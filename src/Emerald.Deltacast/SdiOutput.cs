@@ -83,13 +83,20 @@ public sealed class SdiOutput : IDisposable
         SlotBytes = Format.FrameBytes;
     }
 
+    /// <summary>SDI carries 4 audio groups of 4 channels: 16 mono channels, 8 stereo pairs.</summary>
+    public const int MaxAudioChannels = 16;
+
     /// <summary>
     /// Hands one frame to the card, blocking until a slot frees up. Returns false if the
     /// card refused the slot (usually the IO timeout expiring), which ends playout.
-    /// When <paramref name="left"/> and <paramref name="right"/> are supplied they are
-    /// embedded as audio group 1, channels 1-2, in the same slot.
+    ///
+    /// <paramref name="audioChannels"/> is embedded into the same slot, one mono channel per
+    /// entry, in order: entry 0 becomes SDI channel 1, entry 1 channel 2, and so on up to
+    /// <see cref="MaxAudioChannels"/>. A stereo language is therefore two consecutive
+    /// entries, and every language supplied goes out at once — which is what lets a router
+    /// or a downstream device choose between them, rather than Emerald choosing for it.
     /// </summary>
-    public bool PushFrame(byte[] frame, short[]? left = null, short[]? right = null)
+    public bool PushFrame(byte[] frame, IReadOnlyList<short[]>? audioChannels = null)
     {
         IntPtr slot = IntPtr.Zero;
         if (VideoMasterHD.VHD_LockSlotHandle(_stream, ref slot) != VideoMasterHD.VHDERR_NOERROR)
@@ -107,7 +114,7 @@ public sealed class SdiOutput : IDisposable
             SlotBytes = (int)size;
             Marshal.Copy(frame, 0, buffer, Math.Min(frame.Length, (int)size));
 
-            if (left is not null && right is not null) EmbedAudio(slot, left, right);
+            if (audioChannels is { Count: > 0 }) EmbedAudio(slot, audioChannels);
 
             return true;
         }
@@ -122,6 +129,8 @@ public sealed class SdiOutput : IDisposable
     // inside an 8-byte-aligned outer struct, which the default marshaller does not
     // reproduce faithfully.
     private const int AudioInfoBytes = 1600;   // 4 groups x 400
+    private const int GroupBytes = 400;
+    private const int ChannelsPerGroup = 4;
     private const int GroupChannelsOffset = 64;
     private const int ChannelBytes = 80;
     private const int ChannelMode = 0;
@@ -130,35 +139,53 @@ public sealed class SdiOutput : IDisposable
     private const int ChannelData = 72;
 
     private IntPtr _audioInfo = IntPtr.Zero;
-    private IntPtr _leftBuffer = IntPtr.Zero;
-    private IntPtr _rightBuffer = IntPtr.Zero;
-    private int _audioCapacity;
 
-    private void EmbedAudio(IntPtr slot, short[] left, short[] right)
+    // One native buffer per SDI channel, grown on demand. The samples have to be in
+    // unmanaged memory for the duration of the embed call, and a managed array pinned per
+    // channel per frame would be 16 pins a frame for no gain.
+    private readonly IntPtr[] _channelBuffers = new IntPtr[MaxAudioChannels];
+    private readonly int[] _channelCapacity = new int[MaxAudioChannels];
+
+    /// <summary>
+    /// Embeds up to 16 mono channels into one slot.
+    ///
+    /// Channel <c>i</c> lands in group <c>i / 4</c>, channel <c>i % 4</c> — the SMPTE 299
+    /// ordering, so entries 0 and 1 are the pair a downstream device monitors by default.
+    /// </summary>
+    private void EmbedAudio(IntPtr slot, IReadOnlyList<short[]> channels)
     {
-        int bytes = left.Length * sizeof(short);
-
         if (_audioInfo == IntPtr.Zero)
             _audioInfo = Marshal.AllocHGlobal(AudioInfoBytes);
 
-        if (_audioCapacity < bytes)
-        {
-            if (_leftBuffer != IntPtr.Zero) Marshal.FreeHGlobal(_leftBuffer);
-            if (_rightBuffer != IntPtr.Zero) Marshal.FreeHGlobal(_rightBuffer);
-            _leftBuffer = Marshal.AllocHGlobal(bytes);
-            _rightBuffer = Marshal.AllocHGlobal(bytes);
-            _audioCapacity = bytes;
-        }
-
-        Marshal.Copy(left, 0, _leftBuffer, left.Length);
-        Marshal.Copy(right, 0, _rightBuffer, right.Length);
-
-        // Everything zeroed leaves the other groups and channels VHD_AM_OFF, and
-        // GroupCtrlValid false so the API builds the 48 kHz control packet itself.
+        // Everything zeroed leaves unused groups and channels VHD_AM_OFF, and GroupCtrlValid
+        // false so the API builds the 48 kHz control packet itself.
         for (int i = 0; i < AudioInfoBytes; i += 8) Marshal.WriteInt64(_audioInfo, i, 0);
 
-        WriteChannel(_audioInfo + GroupChannelsOffset, _leftBuffer, bytes);
-        WriteChannel(_audioInfo + GroupChannelsOffset + ChannelBytes, _rightBuffer, bytes);
+        int count = Math.Min(channels.Count, MaxAudioChannels);
+
+        for (int i = 0; i < count; i++)
+        {
+            short[] samples = channels[i];
+            if (samples is null || samples.Length == 0) continue;
+
+            int bytes = samples.Length * sizeof(short);
+
+            if (_channelCapacity[i] < bytes)
+            {
+                if (_channelBuffers[i] != IntPtr.Zero) Marshal.FreeHGlobal(_channelBuffers[i]);
+                _channelBuffers[i] = Marshal.AllocHGlobal(bytes);
+                _channelCapacity[i] = bytes;
+            }
+
+            Marshal.Copy(samples, 0, _channelBuffers[i], samples.Length);
+
+            IntPtr channel = _audioInfo
+                           + (i / ChannelsPerGroup) * GroupBytes
+                           + GroupChannelsOffset
+                           + (i % ChannelsPerGroup) * ChannelBytes;
+
+            WriteChannel(channel, _channelBuffers[i], bytes);
+        }
 
         VideoMasterHD.VHD_SlotEmbedAudio(slot, _audioInfo);
     }
@@ -233,9 +260,15 @@ public sealed class SdiOutput : IDisposable
         }
 
         if (_audioInfo != IntPtr.Zero) { Marshal.FreeHGlobal(_audioInfo); _audioInfo = IntPtr.Zero; }
-        if (_leftBuffer != IntPtr.Zero) { Marshal.FreeHGlobal(_leftBuffer); _leftBuffer = IntPtr.Zero; }
-        if (_rightBuffer != IntPtr.Zero) { Marshal.FreeHGlobal(_rightBuffer); _rightBuffer = IntPtr.Zero; }
-        _audioCapacity = 0;
+
+        for (int i = 0; i < _channelBuffers.Length; i++)
+        {
+            if (_channelBuffers[i] == IntPtr.Zero) continue;
+
+            Marshal.FreeHGlobal(_channelBuffers[i]);
+            _channelBuffers[i] = IntPtr.Zero;
+            _channelCapacity[i] = 0;
+        }
     }
 }
 

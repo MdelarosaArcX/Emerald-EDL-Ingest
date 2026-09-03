@@ -30,17 +30,17 @@ which board and channel, from when, for how long, and from what media.
     "frameRate": 25,
     "startTimecode": "21:56:00:00",
     "startFrame": 1974000,
-    "onAirTimecode": "21:57:00:00",
-    "onAirFrame": 1975500,
+    "onAirTimecode": "21:56:00:00",
+    "onAirFrame": 1974000,
     "mediaStartTimecode": "01:00:00:00",
-    "som": "00:01:00:00",
-    "somFrame": 1500,
-    "eom": "00:11:00:00",
-    "eomFrame": 16500,
+    "som": "01:01:00:00",
+    "somFrame": 91500,
+    "eom": "01:11:00:00",
+    "eomFrame": 106500,
     "duration": "00:10:00:00",
     "durationFrames": 15000,
-    "stopTime": "22:07:00:00",
-    "stopFrame": 1990500,
+    "stopTime": "22:06:00:00",
+    "stopFrame": 1989000,
     "postPlay": "blackScreen",
     "loop": true
   },
@@ -68,13 +68,13 @@ which board and channel, from when, for how long, and from what media.
 | `timing.frameRate` | int | Nominal rate the timecodes are counted at, from the timecode API. |
 | `timing.startTimecode` | `HH:MM:SS:FF` | On-air time on the **house clock**. |
 | `timing.startFrame` | int | Same value as an absolute frame count at `frameRate`. Use whichever is convenient. |
-| `timing.onAirTimecode` / `timing.onAirFrame` | `HH:MM:SS:FF` / int | When video actually reaches the TX: `startTimecode + som`. The output holds the post-play fill between the two. |
+| `timing.onAirTimecode` / `timing.onAirFrame` | `HH:MM:SS:FF` / int | When video actually reaches the TX. The same as `startTimecode`: SOM is an in-point on the media and does not delay the cue. |
 | `timing.mediaStartTimecode` | `HH:MM:SS:FF` | The media's own embedded start timecode, as read by ffprobe. **Reference only** — nothing is measured against it. |
-| `timing.som` / `timing.somFrame` | `HH:MM:SS:FF` / int | Start of message: a **delay applied to `startTimecode`**. `onAirTimecode` = `startTimecode + som`. Not a position inside the media. |
-| `timing.eom` / `timing.eomFrame` | `HH:MM:SS:FF` / int, or `null` | End of message: the matching off-air offset, so `duration = eom − som`. `null` means no fixed duration (loops until stopped). |
+| `timing.som` / `timing.somFrame` | `HH:MM:SS:FF` / int | Start of message: the **in-point on the media's own timecode**, quoted against `mediaStartTimecode`. The decoder seeks `som − mediaStartTimecode` into the file, so the first frame on air is the frame at SOM. Never earlier than `mediaStartTimecode`. |
+| `timing.eom` / `timing.eomFrame` | `HH:MM:SS:FF` / int, or `null` | End of message: the out-point on the same timeline, so `duration = eom − som`. `null` means no fixed duration (loops until stopped). |
 | `timing.duration` | `HH:MM:SS:FF` or `null` | Derived: `eom − som`. **`null` means play until stopped.** |
 | `timing.durationFrames` | int or `null` | Same value in frames. |
-| `timing.stopTime` | `HH:MM:SS:FF` or `null` | Derived: `onAirTimecode + duration` (equivalently `startTimecode + eom`), wrapped at 24 h. `null` when open-ended. |
+| `timing.stopTime` | `HH:MM:SS:FF` or `null` | Derived: `startTimecode + duration`, wrapped at 24 h. `null` when open-ended. |
 | `timing.stopFrame` | int or `null` | Same value in frames. |
 | `timing.postPlay` | string | `blackScreen` or `freezeLastFrame` — what the TX carries after the message until the next one cues. |
 | `timing.loop` | bool | Always `true` — see below. |
@@ -121,9 +121,9 @@ message plays out **silent**, and the video file's own audio is deliberately not
 ```json
 "audio": [
   { "label": "English", "kind": "file", "source": "D:\audio\en.wav",
-    "fileCount": 1, "files": ["en.wav"], "offsetMs": 100, "default": true },
+    "fileCount": 1, "files": ["en.wav"], "offsetMs": 100, "channels": "1-2" },
   { "label": "Arabic",  "kind": "file", "source": "D:\audio\ar.wav",
-    "fileCount": 1, "files": ["ar.wav"], "offsetMs": -50, "default": false }
+    "fileCount": 1, "files": ["ar.wav"], "offsetMs": -50, "channels": "3-4" }
 ]
 ```
 
@@ -132,7 +132,8 @@ message plays out **silent**, and the video file's own audio is deliberately not
 | `label` | string | The language name, as typed by the operator. |
 | `kind` / `source` / `fileCount` / `files` | | Same shape as `media`. Each track loops its own files to fill the duration. |
 | `offsetMs` | int | This language's trim. Positive delays audio behind picture, negative advances it. Independent per track and adjustable live. |
-| `default` | bool | The track on air when the message starts. Exactly one is true. |
+| `channels` | string | The SDI channel pair this language is embedded on, in list order: `"1-2"`, `"3-4"`, and so on. |
 
-**One track is embedded at a time**, on group 1, channels 1-2. The operator can switch which
-one mid-message; `default` records only where it started.
+**Every track is embedded at once**, each on its own channel pair — track 1 on channels 1-2,
+track 2 on 3-4, up to the 16 channels SDI carries (8 tracks). Choosing which language to
+listen to belongs to the router or the receiving device, not to Emerald.

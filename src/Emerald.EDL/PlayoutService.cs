@@ -34,8 +34,7 @@ public sealed record PlayoutRequest(
     Timecode Som,
     TimeSpan SeekOffset,
     PostPlay PostPlay,
-    IReadOnlyList<AudioTrack>? AudioTracks = null,
-    int DefaultTrack = 0)
+    IReadOnlyList<AudioTrack>? AudioTracks = null)
 {
     public bool HasVideo => VideoFiles is { Count: > 0 };
     public bool HasAudio => AudioTracks is { Count: > 0 };
@@ -87,19 +86,7 @@ public sealed class PlayoutService : IDisposable
     /// <summary>SDI carries 4 groups of 4 channels; 8 stereo tracks is the hard ceiling.</summary>
     public const int MaxAudioTracks = 8;
 
-    private int _currentTrackIndex;
     private readonly int[] _trackOffsetsMs = new int[MaxAudioTracks];
-
-    /// <summary>
-    /// Which audio track is on air. The play loop re-reads this every frame, so changing it
-    /// mid-message swaps the language on the next frame — every track is being decoded and
-    /// advanced regardless, so the switch is just a choice of buffer. Video is untouched.
-    /// </summary>
-    public int CurrentTrackIndex
-    {
-        get => Volatile.Read(ref _currentTrackIndex);
-        set => Volatile.Write(ref _currentTrackIndex, value);
-    }
 
     /// <summary>
     /// Per-track audio offset in milliseconds, live. Each language keeps its own delay, so
@@ -327,12 +314,17 @@ public sealed class PlayoutService : IDisposable
             foreach (AudioTrack track in req.AudioTracks ?? Array.Empty<AudioTrack>())
                 beds.Add(new AudioBed(_ffmpegPath!, track, req.FrameRate));
 
-            CurrentTrackIndex = Math.Clamp(req.DefaultTrack, 0, Math.Max(0, beds.Count - 1));
-
             if (beds.Count > 0)
+            {
+                // The channel map is worth stating: it is what the operator patches against
+                // downstream, and getting it wrong is silent until someone monitors the
+                // wrong pair.
+                string map = string.Join(", ",
+                    beds.Select((b, i) => $"ch {i * 2 + 1}-{i * 2 + 2} \"{b.Label}\""));
+
                 Report(new PlayoutStatus(PlayoutState.Playing,
-                    $"Audio: {beds.Count} track(s), on air \"{beds[CurrentTrackIndex].Label}\".",
-                    0, target));
+                    $"Audio: {beds.Count} track(s), all on air - {map}.", 0, target));
+            }
             else
                 Report(new PlayoutStatus(PlayoutState.Playing, "Audio: none - video only, silent.", 0, target));
 
@@ -360,22 +352,35 @@ public sealed class PlayoutService : IDisposable
     }
 
     /// <summary>
-    /// Advances every bed by one frame and returns the one that should go to the card.
+    /// Advances every bed by one frame and lays them out as SDI channels.
     ///
-    /// All beds advance, not just the one on air. A bed left un-advanced would stall its
-    /// decoder against the ring buffer and sit at the wrong position, so switching to it
-    /// would be neither instant nor sample-accurate. Advancing all of them reduces the
-    /// switch to a choice of buffer, and lets each keep its own offset.
+    /// <b>Every track is transmitted, all the time.</b> Track <c>n</c> occupies channels
+    /// <c>2n+1</c> and <c>2n+2</c> — the first language on 1-2, the second on 3-4, and so on
+    /// — so the choice of which language to listen to belongs to the router or the receiving
+    /// device, not to Emerald. Each keeps its own live offset, which is why they are
+    /// advanced individually rather than mixed.
+    ///
+    /// The channel list is allocated once per message and refilled in place: this runs every
+    /// frame, and handing the card a fresh list 25 times a second would be pure garbage.
     /// </summary>
-    private AudioBed? AdvanceBeds(List<AudioBed> beds)
+    private void AdvanceBeds(List<AudioBed> beds, List<short[]> channels)
     {
-        if (beds.Count == 0) return null;
-
         for (int i = 0; i < beds.Count; i++)
+        {
             beds[i].Advance(GetTrackOffset(i));
 
-        return beds[Math.Clamp(CurrentTrackIndex, 0, beds.Count - 1)];
+            // A bed past the card's channel count still advances — leaving it stalled would
+            // put it at the wrong position if the limit ever changed — it simply is not sent.
+            if (i * 2 + 1 >= channels.Count) continue;
+
+            channels[i * 2] = beds[i].Left;
+            channels[i * 2 + 1] = beds[i].Right;
+        }
     }
+
+    /// <summary>The channel buffer for one message: two entries per track, capped at the SDI limit.</summary>
+    private static List<short[]> ChannelsFor(List<AudioBed> beds) =>
+        new(new short[Math.Min(beds.Count * 2, SdiOutput.MaxAudioChannels)][]);
 
     /// <summary>Video drives the loop: the playlist wraps to fill the duration.</summary>
     private long PlayWithVideo(PlayoutEntry entry, SdiOutput output, List<AudioBed> beds,
@@ -386,6 +391,7 @@ public sealed class PlayoutService : IDisposable
         IReadOnlyList<string> files = req.VideoFiles!;
 
         var frame = new byte[format.FrameBytes];
+        List<short[]> channels = ChannelsFor(beds);
         long framesOut = 0;
         long? target = req.DurationFrames;
         int fileIndex = 0;
@@ -413,9 +419,9 @@ public sealed class PlayoutService : IDisposable
                 {
                     if (!source.TryReadFrame(frame)) break;
 
-                    AudioBed? onAir = AdvanceBeds(beds);
+                    AdvanceBeds(beds, channels);
 
-                    if (!output.PushFrame(frame, onAir?.Left, onAir?.Right))
+                    if (!output.PushFrame(frame, channels))
                     {
                         Fail(entry, "The card stopped accepting frames.", framesOut, target);
                         return framesOut;
@@ -479,15 +485,16 @@ public sealed class PlayoutService : IDisposable
         long framesOut = 0;
 
         byte[] black = output.BlackFrame();
+        List<short[]> channels = ChannelsFor(beds);
 
         Report(new PlayoutStatus(PlayoutState.Playing, "No video selected - holding black screen.",
             0, target, "black"));
 
         while (!ct.IsCancellationRequested && (target is null || framesOut < target))
         {
-            AudioBed? onAir = AdvanceBeds(beds);
+            AdvanceBeds(beds, channels);
 
-            if (!output.PushFrame(black, onAir?.Left, onAir?.Right))
+            if (!output.PushFrame(black, channels))
             {
                 Fail(entry, "The card stopped accepting frames.", framesOut, target);
                 return framesOut;

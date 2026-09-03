@@ -354,6 +354,16 @@ public partial class EdlWindow : Window
         }
     }
 
+    /// <summary>How far ahead of the clock the Now button places the start timecode.</summary>
+    private const int NowLeadMinutes = 2;
+
+    /// <summary>
+    /// Stamps the realtime timecode plus a couple of minutes' lead.
+    ///
+    /// Stamping the clock exactly would put the cue in the past by the time the operator has
+    /// finished the rest of the form, and a start that has already gone by plays immediately
+    /// rather than waiting. The lead leaves room to finish setting up and still hit the mark.
+    /// </summary>
     private void Now_Click(object sender, RoutedEventArgs e)
     {
         if (!_timecode.TryGetCurrent(out Timecode now))
@@ -362,7 +372,11 @@ public partial class EdlWindow : Window
             return;
         }
 
-        StartTcBox.Text = now.ToString();
+        int rate = _frameRate > 0 ? _frameRate : FallbackFrameRate;
+        Timecode cue = now.AddWrapping(NowLeadMinutes * 60L * rate);
+
+        StartTcBox.Text = cue.ToString();
+        Log($"Start timecode set to {cue} - {NowLeadMinutes} minutes ahead of {now}.", LogLevel.Info);
     }
 
     // ------------------------------------------------------------------ media source
@@ -441,6 +455,11 @@ public partial class EdlWindow : Window
             if (announce && _mediaInfo is { } info)
                 Log($"Media: {Path.GetFileName(first)} - {info.VideoCodec} {info.Width}x{info.Height}, " +
                     info.Summary(_frameRate > 0 ? _frameRate : FallbackFrameRate), LogLevel.Info);
+
+            // Choosing a file seeds the marks from it. SOM is a position on the media's own
+            // timecode, so starting it anywhere else would be an in-point the operator did
+            // not choose - and on media that starts at 01:00:00:00, an invalid one.
+            if (announce) SeedMarksFromMedia();
         }
 
         if (selection is null)
@@ -589,19 +608,29 @@ public partial class EdlWindow : Window
         ShowFieldError(StartTcError, startOk ? null : startError);
         if (!startOk) problems.Add($"Start timecode: {startError}");
 
-        // SOM and EOM are offsets from the start timecode, not positions in the media.
-        // SOM delays the on-air moment: start 06:20:00:00 with SOM 00:01:00:00 puts video
-        // on TX at 06:21:00:00, holding the post-play fill until then. EOM is the matching
-        // off-air offset, so the duration between them is EOM - SOM.
+        // SOM and EOM are marks **on the media's own timecode**. SOM is the in-point: the
+        // frame the message starts from, so a three-minute clip with SOM 00:01:00:00 goes on
+        // air one minute in, with that first minute skipped. EOM is the out-point, and the
+        // duration between them is EOM - SOM.
+        //
+        // The marks are quoted against the media's own start timecode, which broadcast media
+        // conventionally puts at 01:00:00:00 rather than zero — so SOM is seeded from the
+        // file when one is chosen, and can never be earlier than it.
         //
         // The fields are fixed-width masks and can never be empty, so an open-ended message
         // is expressed as EOM equal to SOM - a zero duration, which is the same 00:00:00:00
         // pair the boxes start out holding.
+        Timecode mediaStart = MediaStart(rate);
+
         Timecode som = Timecode.Zero(rate);
         string? somEomError = null;
 
         if (!Timecode.TryParse(SomBox.Text, rate, out som, out string? somErr))
             somEomError = $"SOM: {somErr}";
+        else if (som.TotalFrames < mediaStart.TotalFrames)
+            somEomError = $"SOM cannot be earlier than the media's own start timecode ({mediaStart}).";
+        else if (MediaEnd(rate) is { } mediaEnd && som.TotalFrames >= mediaEnd.TotalFrames)
+            somEomError = $"SOM is at or past the end of the media ({mediaEnd}); there would be nothing to play.";
 
         Timecode? duration = null;
 
@@ -619,11 +648,10 @@ public partial class EdlWindow : Window
         SomEomError.Foreground = Brush("Bad");
         if (somEomError is not null) problems.Add(somEomError);
 
-        // Derived, read-only fields. Video goes on air at start + SOM, so the stop time is
-        // measured from there, not from the start timecode. While the start timecode is
-        // mid-edit it will not parse, and `start` is then a rate-less default — fall back
-        // rather than deriving from it.
-        Timecode onAir = startOk ? start.AddWrapping(som.TotalFrames) : Timecode.Zero(rate);
+        // The message goes on air at the start timecode itself. SOM no longer delays that —
+        // it moves the in-point within the media instead, so the frame on air at the start
+        // timecode is the frame at SOM.
+        Timecode onAir = startOk ? start : Timecode.Zero(rate);
 
         // Duration is a field the operator types into now, so it is never written back here;
         // SyncTiming has already put it in step with EOM. Only the stop time is derived.
@@ -697,9 +725,75 @@ public partial class EdlWindow : Window
                     FileCount = t.Selection.Files.Count,
                     Files = t.Selection.Files.ToList(),
                     OffsetMs = t.OffsetMs,
-                    Default = t.IsDefault,
+                    Channels = $"{t.Index * 2 + 1}-{t.Index * 2 + 2}",
                 }).ToList(),
         };
+    }
+
+    /// <summary>
+    /// Puts SOM at the head of the newly chosen media, and moves EOM with it so the duration
+    /// the operator had set is preserved rather than being silently re-interpreted against a
+    /// different file.
+    /// </summary>
+    private void SeedMarksFromMedia()
+    {
+        int rate = _frameRate > 0 ? _frameRate : FallbackFrameRate;
+        Timecode mediaStart = MediaStart(rate);
+
+        long keepDuration =
+            Timecode.TryParse(SomBox.Text, rate, out Timecode oldSom, out _) &&
+            Timecode.TryParse(EomBox.Text, rate, out Timecode oldEom, out _) &&
+            oldEom.TotalFrames >= oldSom.TotalFrames
+                ? oldEom.TotalFrames - oldSom.TotalFrames
+                : 0;
+
+        // Never longer than the media itself: a duration carried over from a longer file
+        // would otherwise loop this one to fill the difference.
+        if (MediaEnd(rate) is { } mediaEnd)
+            keepDuration = Math.Min(keepDuration, mediaEnd.TotalFrames - mediaStart.TotalFrames);
+
+        _syncingTiming = true;
+        try
+        {
+            SomBox.Text = mediaStart.ToString();
+            EomBox.Text = mediaStart.AddWrapping(keepDuration).ToString();
+        }
+        finally
+        {
+            _syncingTiming = false;
+        }
+
+        Log(_mediaInfo is { HasEmbeddedTimecode: true }
+                ? $"SOM set to the media's start timecode {mediaStart}."
+                : $"This media carries no timecode; SOM set to {mediaStart}.",
+            LogLevel.Info);
+
+        UpdatePreviewAndValidation();
+    }
+
+    /// <summary>
+    /// The media's own start timecode — where its first frame sits. Broadcast media
+    /// conventionally starts at 01:00:00:00; a file with no embedded timecode, or no media at
+    /// all, starts at zero, which is what makes SOM read as a plain offset in that case.
+    /// </summary>
+    private Timecode MediaStart(int rate) =>
+        _mediaInfo is { HasEmbeddedTimecode: true } info ? info.StartTimecode.Rebase(rate) : Timecode.Zero(rate);
+
+    /// <summary>Where the media runs out, or null when its length is unknown.</summary>
+    private Timecode? MediaEnd(int rate) =>
+        _mediaInfo is { } info && info.Duration > TimeSpan.Zero
+            ? MediaStart(rate).AddWrapping((long)Math.Round(info.Duration.TotalSeconds * rate))
+            : null;
+
+    /// <summary>
+    /// How far into the file the decoder must seek to reach SOM. This is the whole of what
+    /// SOM does now: ffmpeg is given it as an in-point, so the first frame on air is the
+    /// frame at SOM rather than the head of the file.
+    /// </summary>
+    private TimeSpan SeekFor(Timecode som, int rate)
+    {
+        long frames = som.TotalFrames - MediaStart(rate).TotalFrames;
+        return frames <= 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(frames / (double)rate);
     }
 
     private static EdlCommand.BoardRef Describe(BoardInfo board) =>
@@ -894,35 +988,10 @@ public partial class EdlWindow : Window
         UpdatePreviewAndValidation();
     }
 
-    private void AudioDefault_Checked(object sender, RoutedEventArgs e)
-    {
-        if (RowOf(sender) is not { } row) return;
-
-        foreach (AudioTrackRow other in _audioTracks)
-            if (!ReferenceEquals(other, row)) other.IsDefault = false;
-
-        UpdatePreviewAndValidation();
-    }
-
-    /// <summary>Switches the language on air mid-message. Video is not touched.</summary>
-    private void AudioTakeOnAir_Click(object sender, RoutedEventArgs e)
-    {
-        if (RowOf(sender) is not { } row || _playout is null) return;
-
-        _playout.CurrentTrackIndex = row.Index;
-        Log($"Audio on air: \"{row.Label}\" (track {row.Index + 1}).", LogLevel.Ok);
-        RefreshOnAirIndicators();
-    }
-
-    private void RefreshOnAirIndicators()
-    {
-        int current = _playout?.CurrentTrackIndex ?? 0;
-
-        foreach (AudioTrackRow row in _audioTracks)
-            row.IsOnAir = _audioTracks.Count > 0 && row.Index == current;
-    }
-
-    /// <summary>List order is the engine's track index, so it is restamped on every change.</summary>
+    /// <summary>
+    /// List order is the engine's track index, which is also the SDI channel pair the track
+    /// is embedded on, so it is restamped on every change.
+    /// </summary>
     private void RenumberAudioTracks()
     {
         for (int i = 0; i < _audioTracks.Count; i++)
@@ -931,13 +1000,9 @@ public partial class EdlWindow : Window
             _playout?.SetTrackOffset(i, _audioTracks[i].OffsetMs);
         }
 
-        if (_audioTracks.Count > 0 && !_audioTracks.Any(t => t.IsDefault))
-            _audioTracks[0].IsDefault = true;
-
         AudioEmptyText.Visibility = _audioTracks.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         AddAudioButton.IsEnabled = _audioTracks.Count < PlayoutService.MaxAudioTracks;
 
-        RefreshOnAirIndicators();
         UpdatePreviewAndValidation();
     }
 
@@ -956,15 +1021,6 @@ public partial class EdlWindow : Window
             OffsetMs = saved.OffsetMs,
             IsDefault = saved.IsDefault,
         });
-    }
-
-    private int DefaultTrackIndex
-    {
-        get
-        {
-            int i = _audioTracks.ToList().FindIndex(t => t.IsDefault);
-            return i < 0 ? 0 : i;
-        }
     }
 
     private PostPlay SelectedPostPlay =>
@@ -1004,16 +1060,17 @@ public partial class EdlWindow : Window
             BoardModel: command.Playback.Board.Model,
             TxChannel: command.Playback.Index,
             VideoFiles: files,
-            // The engine cues on the on-air time (start + SOM), holding the post-play fill
-            // until then; the start timecode itself is only the reference the SOM is off.
-            Start: new Timecode(command.Timing.OnAirFrame, command.Timing.FrameRate),
+            // The engine cues on the start timecode itself, holding the post-play fill until
+            // then. SOM does not delay that: it is where the media is entered, handed over as
+            // the seek below, so the first frame on air is the frame at SOM.
+            Start: new Timecode(command.Timing.StartFrame, command.Timing.FrameRate),
             DurationFrames: command.Timing.DurationFrames,
             FrameRate: command.Timing.FrameRate,
             Som: new Timecode(command.Timing.SomFrame, command.Timing.FrameRate),
-            SeekOffset: TimeSpan.Zero,   // SOM never seeks into the media
+            SeekOffset: SeekFor(new Timecode(command.Timing.SomFrame, command.Timing.FrameRate),
+                                command.Timing.FrameRate),
             PostPlay: SelectedPostPlay,
-            AudioTracks: tracks.Count > 0 ? tracks : null,
-            DefaultTrack: DefaultTrackIndex);
+            AudioTracks: tracks.Count > 0 ? tracks : null);
 
         var entry = new PlayoutEntry
         {
@@ -1033,8 +1090,8 @@ public partial class EdlWindow : Window
         {
             0 => "    audio     none - video plays out silent",
             1 => $"    audio     \"{tracks[0].Label}\"",
-            _ => $"    audio     {tracks.Count} tracks, default \"{tracks[DefaultTrackIndex].Label}\" " +
-                 $"({string.Join(", ", tracks.Select(t => t.Label))})",
+            _ => $"    audio     {tracks.Count} tracks, all on air - " +
+                 $"{string.Join(", ", tracks.Select((t, i) => $"ch {i * 2 + 1}-{i * 2 + 2} \"{t.Label}\""))}",
         }, LogLevel.Info);
     }
 
@@ -1229,7 +1286,6 @@ public partial class EdlWindow : Window
 
     private void RenderPlayout(PlayoutStatus status)
     {
-        RefreshOnAirIndicators();
         UpdateCapture(status.State);
 
         PlayoutBar.Visibility = Visibility.Visible;

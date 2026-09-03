@@ -133,6 +133,10 @@ public sealed class EdlCommand
         /// <summary>Per-language trim in milliseconds; positive delays audio behind picture.</summary>
         [JsonPropertyName("offsetMs")] public int OffsetMs { get; set; }
 
-        [JsonPropertyName("default")] public bool Default { get; set; }
+        /// <summary>
+        /// The SDI channel pair this language is embedded on, as "1-2". Every track listed is
+        /// transmitted at once, so this — not a "default" — is what says where to find it.
+        /// </summary>
+        [JsonPropertyName("channels")] public string Channels { get; set; } = "";
     }
 }

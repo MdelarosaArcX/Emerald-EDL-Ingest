@@ -183,8 +183,8 @@
                                 </Grid.ColumnDefinitions>
 
                                 <StackPanel Grid.Column="0">
-                                    <TextBlock Text="SOM (start of message)" Style="{StaticResource FieldLabel}"
-                                               ToolTip="Sets the duration together with the other mark"/>
+                                    <TextBlock Text="SOM (in-point on the media)" Style="{StaticResource FieldLabel}"
+                                               ToolTip="The frame the message plays from. Seeded from the media's own start timecode when you choose a file."/>
                                     <TextBox x:Name="SomBox" FontFamily="Consolas" FontSize="15"
                                              core:TimecodeMask.Enabled="True" TextChanged="Som_Changed"/>
                                 </StackPanel>
@@ -199,7 +199,7 @@
                             <TextBlock x:Name="SomEomError" Style="{StaticResource Hint}"
                                        Foreground="{StaticResource Bad}" Visibility="Collapsed"/>
                             <TextBlock Style="{StaticResource Hint}"
-                                       Text="SOM and EOM are the marks. Set EOM equal to SOM to loop until stopped."/>
+                                       Text="Marks on the media's own timecode: video plays from SOM, so a SOM one minute in skips the first minute. Set EOM equal to SOM to loop until stopped."/>
 
                             <Grid Margin="0,14,0,0">
                                 <Grid.ColumnDefinitions>
@@ -222,7 +222,7 @@
                                 </StackPanel>
                             </Grid>
                             <TextBlock x:Name="DerivedHint" Style="{StaticResource Hint}"
-                                       Text="Edit either EOM or Duration - each follows the other. Video goes on air at start + SOM."/>
+                                       Text="Edit either EOM or Duration - each follows the other. Video goes on air at the start timecode, from the frame at SOM."/>
 
                             <Grid Margin="0,16,0,5">
                                 <TextBlock Text="Audio Tracks" Style="{StaticResource FieldLabel}" Margin="0"/>
@@ -260,12 +260,14 @@
                                                             <ColumnDefinition Width="Auto"/>
                                                         </Grid.ColumnDefinitions>
 
-                                                        <RadioButton Grid.Column="0" GroupName="DefaultAudio"
-                                                                     Foreground="{StaticResource Muted}" FontSize="10.5"
-                                                                     VerticalAlignment="Center" Margin="0,0,7,0"
-                                                                     IsChecked="{Binding IsDefault, Mode=TwoWay}"
-                                                                     Checked="AudioDefault_Checked"
-                                                                     ToolTip="Language on air when the message starts"/>
+                                                        <Border Grid.Column="0" Background="{StaticResource PanelDeep}"
+                                                                BorderBrush="{StaticResource Line}" BorderThickness="1"
+                                                                CornerRadius="4" Margin="0,0,7,0" Width="56" Height="25"
+                                                                ToolTip="The SDI channel pair this language is embedded on">
+                                                            <TextBlock Text="{Binding ChannelLabel}" FontFamily="Consolas"
+                                                                       FontSize="11" Foreground="{StaticResource Ok}"
+                                                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                        </Border>
 
                                                         <TextBox Grid.Column="1"
                                                                  Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}"
@@ -294,12 +296,6 @@
                                                                 Width="25" Height="25" FontSize="11" Padding="0" Margin="4,0,0,0"
                                                                 Click="AudioTrackReset_Click" ToolTip="Reset this offset to zero"/>
 
-                                                        <Button Grid.Column="6" Content="{Binding OnAirText}"
-                                                                Style="{StaticResource GhostButton}" Height="25"
-                                                                Padding="9,0" FontSize="10" Margin="6,0,0,0"
-                                                                Click="AudioTakeOnAir_Click"
-                                                                ToolTip="Put this language on air now"/>
-
                                                         <Button Grid.Column="7" Content="&#215;" Style="{StaticResource GhostButton}"
                                                                 Width="25" Height="25" Padding="0" FontSize="12" Margin="4,0,0,0"
                                                                 Click="RemoveAudioTrack_Click" ToolTip="Remove this track"/>
@@ -312,7 +308,7 @@
                                 </StackPanel>
                             </Border>
                             <TextBlock x:Name="AudioTracksHint" Style="{StaticResource Hint}"
-                                       Text="One language on air at a time, on channels 1-2. 10 ms per tick, +/-500 ms, each track independent. Take switches live without touching video."/>
+                                       Text="Every track is transmitted at once, each on its own SDI channel pair - track 1 on CH 1-2, track 2 on CH 3-4, up to 8 tracks. 10 ms per tick, +/-500 ms, each track independent and adjustable on air."/>
 
                             <TextBlock Text="Post Play" Style="{StaticResource FieldLabel}" Margin="0,14,0,5"/>
                             <ComboBox x:Name="PostPlayCombo" SelectionChanged="PortCombo_SelectionChanged"/>

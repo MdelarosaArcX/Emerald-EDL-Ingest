@@ -229,12 +229,12 @@ audio tracks carry across from the pre-Emerald app.
 | **Capture Port** | `RX0`…`RXn` on the capture board, where *n* comes from `VHD_CORE_BP_NB_RXCHANNELS`. |
 | **Playback Port** | `TX0`…`TXn` on the playback board, from `VHD_CORE_BP_NB_TXCHANNELS`. A board with no TX channels (e.g. `DELTA-12G-elp-h 20`, which is 8 RX / 0 TX) shows an amber warning and blocks Send. On startup each side defaults to the first board that can actually do that job. |
 | **Timecode API** | Default `http://10.0.0.31:8888/api/timecode`. **Apply** switches source at runtime — and it is **one setting for the whole application**, so the deck and the Ingest Controller re-dial with it and show the new address immediately. |
-| **Start Timecode** | On-air time on the house clock. `HH:MM:SS:FF`, masked (see below) and validated against the live frame rate. **Now** stamps the current realtime timecode. |
-| **SOM** (start of message) | A **delay on the start timecode**, masked. Start `06:20:00:00` with SOM `00:01:00:00` puts video on TX at `06:21:00:00`; until then the output holds the post-play fill. It is **not** a position inside the media file — nothing seeks, and it is never checked against the media's length or embedded timecode. |
+| **Start Timecode** | On-air time on the house clock. `HH:MM:SS:FF`, masked (see below) and validated against the live frame rate. **Now** stamps the realtime timecode **plus two minutes** — stamping the clock exactly would put the cue in the past by the time the rest of the form is filled in, and a start that has gone by plays immediately. |
+| **SOM** (in-point on the media) | The **frame the message plays from**, quoted on the media's own timecode. A three-minute clip with SOM one minute in goes on air one minute in, with that first minute skipped — ffmpeg is given it as a seek. Choosing a file **seeds SOM from that file's start timecode** (EOM moves with it, preserving the duration), and SOM can never be earlier than it, nor at or past the end of the media. It does **not** delay the cue. |
 | **EOM** (end of message) | The matching off-air offset. `EOM − SOM` is the duration. **Set EOM equal to SOM** for no fixed duration: the media loops until stopped. Must not be earlier than SOM. |
 | **Duration** | **Editable**, and tied to EOM both ways: type a duration and EOM follows (`SOM + duration`); type an EOM and the duration follows (`EOM − SOM`). There is no mode to choose — whichever you last typed into is the one you are driving, and the calculated one is tinted. Moving **SOM** then leaves the field you set alone and re-derives the other. |
-| **Stop Time** | **Read-only** — on-air time + duration (i.e. `Start + EOM`), wrapped at 24 h. Start `06:20:00:00`, SOM `00:01:00:00`, EOM `00:11:00:00` gives on air `06:21:00:00` and stop `06:31:00:00`. |
-| **Audio Tracks** | A list of language beds, each with its own source. Only **one is on air at a time**, on channels 1-2. The **default** radio picks which starts; **take** switches live mid-message. Each has its own **+ / −** trim at **10 ms per tick** (±500 ms) and a **0** reset — independent per language, so switching preserves each one's delay. Up to 8 tracks. |
+| **Stop Time** | **Read-only** — start timecode + duration, wrapped at 24 h. Start `20:57:26:00` with a two-minute duration stops at `20:59:26:00`, whatever SOM is. |
+| **Audio Tracks** | A list of language beds, each with its own source. **All of them are transmitted at once**, each on its own SDI channel pair — track 1 on CH 1-2, track 2 on CH 3-4, up to 8 tracks (16 channels). The pair is shown on each row. Each has its own **+ / −** trim at **10 ms per tick** (±500 ms) and a **0** reset, independent per language and adjustable while on air. |
 | **Media Source** | **Optional.** Drop a folder or file onto the panel, or browse. Folders are scanned one level deep for playable containers (`.mxf .mov .mp4 .avi .mkv .ts .m2t .mpg .dv .gxf .lxf .webm .yuv .wav` …) and sent as an ordered playlist. |
 | **Post Play** | What the TX carries once the message ends and until the next one cues: **Black Screen** or **Freeze on last frame**. |
 | **Recording folder** | Where RX recordings are written, in 2-minute segments, while a message is on air. Leave empty to record nothing. Validated as you type, with free space shown. |
@@ -297,14 +297,17 @@ The generator drives the SDI output itself through VideoMaster.
 - **Pacing.** Frames are handed to the card one slot at a time and the card blocks until
   it is ready, so playout is clocked by the SDI output rather than by a software timer.
   There is no drift.
-- **SOM/EOM.** SOM delays the on-air moment relative to the Start Timecode; EOM is the
-  matching off-air offset, so the duration is `EOM − SOM`. The output opens at the start
-  timecode and holds the post-play fill through the SOM delay, then cuts to the media,
-  which plays from its top and loops to fill the duration. Neither mark seeks into the
-  media, and neither is checked against the media's length or its embedded timecode — set
-  them freely. When media is selected, ffprobe still reports its length, stream layout and
-  embedded timecode under the drop zone
-  (`length 00:04:28:06, has audio, media TC starts 01:00:00:00`), for information only.
+- **SOM/EOM.** Both are marks **on the media's own timecode**, and SOM is where the media is
+  entered. The output cues at the Start Timecode and cuts to the media at that moment, from
+  the frame at SOM — ffmpeg is given `SOM − media start` as an in-point before `-i`, so the
+  seek is by keyframe and then decoded forward, which is frame-accurate. The duration is
+  `EOM − SOM`, and the playlist loops to fill it if the media runs out first. The marks are
+  checked against the media: SOM cannot be earlier than the file's own start timecode, nor
+  at or past its end. ffprobe reports what it found under the drop zone
+  (`length 00:04:28:06, has audio, media TC starts 01:00:00:00`), and that start timecode is
+  what SOM is seeded from when a file is chosen.
+- **The seek is exact.** Verified against a clip with burnt-in timecode starting at
+  `01:00:00:00`: SOM `01:01:00:00` produces a first frame reading `REC TC: 01:01:00:00`.
 - **Decode errors are surfaced.** ffmpeg's stderr is captured, so a file that supplies
   fewer frames than the duration needs is reported with ffmpeg's own explanation rather
   than silently rolling on to the next file.
@@ -325,17 +328,20 @@ no bearing on the other:
 |---|---|
 | Video only | Video to TX, **silent** — the video file's own audio is deliberately *not* used |
 | Audio only | **Black screen** to TX, carrying the audio |
-| Video + one track | Video with that track |
-| Video + several tracks | Video with **one language at a time** on channels 1-2 |
+| Video + one track | Video with that track on channels 1-2 |
+| Video + several tracks | Video with **every language at once**, one per channel pair |
 
 At least one of the two is required; either alone is a valid message.
 
 ### Multiple languages
 
-Every track is decoded and advanced **every frame**, whether or not it is the one on air.
-That is what makes **take** instant: switching is a choice of buffer, not a restart. A track
-left un-advanced would stall its decoder against its ring buffer and sit at the wrong
-position, so switching to it would be neither immediate nor sample-accurate.
+Every track is decoded, advanced and **embedded every frame**. Track 1 goes to SDI channels
+1-2, track 2 to 3-4, and so on up to the 16 channels the standard carries — the SMPTE 299
+ordering, so a router or a downstream device chooses which language to listen to. Emerald
+does not choose for it, and nothing has to be switched on air to hear a different one.
+
+A track left un-advanced would stall its decoder against its ring buffer and sit at the
+wrong position, so all of them run whether or not anything downstream is listening.
 
 The cost is one ffmpeg process and about 576 KB of ring buffer per language, which is
 nothing for the eight tracks SDI can carry.
@@ -346,8 +352,8 @@ keeps sound on air throughout.
 ### Adjusting on air
 
 Each language has **its own** offset, adjustable **while a message is playing**, at **10 ms
-per tick** up to ±500 ms. Picture is never touched, and switching languages preserves
-whatever each was trimmed to.
+per tick** up to ±500 ms. Picture is never touched, and because every track is on air at
+once, a nudge trims that one channel pair without disturbing the others.
 
 The offset is never passed to ffmpeg. Audio is always decoded from the natural start of the
 file into a rolling three-second buffer, and the offset simply moves **where the play loop
@@ -359,12 +365,13 @@ every frame, so a nudge lands on the next frame:
 
 The buffer carries both history and lookahead, so neither direction needs a re-seek and
 there is no gap or click on adjustment. Verified on the card: 90 offset changes during a
-20-second message, and separately 6 language switches during another, both still outputting
-exactly 500 frames with no interruption to picture.
+20-second message still output exactly 500 frames with no interruption to picture.
 
-- Audio is decoded to 48 kHz 16-bit stereo, de-interleaved, and embedded into the SDI as
-  **group 1, channels 1–2**. Every frame rate the app outputs divides 48000 exactly, so a
-  frame is a whole number of samples and audio cannot drift against picture.
+- Audio is decoded to 48 kHz 16-bit stereo, de-interleaved, and embedded into the SDI one
+  mono channel at a time: track *n* fills channels *2n+1* and *2n+2*, which is group
+  *n / 2*, channels *(n × 2) mod 4* and the next. Every frame rate the app outputs divides
+  48000 exactly, so a frame is a whole number of samples and audio cannot drift against
+  picture.
 - A track whose file carries no audio stream is warned about in the log and plays silent.
 
 Two details of the SDI side are worth recording, because both are easy to get wrong:

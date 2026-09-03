@@ -24,8 +24,21 @@ public sealed class AudioTrackRow : INotifyPropertyChanged
 
     public required MediaSelection Selection { get; init; }
 
+    private int _index;
+
     /// <summary>Position in the list, which is also the engine's track index.</summary>
-    public int Index { get; set; }
+    public int Index
+    {
+        get => _index;
+        set { _index = value; Notify(); Notify(nameof(ChannelLabel)); }
+    }
+
+    /// <summary>
+    /// The SDI channel pair this language is embedded on — track 0 on channels 1-2, track 1
+    /// on 3-4, and so on. Every track is transmitted at once, so this is what an operator
+    /// patches against downstream, and it is worth having on screen rather than counted out.
+    /// </summary>
+    public string ChannelLabel => $"CH {_index * 2 + 1}-{_index * 2 + 2}";
 
     public string Label
     {
