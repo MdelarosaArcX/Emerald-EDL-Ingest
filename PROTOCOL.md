@@ -33,10 +33,10 @@ which board and channel, from when, for how long, and from what media.
     "onAirTimecode": "21:56:00:00",
     "onAirFrame": 1974000,
     "mediaStartTimecode": "01:00:00:00",
-    "som": "01:01:00:00",
-    "somFrame": 91500,
-    "eom": "01:11:00:00",
-    "eomFrame": 106500,
+    "som": "00:01:00:00",
+    "somFrame": 1500,
+    "eom": "00:11:00:00",
+    "eomFrame": 16500,
     "duration": "00:10:00:00",
     "durationFrames": 15000,
     "stopTime": "22:06:00:00",
@@ -70,8 +70,8 @@ which board and channel, from when, for how long, and from what media.
 | `timing.startFrame` | int | Same value as an absolute frame count at `frameRate`. Use whichever is convenient. |
 | `timing.onAirTimecode` / `timing.onAirFrame` | `HH:MM:SS:FF` / int | When video actually reaches the TX. The same as `startTimecode`: SOM is an in-point on the media and does not delay the cue. |
 | `timing.mediaStartTimecode` | `HH:MM:SS:FF` | The media's own embedded start timecode, as read by ffprobe. **Reference only** — nothing is measured against it. |
-| `timing.som` / `timing.somFrame` | `HH:MM:SS:FF` / int | Start of message: the **in-point on the media's own timecode**, quoted against `mediaStartTimecode`. The decoder seeks `som − mediaStartTimecode` into the file, so the first frame on air is the frame at SOM. Never earlier than `mediaStartTimecode`. |
-| `timing.eom` / `timing.eomFrame` | `HH:MM:SS:FF` / int, or `null` | End of message: the out-point on the same timeline, so `duration = eom − som`. `null` means no fixed duration (loops until stopped). |
+| `timing.som` / `timing.somFrame` | `HH:MM:SS:FF` / int | Start of message: the in-point **measured from the head of the media**, not against its embedded timecode. The decoder is handed it as a seek, so `00:01:00:00` starts one minute into the clip whatever timecode that clip carries. Must be shorter than the media. |
+| `timing.eom` / `timing.eomFrame` | `HH:MM:SS:FF` / int, or `null` | End of message: the out-point on the same elapsed scale, so `duration = eom − som`. A 3-minute clip with `som` `00:01:00:00` and `eom` `00:03:00:00` plays its last two minutes. `null` means no fixed duration (loops until stopped). |
 | `timing.duration` | `HH:MM:SS:FF` or `null` | Derived: `eom − som`. **`null` means play until stopped.** |
 | `timing.durationFrames` | int or `null` | Same value in frames. |
 | `timing.stopTime` | `HH:MM:SS:FF` or `null` | Derived: `startTimecode + duration`, wrapped at 24 h. `null` when open-ended. |

@@ -230,8 +230,8 @@ audio tracks carry across from the pre-Emerald app.
 | **Playback Port** | `TX0`…`TXn` on the playback board, from `VHD_CORE_BP_NB_TXCHANNELS`. A board with no TX channels (e.g. `DELTA-12G-elp-h 20`, which is 8 RX / 0 TX) shows an amber warning and blocks Send. On startup each side defaults to the first board that can actually do that job. |
 | **Timecode API** | Default `http://10.0.0.31:8888/api/timecode`. **Apply** switches source at runtime — and it is **one setting for the whole application**, so the deck and the Ingest Controller re-dial with it and show the new address immediately. |
 | **Start Timecode** | On-air time on the house clock. `HH:MM:SS:FF`, masked (see below) and validated against the live frame rate. **Now** stamps the realtime timecode **plus two minutes** — stamping the clock exactly would put the cue in the past by the time the rest of the form is filled in, and a start that has gone by plays immediately. |
-| **SOM** (in-point on the media) | The **frame the message plays from**, quoted on the media's own timecode. A three-minute clip with SOM one minute in goes on air one minute in, with that first minute skipped — ffmpeg is given it as a seek. Choosing a file **seeds SOM from that file's start timecode** (EOM moves with it, preserving the duration), and SOM can never be earlier than it, nor at or past the end of the media. It does **not** delay the cue. |
-| **EOM** (end of message) | The matching off-air offset. `EOM − SOM` is the duration. **Set EOM equal to SOM** for no fixed duration: the media loops until stopped. Must not be earlier than SOM. |
+| **SOM** (in-point, from the head) | How far **into the clip** to start, measured from its first frame and independent of whatever timecode the file carries. `00:01:00:00` plays from one minute in, on any clip — ffmpeg is handed it as a seek. Must be shorter than the media. It does **not** delay the cue. |
+| **EOM** (out-point, from the head) | Where to stop, on the same elapsed scale, so `EOM − SOM` is the duration. A 3-minute clip with SOM `00:01:00:00` and EOM `00:03:00:00` plays its last two minutes. Choosing a file **seeds SOM to `00:00:00:00` and EOM to the clip's length**, so it plays whole until you trim it. **Set EOM equal to SOM** for no fixed duration: the media loops until stopped. |
 | **Duration** | **Editable**, and tied to EOM both ways: type a duration and EOM follows (`SOM + duration`); type an EOM and the duration follows (`EOM − SOM`). There is no mode to choose — whichever you last typed into is the one you are driving, and the calculated one is tinted. Moving **SOM** then leaves the field you set alone and re-derives the other. |
 | **Stop Time** | **Read-only** — start timecode + duration, wrapped at 24 h. Start `20:57:26:00` with a two-minute duration stops at `20:59:26:00`, whatever SOM is. |
 | **Audio Tracks** | A list of language beds, each with its own source. **All of them are transmitted at once**, each on its own SDI channel pair — track 1 on CH 1-2, track 2 on CH 3-4, up to 8 tracks (16 channels). The pair is shown on each row. Each has its own **+ / −** trim at **10 ms per tick** (±500 ms) and a **0** reset, independent per language and adjustable while on air. |
@@ -297,17 +297,21 @@ The generator drives the SDI output itself through VideoMaster.
 - **Pacing.** Frames are handed to the card one slot at a time and the card blocks until
   it is ready, so playout is clocked by the SDI output rather than by a software timer.
   There is no drift.
-- **SOM/EOM.** Both are marks **on the media's own timecode**, and SOM is where the media is
-  entered. The output cues at the Start Timecode and cuts to the media at that moment, from
-  the frame at SOM — ffmpeg is given `SOM − media start` as an in-point before `-i`, so the
+- **SOM/EOM.** Both are marks measured **from the head of the media**, and SOM is where the
+  media is entered. The output cues at the Start Timecode and cuts to the media at that
+  moment, from the frame SOM names — ffmpeg is handed SOM as an in-point before `-i`, so the
   seek is by keyframe and then decoded forward, which is frame-accurate. The duration is
-  `EOM − SOM`, and the playlist loops to fill it if the media runs out first. The marks are
-  checked against the media: SOM cannot be earlier than the file's own start timecode, nor
-  at or past its end. ffprobe reports what it found under the drop zone
-  (`length 00:04:28:06, has audio, media TC starts 01:00:00:00`), and that start timecode is
-  what SOM is seeded from when a file is chosen.
-- **The seek is exact.** Verified against a clip with burnt-in timecode starting at
-  `01:00:00:00`: SOM `01:01:00:00` produces a first frame reading `REC TC: 01:01:00:00`.
+  `EOM − SOM`, and the playlist loops to fill it if the media runs out first.
+
+  The file's own embedded timecode is deliberately **not** part of this arithmetic. It is
+  read and shown under the drop zone
+  (`length 00:03:00:00, has audio, media TC starts 00:01:00:00`) and travels in the record as
+  `mediaStartTimecode`, but the marks do not follow it — otherwise the same SOM would mean a
+  different frame on every clip, which is precisely the trap a clip ingested with its own
+  start timecode sets.
+- **The seek is exact.** Verified end to end on a 3-minute clip carrying burnt-in timecode:
+  its head reads `REC TC 02:23:49:02`, and SOM `00:01:00:00` produces a first frame reading
+  `REC TC 02:24:49:02` — one minute later, to the frame.
 - **Decode errors are surfaced.** ffmpeg's stderr is captured, so a file that supplies
   fewer frames than the duration needs is reported with ffmpeg's own explanation rather
   than silently rolling on to the next file.

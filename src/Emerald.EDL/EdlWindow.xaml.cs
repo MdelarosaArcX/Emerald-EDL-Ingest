@@ -608,29 +608,27 @@ public partial class EdlWindow : Window
         ShowFieldError(StartTcError, startOk ? null : startError);
         if (!startOk) problems.Add($"Start timecode: {startError}");
 
-        // SOM and EOM are marks **on the media's own timecode**. SOM is the in-point: the
-        // frame the message starts from, so a three-minute clip with SOM 00:01:00:00 goes on
-        // air one minute in, with that first minute skipped. EOM is the out-point, and the
-        // duration between them is EOM - SOM.
+        // SOM and EOM are marks measured **from the head of the media**, not against whatever
+        // timecode the file happens to carry. SOM 00:01:00:00 is one minute into the clip on
+        // every clip, whether its own timecode starts at zero, at 01:00:00:00, or anywhere
+        // else — which is the only reading under which the same number means the same thing
+        // twice. EOM is the out-point on that same elapsed scale, and the duration between
+        // them is EOM - SOM: a three-minute clip marked SOM 00:01:00:00, EOM 00:03:00:00
+        // plays its last two minutes.
         //
-        // The marks are quoted against the media's own start timecode, which broadcast media
-        // conventionally puts at 01:00:00:00 rather than zero — so SOM is seeded from the
-        // file when one is chosen, and can never be earlier than it.
+        // The file's own start timecode is still read and shown under the drop zone, and
+        // still travels in the record as mediaStartTimecode — it is reference, not arithmetic.
         //
         // The fields are fixed-width masks and can never be empty, so an open-ended message
         // is expressed as EOM equal to SOM - a zero duration, which is the same 00:00:00:00
         // pair the boxes start out holding.
-        Timecode mediaStart = MediaStart(rate);
-
         Timecode som = Timecode.Zero(rate);
         string? somEomError = null;
 
         if (!Timecode.TryParse(SomBox.Text, rate, out som, out string? somErr))
             somEomError = $"SOM: {somErr}";
-        else if (som.TotalFrames < mediaStart.TotalFrames)
-            somEomError = $"SOM cannot be earlier than the media's own start timecode ({mediaStart}).";
-        else if (MediaEnd(rate) is { } mediaEnd && som.TotalFrames >= mediaEnd.TotalFrames)
-            somEomError = $"SOM is at or past the end of the media ({mediaEnd}); there would be nothing to play.";
+        else if (MediaLength(rate) is { } length && som.TotalFrames >= length.TotalFrames)
+            somEomError = $"SOM {som} is at or past the end of the media, which is {length} long.";
 
         Timecode? duration = null;
 
@@ -731,70 +729,70 @@ public partial class EdlWindow : Window
     }
 
     /// <summary>
-    /// Puts SOM at the head of the newly chosen media, and moves EOM with it so the duration
-    /// the operator had set is preserved rather than being silently re-interpreted against a
-    /// different file.
+    /// Marks the whole of a newly chosen clip: SOM at its head, EOM at its tail.
+    ///
+    /// Play-it-all is the only sensible default, and it makes the pair immediately readable —
+    /// EOM is the clip's length, so trimming from either end is a matter of moving one mark
+    /// and watching the duration follow. When ffprobe cannot say how long the media is, the
+    /// duration already on screen is kept rather than guessed at.
     /// </summary>
     private void SeedMarksFromMedia()
     {
         int rate = _frameRate > 0 ? _frameRate : FallbackFrameRate;
-        Timecode mediaStart = MediaStart(rate);
 
-        long keepDuration =
-            Timecode.TryParse(SomBox.Text, rate, out Timecode oldSom, out _) &&
-            Timecode.TryParse(EomBox.Text, rate, out Timecode oldEom, out _) &&
-            oldEom.TotalFrames >= oldSom.TotalFrames
-                ? oldEom.TotalFrames - oldSom.TotalFrames
-                : 0;
+        long outPoint;
 
-        // Never longer than the media itself: a duration carried over from a longer file
-        // would otherwise loop this one to fill the difference.
-        if (MediaEnd(rate) is { } mediaEnd)
-            keepDuration = Math.Min(keepDuration, mediaEnd.TotalFrames - mediaStart.TotalFrames);
+        if (MediaLength(rate) is { } length)
+        {
+            outPoint = length.TotalFrames;
+        }
+        else
+        {
+            outPoint =
+                Timecode.TryParse(SomBox.Text, rate, out Timecode oldSom, out _) &&
+                Timecode.TryParse(EomBox.Text, rate, out Timecode oldEom, out _) &&
+                oldEom.TotalFrames >= oldSom.TotalFrames
+                    ? oldEom.TotalFrames - oldSom.TotalFrames
+                    : 0;
+        }
 
         _syncingTiming = true;
         try
         {
-            SomBox.Text = mediaStart.ToString();
-            EomBox.Text = mediaStart.AddWrapping(keepDuration).ToString();
+            SomBox.Text = Timecode.Zero(rate).ToString();
+            EomBox.Text = new Timecode(outPoint, rate).ToString();
         }
         finally
         {
             _syncingTiming = false;
         }
 
-        Log(_mediaInfo is { HasEmbeddedTimecode: true }
-                ? $"SOM set to the media's start timecode {mediaStart}."
-                : $"This media carries no timecode; SOM set to {mediaStart}.",
+        Log(MediaLength(rate) is { } len
+                ? $"Marked the whole clip: SOM 00:00:00:00, EOM {len}." +
+                  (_mediaInfo is { HasEmbeddedTimecode: true, StartTimecode: var start }
+                      ? $" Its own timecode starts at {start.Rebase(rate)}, which the marks do not follow."
+                      : "")
+                : "Media length is unknown, so the marks were left as they were.",
             LogLevel.Info);
 
         UpdatePreviewAndValidation();
     }
 
-    /// <summary>
-    /// The media's own start timecode — where its first frame sits. Broadcast media
-    /// conventionally starts at 01:00:00:00; a file with no embedded timecode, or no media at
-    /// all, starts at zero, which is what makes SOM read as a plain offset in that case.
-    /// </summary>
-    private Timecode MediaStart(int rate) =>
-        _mediaInfo is { HasEmbeddedTimecode: true } info ? info.StartTimecode.Rebase(rate) : Timecode.Zero(rate);
-
-    /// <summary>Where the media runs out, or null when its length is unknown.</summary>
-    private Timecode? MediaEnd(int rate) =>
+    /// <summary>How long the media runs, or null when ffprobe could not say.</summary>
+    private Timecode? MediaLength(int rate) =>
         _mediaInfo is { } info && info.Duration > TimeSpan.Zero
-            ? MediaStart(rate).AddWrapping((long)Math.Round(info.Duration.TotalSeconds * rate))
+            ? new Timecode((long)Math.Round(info.Duration.TotalSeconds * rate), rate)
             : null;
 
     /// <summary>
-    /// How far into the file the decoder must seek to reach SOM. This is the whole of what
-    /// SOM does now: ffmpeg is given it as an in-point, so the first frame on air is the
-    /// frame at SOM rather than the head of the file.
+    /// How far into the file the decoder seeks to reach SOM — which, SOM being measured from
+    /// the head, is simply SOM. This is the whole of what SOM does: ffmpeg is handed it as an
+    /// in-point, so the first frame on air is the one SOM names.
     /// </summary>
-    private TimeSpan SeekFor(Timecode som, int rate)
-    {
-        long frames = som.TotalFrames - MediaStart(rate).TotalFrames;
-        return frames <= 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(frames / (double)rate);
-    }
+    private static TimeSpan SeekFor(Timecode som, int rate) =>
+        som.TotalFrames <= 0 || rate <= 0
+            ? TimeSpan.Zero
+            : TimeSpan.FromSeconds(som.TotalFrames / (double)rate);
 
     private static EdlCommand.BoardRef Describe(BoardInfo board) =>
         new() { Index = board.Index, Model = board.Model, Type = board.BoardType };

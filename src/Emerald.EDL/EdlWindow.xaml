@@ -183,15 +183,15 @@
                                 </Grid.ColumnDefinitions>
 
                                 <StackPanel Grid.Column="0">
-                                    <TextBlock Text="SOM (in-point on the media)" Style="{StaticResource FieldLabel}"
-                                               ToolTip="The frame the message plays from. Seeded from the media's own start timecode when you choose a file."/>
+                                    <TextBlock Text="SOM (in-point, from the head)" Style="{StaticResource FieldLabel}"
+                                               ToolTip="How far into the clip to start. 00:01:00:00 plays from one minute in, on any clip."/>
                                     <TextBox x:Name="SomBox" FontFamily="Consolas" FontSize="15"
                                              core:TimecodeMask.Enabled="True" TextChanged="Som_Changed"/>
                                 </StackPanel>
 
                                 <StackPanel Grid.Column="2">
-                                    <TextBlock Text="EOM (end of message)" Style="{StaticResource FieldLabel}"
-                                               ToolTip="Sets the duration together with the other mark"/>
+                                    <TextBlock Text="EOM (out-point, from the head)" Style="{StaticResource FieldLabel}"
+                                               ToolTip="How far into the clip to stop. Seeded to the clip's length, so it plays to the end."/>
                                     <TextBox x:Name="EomBox" FontFamily="Consolas" FontSize="15"
                                              core:TimecodeMask.Enabled="True" TextChanged="Eom_Changed"/>
                                 </StackPanel>
@@ -199,7 +199,7 @@
                             <TextBlock x:Name="SomEomError" Style="{StaticResource Hint}"
                                        Foreground="{StaticResource Bad}" Visibility="Collapsed"/>
                             <TextBlock Style="{StaticResource Hint}"
-                                       Text="Marks on the media's own timecode: video plays from SOM, so a SOM one minute in skips the first minute. Set EOM equal to SOM to loop until stopped."/>
+                                       Text="Measured from the head of the clip, whatever timecode it carries. A 3-minute clip with SOM 00:01:00:00 and EOM 00:03:00:00 plays its last 2 minutes. Set EOM equal to SOM to loop until stopped."/>
 
                             <Grid Margin="0,14,0,0">
                                 <Grid.ColumnDefinitions>
