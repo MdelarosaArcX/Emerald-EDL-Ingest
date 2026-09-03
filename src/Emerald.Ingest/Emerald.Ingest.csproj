@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Emerald.Ingest</RootNamespace>
+    <AssemblyName>Emerald.Ingest</AssemblyName>
+    <!-- VideoMasterHD.dll in System32 is 64-bit, so every assembly in the process must be. -->
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The ingest controller orchestrates; it owns no hardware, no encoder and no store of
+         its own. Everything below this line already existed. -->
+    <ProjectReference Include="..\Emerald.Core\Emerald.Core.csproj" />
+    <ProjectReference Include="..\Emerald.Deltacast\Emerald.Deltacast.csproj" />
+    <ProjectReference Include="..\Emerald.Video\Emerald.Video.csproj" />
+    <ProjectReference Include="..\Emerald.Media\Emerald.Media.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Queued jobs have to outlive the process: an ingest booked for 03:00 must still be
+         there after a restart. Emerald's settings.json is the wrong shape for a job history,
+         so this is the one place a database earns its keep. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.11" />
+  </ItemGroup>
+
+</Project>

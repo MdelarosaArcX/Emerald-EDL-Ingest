@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Emerald.Video</RootNamespace>
+    <AssemblyName>Emerald.Video</AssemblyName>
+    <!-- VideoMasterHD.dll in System32 is 64-bit, so every assembly in the process must be. -->
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <!-- UyvyPreview walks the slot buffer directly; a per-pixel marshalled copy would not keep up. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Emerald.Core\Emerald.Core.csproj" />
+    <ProjectReference Include="..\Emerald.Deltacast\Emerald.Deltacast.csproj" />
+  </ItemGroup>
+</Project>

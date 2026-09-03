@@ -1,0 +1,484 @@
+<Window x:Class="Emerald.Edl.EdlWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:Emerald.Edl"
+        xmlns:core="clr-namespace:Emerald.Core;assembly=Emerald.Core"
+        Title="EDL Generator" Height="1010" Width="1180" MinHeight="760" MinWidth="1000"
+        Background="{StaticResource Bg}" WindowStartupLocation="CenterScreen"
+        TextOptions.TextFormattingMode="Display" UseLayoutRounding="True">
+
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header: identity + realtime timecode -->
+        <Border Grid.Row="0" Style="{StaticResource Card}" Padding="20,14" Margin="0,0,0,14">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                    <TextBlock Text="EDL GENERATOR" Foreground="{StaticResource Text}"
+                               FontSize="17" FontWeight="Bold"/>
+                    <TextBlock x:Name="ApiInfoText" Text="VideoMaster SDK -" Style="{StaticResource Hint}"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" HorizontalAlignment="Right">
+                    <TextBlock Text="REALTIME TIMECODE" Foreground="{StaticResource Muted}"
+                               FontSize="10" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+                    <TextBlock x:Name="TcDisplay" Text="--:--:--:--" FontFamily="Consolas"
+                               FontSize="42" FontWeight="Bold" Foreground="{StaticResource Tc}"
+                               HorizontalAlignment="Right" Margin="0,-2,0,0"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,2,0,0">
+                        <Ellipse x:Name="TcDot" Width="8" Height="8" Fill="{StaticResource Muted}"
+                                 VerticalAlignment="Center" Margin="0,0,7,0"/>
+                        <TextBlock x:Name="TcStatusText" Text="connecting..." Foreground="{StaticResource Muted}"
+                                   FontSize="11" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Main: signal path + EDL command -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="1*" MinWidth="360"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="1.15*" MinWidth="400"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Left: hardware + transport -->
+            <Border Grid.Column="0" Style="{StaticResource Card}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,12">
+                            <TextBlock Text="SIGNAL PATH" Style="{StaticResource SectionHeader}" Margin="0"/>
+                            <Button x:Name="RefreshBoardsButton" Content="Rescan"
+                                    Style="{StaticResource GhostButton}" HorizontalAlignment="Right"
+                                    Height="22" Padding="10,0" FontSize="11" Click="RefreshBoards_Click"/>
+                        </Grid>
+
+                        <!-- Capture and playback are chosen independently: the RX may live on
+                             one board and the TX on another. -->
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="14"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="CAPTURE" Foreground="{StaticResource Tc}" FontSize="10.5"
+                                           FontWeight="SemiBold" Margin="0,0,0,8"/>
+                                <TextBlock Text="Board" Style="{StaticResource FieldLabel}"/>
+                                <ComboBox x:Name="CaptureBoardCombo" Tag="no board detected"
+                                          SelectionChanged="CaptureBoardCombo_SelectionChanged"/>
+                                <TextBlock x:Name="CaptureBoardInfo" Style="{StaticResource Hint}" Text="Scanning..."/>
+                                <TextBlock Text="Capture Port" Style="{StaticResource FieldLabel}" Margin="0,12,0,5"/>
+                                <ComboBox x:Name="CaptureCombo" Tag="no RX channel"
+                                          SelectionChanged="PortCombo_SelectionChanged"/>
+                                <TextBlock x:Name="CaptureWarning" Style="{StaticResource Hint}"
+                                           Foreground="{StaticResource Warn}" Visibility="Collapsed"
+                                           Text="No RX channels on this board."/>
+                            </StackPanel>
+
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="PLAYBACK" Foreground="{StaticResource Tc}" FontSize="10.5"
+                                           FontWeight="SemiBold" Margin="0,0,0,8"/>
+                                <TextBlock Text="Board" Style="{StaticResource FieldLabel}"/>
+                                <ComboBox x:Name="PlaybackBoardCombo" Tag="no board detected"
+                                          SelectionChanged="PlaybackBoardCombo_SelectionChanged"/>
+                                <TextBlock x:Name="PlaybackBoardInfo" Style="{StaticResource Hint}" Text="Scanning..."/>
+                                <TextBlock Text="Playback Port" Style="{StaticResource FieldLabel}" Margin="0,12,0,5"/>
+                                <ComboBox x:Name="PlaybackCombo" Tag="no TX channel"
+                                          SelectionChanged="PortCombo_SelectionChanged"/>
+                                <TextBlock x:Name="PlaybackWarning" Style="{StaticResource Hint}"
+                                           Foreground="{StaticResource Warn}" Visibility="Collapsed"
+                                           Text="No TX channels on this board - it cannot play out."/>
+                            </StackPanel>
+                        </Grid>
+
+                        <Border Height="1" Background="{StaticResource Line}" Margin="0,20,0,18"/>
+
+                        <TextBlock Text="TIMECODE SOURCE" Style="{StaticResource SectionHeader}"/>
+
+                        <TextBlock Text="Timecode API" Style="{StaticResource FieldLabel}"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBox x:Name="ApiUrlBox" Grid.Column="0" Text="http://10.0.0.31:8888/api/timecode"/>
+                            <Button x:Name="ApplyApiButton" Grid.Column="1" Content="Apply"
+                                    Style="{StaticResource GhostButton}" Margin="8,0,0,0"
+                                    Click="ApplyApi_Click"/>
+                        </Grid>
+                        <TextBlock x:Name="TcMetaText" Style="{StaticResource Hint}"
+                                   Text="Waiting for the first sample..."/>
+
+                        <Border Height="1" Background="{StaticResource Line}" Margin="0,20,0,18"/>
+
+                        <TextBlock Text="CAPTURE" Style="{StaticResource SectionHeader}"/>
+
+                        <TextBlock Text="Recording folder" Style="{StaticResource FieldLabel}"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBox x:Name="CaptureFolderBox" Grid.Column="0"
+                                     TextChanged="CaptureFolder_Changed"/>
+                            <Button x:Name="BrowseCaptureButton" Grid.Column="1" Content="Browse..."
+                                    Style="{StaticResource GhostButton}" Margin="8,0,0,0"
+                                    Click="BrowseCaptureFolder_Click"/>
+                        </Grid>
+                        <TextBlock x:Name="CaptureFolderHint" Style="{StaticResource Hint}"
+                                   Text="Leave empty for no recording. RX is recorded while a message is on air, in 2-minute files."/>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+
+            <!-- Right: the EDL command itself -->
+            <Border Grid.Column="2" Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <TextBlock Text="EDL COMMAND" Style="{StaticResource SectionHeader}"/>
+
+                            <TextBlock Text="Start Timecode" Style="{StaticResource FieldLabel}"/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="StartTcBox" Grid.Column="0" Text="00:00:00:00"
+                                         FontFamily="Consolas" FontSize="15"
+                                         core:TimecodeMask.Enabled="True"
+                                         TextChanged="EdlField_Changed"/>
+                                <Button x:Name="NowButton" Grid.Column="1" Content="Now"
+                                        Style="{StaticResource GhostButton}" Margin="8,0,0,0"
+                                        Click="Now_Click" ToolTip="Copy the realtime timecode into this field"/>
+                            </Grid>
+                            <TextBlock x:Name="StartTcError" Style="{StaticResource Hint}"
+                                       Foreground="{StaticResource Bad}" Visibility="Collapsed"/>
+                            <TextBlock Style="{StaticResource Hint}" Text="HH:MM:SS:FF - type digits only, the colons are added for you"/>
+
+                            <!-- SOM/EOM are in-points on the media; Duration and Stop Time
+                                 are derived from them and are never typed. -->
+                            <Grid Margin="0,18,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="12"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="SOM (start of message)" Style="{StaticResource FieldLabel}"
+                                               ToolTip="Sets the duration together with the other mark"/>
+                                    <TextBox x:Name="SomBox" FontFamily="Consolas" FontSize="15"
+                                             core:TimecodeMask.Enabled="True" TextChanged="Som_Changed"/>
+                                </StackPanel>
+
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="EOM (end of message)" Style="{StaticResource FieldLabel}"
+                                               ToolTip="Sets the duration together with the other mark"/>
+                                    <TextBox x:Name="EomBox" FontFamily="Consolas" FontSize="15"
+                                             core:TimecodeMask.Enabled="True" TextChanged="Eom_Changed"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock x:Name="SomEomError" Style="{StaticResource Hint}"
+                                       Foreground="{StaticResource Bad}" Visibility="Collapsed"/>
+                            <TextBlock Style="{StaticResource Hint}"
+                                       Text="SOM and EOM are the marks. Set EOM equal to SOM to loop until stopped."/>
+
+                            <Grid Margin="0,14,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="12"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Duration (EOM - SOM)" Style="{StaticResource FieldLabel}"/>
+                                    <TextBox x:Name="DurationBox" FontFamily="Consolas" FontSize="15"
+                                             core:TimecodeMask.Enabled="True" TextChanged="Duration_Changed"/>
+                                </StackPanel>
+
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Stop Time (on air + duration)" Style="{StaticResource FieldLabel}"/>
+                                    <TextBox x:Name="StopTimeBox" FontFamily="Consolas" FontSize="15"
+                                             IsReadOnly="True" IsTabStop="False" Focusable="False"
+                                             Foreground="{StaticResource Tc}" Text="--:--:--:--"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock x:Name="DerivedHint" Style="{StaticResource Hint}"
+                                       Text="Edit either EOM or Duration - each follows the other. Video goes on air at start + SOM."/>
+
+                            <Grid Margin="0,16,0,5">
+                                <TextBlock Text="Audio Tracks" Style="{StaticResource FieldLabel}" Margin="0"/>
+                                <Button x:Name="AddAudioButton" Content="Add track..."
+                                        Style="{StaticResource GhostButton}" HorizontalAlignment="Right"
+                                        Height="22" Padding="10,0" FontSize="11" Click="AddAudioTrack_Click"/>
+                            </Grid>
+
+                            <Border x:Name="AudioDropZone" AllowDrop="True" MinHeight="52" CornerRadius="5"
+                                    Background="{StaticResource PanelDeep}" BorderBrush="{StaticResource Line}"
+                                    BorderThickness="1" Padding="10,8"
+                                    Drop="AudioDropZone_Drop" DragOver="AudioDropZone_DragOver"
+                                    DragLeave="AudioDropZone_DragLeave">
+                                <StackPanel>
+                                    <TextBlock x:Name="AudioEmptyText" Foreground="#5C6474" FontSize="12"
+                                               TextWrapping="Wrap"
+                                               Text="No audio - video plays out silent. Drop audio files or folders here, or Add track."/>
+
+                                    <ScrollViewer MaxHeight="150" VerticalScrollBarVisibility="Auto">
+                                    <ItemsControl x:Name="AudioTrackList">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Background="#151A21" CornerRadius="4" Padding="7,5"
+                                                        Margin="0,0,0,4" BorderThickness="1" BorderBrush="{StaticResource Line}"
+                                                        ToolTip="{Binding Source}">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="*" MinWidth="70"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                        </Grid.ColumnDefinitions>
+
+                                                        <RadioButton Grid.Column="0" GroupName="DefaultAudio"
+                                                                     Foreground="{StaticResource Muted}" FontSize="10.5"
+                                                                     VerticalAlignment="Center" Margin="0,0,7,0"
+                                                                     IsChecked="{Binding IsDefault, Mode=TwoWay}"
+                                                                     Checked="AudioDefault_Checked"
+                                                                     ToolTip="Language on air when the message starts"/>
+
+                                                        <TextBox Grid.Column="1"
+                                                                 Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}"
+                                                                 FontSize="12" Height="25" Padding="5,2"
+                                                                 ToolTip="Language name"/>
+
+                                                        <Button Grid.Column="2" Content="&#8211;" Style="{StaticResource GhostButton}"
+                                                                Width="27" Height="25" FontSize="14" Padding="0" Margin="6,0,0,0"
+                                                                IsEnabled="{Binding CanDecrease}" Click="AudioTrackMinus_Click"
+                                                                ToolTip="Advance this language by 10 ms"/>
+
+                                                        <Border Grid.Column="3" Background="{StaticResource PanelDeep}"
+                                                                BorderBrush="{StaticResource Line}" BorderThickness="1"
+                                                                CornerRadius="4" Margin="4,0" Width="72" Height="25">
+                                                            <TextBlock Text="{Binding OffsetText}" FontFamily="Consolas"
+                                                                       FontSize="12" Foreground="{StaticResource Tc}"
+                                                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                        </Border>
+
+                                                        <Button Grid.Column="4" Content="+" Style="{StaticResource GhostButton}"
+                                                                Width="27" Height="25" FontSize="14" Padding="0"
+                                                                IsEnabled="{Binding CanIncrease}" Click="AudioTrackPlus_Click"
+                                                                ToolTip="Delay this language by 10 ms"/>
+
+                                                        <Button Grid.Column="5" Content="0" Style="{StaticResource GhostButton}"
+                                                                Width="25" Height="25" FontSize="11" Padding="0" Margin="4,0,0,0"
+                                                                Click="AudioTrackReset_Click" ToolTip="Reset this offset to zero"/>
+
+                                                        <Button Grid.Column="6" Content="{Binding OnAirText}"
+                                                                Style="{StaticResource GhostButton}" Height="25"
+                                                                Padding="9,0" FontSize="10" Margin="6,0,0,0"
+                                                                Click="AudioTakeOnAir_Click"
+                                                                ToolTip="Put this language on air now"/>
+
+                                                        <Button Grid.Column="7" Content="&#215;" Style="{StaticResource GhostButton}"
+                                                                Width="25" Height="25" Padding="0" FontSize="12" Margin="4,0,0,0"
+                                                                Click="RemoveAudioTrack_Click" ToolTip="Remove this track"/>
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    </ScrollViewer>
+                                </StackPanel>
+                            </Border>
+                            <TextBlock x:Name="AudioTracksHint" Style="{StaticResource Hint}"
+                                       Text="One language on air at a time, on channels 1-2. 10 ms per tick, +/-500 ms, each track independent. Take switches live without touching video."/>
+
+                            <TextBlock Text="Post Play" Style="{StaticResource FieldLabel}" Margin="0,14,0,5"/>
+                            <ComboBox x:Name="PostPlayCombo" SelectionChanged="PortCombo_SelectionChanged"/>
+                            <TextBlock Style="{StaticResource Hint}"
+                                       Text="What the TX carries once the message ends, until the next one cues."/>
+
+                            <TextBlock Text="Media Source" Style="{StaticResource FieldLabel}" Margin="0,18,0,5"/>
+                            <Border x:Name="MediaDropZone" AllowDrop="True" MinHeight="86" CornerRadius="5"
+                                    Background="{StaticResource PanelDeep}" BorderBrush="{StaticResource Line}"
+                                    BorderThickness="1" Padding="14,12" Cursor="Hand"
+                                    Drop="MediaDropZone_Drop" DragOver="MediaDropZone_DragOver"
+                                    DragLeave="MediaDropZone_DragLeave"
+                                    MouseLeftButtonUp="MediaDropZone_Click">
+                                <StackPanel VerticalAlignment="Center">
+                                    <TextBlock x:Name="MediaPathText" Text="Optional - drop a folder or file here, or click to browse"
+                                               Foreground="#5C6474" FontSize="12.5" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="MediaSummaryText" Style="{StaticResource Hint}"
+                                               Visibility="Collapsed"/>
+                                </StackPanel>
+                            </Border>
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                <Button x:Name="BrowseFolderButton" Content="Browse folder..."
+                                        Style="{StaticResource GhostButton}" Click="BrowseFolder_Click"/>
+                                <Button x:Name="BrowseFileButton" Content="Browse file..."
+                                        Style="{StaticResource GhostButton}" Margin="8,0,0,0"
+                                        Click="BrowseFile_Click"/>
+                                <Button x:Name="ClearMediaButton" Content="Clear"
+                                        Style="{StaticResource GhostButton}" Margin="8,0,0,0"
+                                        Click="ClearMedia_Click"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </ScrollViewer>
+
+                    <StackPanel Grid.Row="1" Margin="0,16,0,0">
+                        <Button x:Name="SendButton" Content="SEND EDL" Style="{StaticResource PrimaryButton}"
+                                Click="SendEdl_Click" ToolTip="Adds this message to the playout queue"/>
+                        <TextBlock x:Name="SendStatusText" Style="{StaticResource Hint}"
+                                   HorizontalAlignment="Center" TextAlignment="Center"/>
+
+                        <!-- Playout state: hidden until an EDL actually puts video on TX. -->
+                        <Border x:Name="PlayoutBar" Margin="0,12,0,0" Padding="12,10" CornerRadius="5"
+                                Background="{StaticResource PanelDeep}" BorderBrush="{StaticResource Line}"
+                                BorderThickness="1" Visibility="Collapsed">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+
+                                <Ellipse x:Name="PlayoutDot" Grid.Column="0" Width="9" Height="9"
+                                         Fill="{StaticResource Muted}" VerticalAlignment="Center"
+                                         Margin="0,0,10,0"/>
+
+                                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                    <TextBlock x:Name="PlayoutStateText" Foreground="{StaticResource Text}"
+                                               FontSize="12.5" TextWrapping="Wrap" Text="Idle"/>
+                                    <TextBlock x:Name="PlayoutDetailText" Style="{StaticResource Hint}"
+                                               Margin="0,2,0,0"/>
+                                </StackPanel>
+
+                                <Button x:Name="StopPlayoutButton" Grid.Column="2" Content="STOP"
+                                        Style="{StaticResource GhostButton}" Height="30" Padding="16,0"
+                                        Foreground="{StaticResource Bad}" FontWeight="SemiBold"
+                                        Visibility="Collapsed" Click="StopPlayout_Click"/>
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- Activity log + payload preview -->
+        <Grid Grid.Row="2" Margin="0,14,0,0" Height="212">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="1*" MinWidth="360"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="1.15*" MinWidth="400"/>
+            </Grid.ColumnDefinitions>
+
+            <Border Grid.Column="0" Style="{StaticResource Card}" Padding="16,12">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Grid Grid.Row="0" Margin="0,0,0,8">
+                    <TextBlock Text="ACTIVITY" Style="{StaticResource SectionHeader}" Margin="0"/>
+                    <Button x:Name="ClearLogButton" Content="Clear" Style="{StaticResource GhostButton}"
+                            HorizontalAlignment="Right" Height="22" Padding="10,0" FontSize="11"
+                            Click="ClearLog_Click"/>
+                </Grid>
+                <ScrollViewer x:Name="LogScroller" Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                    <ItemsControl x:Name="LogList">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,1">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{Binding Time}" FontFamily="Consolas"
+                                               FontSize="11.5" Foreground="#5C6474" Margin="0,0,10,0"/>
+                                    <TextBlock Grid.Column="1" Text="{Binding Message}" FontFamily="Consolas"
+                                               FontSize="11.5" Foreground="{Binding Brush}" TextWrapping="Wrap"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </Grid>
+            </Border>
+
+            <Border Grid.Column="2" Style="{StaticResource Card}" Padding="16,12">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0" Margin="0,0,0,8">
+                        <TextBlock x:Name="QueueHeader" Text="QUEUE" Style="{StaticResource SectionHeader}" Margin="0"/>
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button x:Name="CopyPayloadButton" Content="Copy JSON" Style="{StaticResource GhostButton}"
+                                    Height="22" Padding="10,0" FontSize="11" Click="CopyPayload_Click"/>
+                            <Button x:Name="ClearQueueButton" Content="Clear finished" Style="{StaticResource GhostButton}"
+                                    Height="22" Padding="10,0" FontSize="11" Margin="6,0,0,0"
+                                    Click="ClearQueue_Click"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <Grid Grid.Row="1">
+                        <TextBlock x:Name="QueueEmptyText" Foreground="#5C6474" FontSize="12"
+                                   VerticalAlignment="Top" Text="Nothing queued. Send EDL adds a message here."/>
+                        <ScrollViewer x:Name="QueueScroller" VerticalScrollBarVisibility="Auto">
+                            <ItemsControl x:Name="QueueList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Background="#151A21" CornerRadius="4" Padding="9,6" Margin="0,0,0,4"
+                                                BorderThickness="1" BorderBrush="{Binding Accent}">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Ellipse Grid.Column="0" Width="8" Height="8" Margin="0,0,9,0"
+                                                         VerticalAlignment="Top" Fill="{Binding Accent}"/>
+                                                <StackPanel Grid.Column="1">
+                                                    <TextBlock FontFamily="Consolas" FontSize="11.5"
+                                                               Foreground="{Binding Accent}" Text="{Binding Headline}"/>
+                                                    <TextBlock FontFamily="Consolas" FontSize="11"
+                                                               Foreground="#8A93A3" Text="{Binding Timing}"
+                                                               Margin="0,2,0,0"/>
+                                                    <TextBlock FontFamily="Consolas" FontSize="11"
+                                                               Foreground="#6B7382" Text="{Binding Media}"
+                                                               TextTrimming="CharacterEllipsis"/>
+                                                </StackPanel>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </Grid>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

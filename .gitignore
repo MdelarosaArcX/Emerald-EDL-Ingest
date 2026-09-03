@@ -1,0 +1,95 @@
+# ---------------------------------------------------------------------------
+#  Emerald
+#
+#  Two things must never reach the repository: build output, and video.
+#  The media store alone is hundreds of gigabytes of recorded ProRes, and a
+#  single segment is well over a gigabyte, so the video rules below are
+#  deliberately broad. If you ever do need to commit a media file - a small
+#  fixture, say - "git add -f <path>" will override any of them.
+# ---------------------------------------------------------------------------
+
+# --- build output ----------------------------------------------------------
+# Every project writes to bin\x64\<Config>\... ; obj holds the generated XAML
+# partial classes and the restored package graph. All of it is reproducible
+# from a "dotnet build".
+[Bb]in/
+[Oo]bj/
+
+# --- the media store -------------------------------------------------------
+# Recordings, ingested clips, EDL captures. The folder itself is kept (see
+# media/.gitkeep) because RecordingSetup refuses to record into a directory
+# that is not there, so a fresh clone should still have somewhere to write.
+/media/*
+!/media/.gitkeep
+
+# --- video and audio anywhere else -----------------------------------------
+# A safety net for a clip dropped next to the solution or into a test folder.
+*.mov
+*.mp4
+*.mxf
+*.mkv
+*.avi
+*.m2ts
+*.mts
+*.m2t
+*.ts
+*.gxf
+*.lxf
+*.webm
+*.yuv
+*.raw
+*.wav
+*.mp3
+*.aac
+*.m4a
+*.flac
+*.ac3
+*.eac3
+
+# --- tools that are installed, not committed -------------------------------
+# ffmpeg is resolved at run time from the app folder, PATH, or C:\ffmpeg\bin.
+ffmpeg.exe
+ffprobe.exe
+
+# --- local state -----------------------------------------------------------
+# settings.json and ingest.db live in %APPDATA%\Emerald, not here, but a copy
+# dropped alongside the app for testing should not be committed either.
+settings.json
+*.db
+*.db-shm
+*.db-wal
+
+# --- IDE and tooling -------------------------------------------------------
+.vs/
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.csproj.user
+
+# --- MSBuild and NuGet -----------------------------------------------------
+*.binlog
+msbuild.log
+msbuild.err
+msbuild.wrn
+packages/
+*.nupkg
+*.snupkg
+.nuget/
+
+# --- test output -----------------------------------------------------------
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coverlet.json
+coverage*.xml
+coverage*.json
+
+# --- OS clutter ------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store

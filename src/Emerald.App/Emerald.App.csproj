@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>Emerald.App</RootNamespace>
+    <AssemblyName>Emerald.App</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- VideoMasterHD.dll in System32 is 64-bit, so the host process must be too. -->
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <!-- RxPreview walks the UYVY slot buffer directly; a per-pixel marshalled copy would not keep up. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Emerald.Core\Emerald.Core.csproj" />
+    <ProjectReference Include="..\Emerald.Deltacast\Emerald.Deltacast.csproj" />
+    <ProjectReference Include="..\Emerald.Video\Emerald.Video.csproj" />
+    <ProjectReference Include="..\Emerald.Media\Emerald.Media.csproj" />
+    <ProjectReference Include="..\Emerald.EDL\Emerald.EDL.csproj" />
+    <ProjectReference Include="..\Emerald.LiveEdit\Emerald.LiveEdit.csproj" />
+    <ProjectReference Include="..\Emerald.Ingest\Emerald.Ingest.csproj" />
+  </ItemGroup>
+
+</Project>

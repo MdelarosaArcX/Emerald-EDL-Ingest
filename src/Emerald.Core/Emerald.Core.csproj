@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Emerald.Core</RootNamespace>
+    <AssemblyName>Emerald.Core</AssemblyName>
+    <!-- TimecodeMask is a WPF attached behaviour: every module that types a timecode into a
+         TextBox shares it, so it lives here rather than in whichever module needed it first. -->
+    <UseWPF>true</UseWPF>
+    <!-- VideoMasterHD.dll in System32 is 64-bit, so every assembly in the process must be. -->
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+</Project>
