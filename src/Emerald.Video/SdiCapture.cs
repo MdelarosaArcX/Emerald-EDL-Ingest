@@ -455,7 +455,7 @@ public sealed class SdiCapture : IDisposable
         // the EDL records with whatever they were left on.
         foreach (string a in request.Profile.EncoderArguments(
                      format, pipeName, request.Folder, request.NamePrefix, SampleRate,
-                     request.SingleFile, request.StartTimecode))
+                     request.SingleFile, request.StartTimecode, request.DelayFile))
             info.ArgumentList.Add(a);
 
         Process ff = Process.Start(info) ?? throw new InvalidOperationException("Could not start ffmpeg for capture.");

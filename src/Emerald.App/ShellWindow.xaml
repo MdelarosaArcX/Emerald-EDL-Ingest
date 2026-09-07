@@ -29,7 +29,10 @@
                     <Button Content="Capture" Style="{StaticResource IpNavActive}"
                             ToolTip="This deck"/>
                     <Button Content="Playback" Style="{StaticResource IpNav}"
-                            Click="Playback_Click" ToolTip="Open Live Edit"/>
+                            Click="Playback_Click"
+                            ToolTip="Open the playback deck: transmit, preview and tidal lock"/>
+                    <Button Content="Live Edit" Style="{StaticResource IpNav}"
+                            Click="LiveEdit_Click" ToolTip="Open Live Edit"/>
                     <Button Content="Logging" Style="{StaticResource IpNav}"
                             Click="Logging_Click" ToolTip="Open the EDL Generator and its activity log"/>
                     <Button Content="Ingest" Style="{StaticResource IpNav}"
@@ -274,9 +277,11 @@
                               VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                     <StackPanel>
 
-                        <!-- Confidence monitor on the receiver being recorded -->
+                        <!-- Confidence monitor on the receiver being recorded. 196 high fills the
+                             352-wide deck at 16:9, so the picture uses the whole column instead
+                             of sitting pillarboxed inside it. -->
                         <Border Background="{StaticResource IpStage}" BorderBrush="{StaticResource IpTeal}"
-                                BorderThickness="1.5" CornerRadius="4" Height="104">
+                                BorderThickness="1.5" CornerRadius="4" Height="196">
                             <Grid>
                                 <Image x:Name="PreviewImage" Stretch="Uniform" Margin="1"
                                        RenderOptions.BitmapScalingMode="HighQuality"/>

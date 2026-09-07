@@ -94,6 +94,7 @@ public partial class ShellWindow : Window
     private EdlWindow? _edl;
     private LiveEditWindow? _liveEdit;
     private IngestControllerWindow? _ingest;
+    private PlaybackWindow? _playback;
 
     // Player
     private bool _playing;
@@ -854,10 +855,17 @@ public partial class ShellWindow : Window
         _settings.CaptureFrameRate = SelectedRate();
         _settings.CaptureFolder = folder;
 
+        // Tidal lock is armed from the playback deck, and only takes effect from the next
+        // recording: the delay line has to be opened by the same encoder pass as the rest, so
+        // it cannot be added to a recording already under way.
+        bool tidalLock = TidalLock.Shared.State == TidalLockState.Armed;
+
         if (!RecordingSetup.TryBuild(_settings, board.Index, port.Index, folder, SelectedRate(),
-                                     RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem))
+                                     RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem,
+                                     withDelayFile: tidalLock))
         {
             SetStatus(problem!, true);
+            if (tidalLock) TidalLock.Shared.Fail($"Recording could not start: {problem}");
             return;
         }
 
@@ -868,6 +876,17 @@ public partial class ShellWindow : Window
 
         _recording = true;
         UpdateRecordUi();
+
+        // The playback deck cues off this: the delay is counted from the station clock at the
+        // moment the recorder rolled, not from when the operator got round to arming.
+        if (tidalLock && request!.DelayFile is { } delayFile)
+        {
+            if (_timecode.TryGetCurrent(out Timecode rolledAt))
+                TidalLock.Shared.RecordingRolled(delayFile, rolledAt);
+            else
+                TidalLock.Shared.Fail("Tidal lock needs the station clock to time the delay, " +
+                                      "and there is none.");
+        }
     }
 
     private async void StopRecording()
@@ -881,6 +900,9 @@ public partial class ShellWindow : Window
         // Stop joins the capture thread so the encoder can finalise the file, which takes
         // long enough to be worth keeping off the UI thread.
         await Task.Run(() => _capture.Stop());
+
+        // Nothing more is being written for the playback deck to follow.
+        TidalLock.Shared.RecordingStopped();
 
         UpdateRecordUi();
         RefreshClips();
@@ -1094,6 +1116,9 @@ public partial class ShellWindow : Window
         Dispatcher.BeginInvoke(() => ApiUrlBox.Text = url);
 
     private void Playback_Click(object sender, RoutedEventArgs e) =>
+        ShowModule(ref _playback, () => new PlaybackWindow(_settings));
+
+    private void LiveEdit_Click(object sender, RoutedEventArgs e) =>
         ShowModule(ref _liveEdit, () => new LiveEditWindow());
 
     private void Logging_Click(object sender, RoutedEventArgs e) =>
@@ -1140,6 +1165,7 @@ public partial class ShellWindow : Window
                 if (ReferenceEquals(_edl, created)) _edl = null;
                 if (ReferenceEquals(_liveEdit, created)) _liveEdit = null;
                 if (ReferenceEquals(_ingest, created)) _ingest = null;
+                if (ReferenceEquals(_playback, created)) _playback = null;
 
                 // The EDL edits the settings this deck is showing.
                 if (!_loading) LoadProfile();

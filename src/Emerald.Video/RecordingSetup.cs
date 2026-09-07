@@ -25,7 +25,8 @@ public sealed record CaptureRequest(
     RecordingProfile Profile,
     long? FrameLimit = null,
     bool SingleFile = false,
-    string? StartTimecode = null)
+    string? StartTimecode = null,
+    string? DelayFile = null)
 {
     /// <summary>The files this request will write, proxy first — the order ffmpeg is given them in.</summary>
     public IReadOnlyList<string> OutputPaths => SingleFile
@@ -57,7 +58,8 @@ public static class RecordingSetup
         out string? problem,
         long? frameLimit = null,
         bool singleFile = false,
-        string? startTimecode = null)
+        string? startTimecode = null,
+        bool withDelayFile = false)
     {
         request = null;
         folder = folder.Trim();
@@ -87,17 +89,28 @@ public static class RecordingSetup
         }
 
         RecordingProfile profile = RecordingProfile.From(settings);
+        string prefix = SdiCapture.SanitisePrefix(namePrefix);
 
         // Both files are written under the folder the operator chose, one per output.
         try
         {
             foreach (string output in RecordingProfile.FoldersFor(folder)) Directory.CreateDirectory(output);
+            if (withDelayFile)
+                Directory.CreateDirectory(RecordingProfile.FolderFor(RecordingProfile.Delay, folder));
         }
         catch (Exception ex)
         {
             problem = $"cannot prepare {folder}: {ex.Message}";
             return false;
         }
+
+        // The delay line is stamped with the wall clock rather than the operator's title:
+        // tidal lock only ever reads the newest one, and a name that repeats would have the
+        // recorder appending to the file a previous run is still being read out of.
+        string? delayFile = withDelayFile
+            ? Path.Combine(RecordingProfile.FolderFor(RecordingProfile.Delay, folder),
+                           $"{prefix}_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.{RecordingProfile.Delay.Extension}")
+            : null;
 
         // Sanitised here rather than only inside the recorder, so a caller that needs to know
         // where the files will land — an ingest checking it is not about to overwrite a clip —
@@ -108,11 +121,12 @@ public static class RecordingSetup
             RxChannel: rxChannel,
             Folder: folder,
             FrameRate: frameRate > 0 ? frameRate : 25,
-            NamePrefix: SdiCapture.SanitisePrefix(namePrefix),
+            NamePrefix: prefix,
             Profile: profile,
             FrameLimit: frameLimit,
             SingleFile: singleFile,
-            StartTimecode: startTimecode);
+            StartTimecode: startTimecode,
+            DelayFile: delayFile);
 
         problem = null;
         return true;

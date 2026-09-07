@@ -4,9 +4,12 @@ A Windows desktop application (C# / WPF, .NET 8) for SDI playout, recording and 
 DELTACAST hardware. It is self-contained: no server, no network transport, nothing to
 connect to.
 
-Emerald opens on a **shell** with a live confidence monitor on an SDI receiver, and three
+Emerald opens on a **shell** with a live confidence monitor on an SDI receiver, and four
 ways in:
 
+- **Playback** — the capture deck's opposite number: a transmitter, a confidence monitor on
+  whatever comes back, and **tidal lock**, which puts the capture deck's receiver to air a
+  fixed time later.
 - **EDL Generator** — composes an EDL playout command and plays it out of a DELTACAST SDI
   output, cued to house timecode, recording the return feed while it is on air.
 - **Ingest Controller** — schedules recordings off an RX input: pick a board and port, a
@@ -24,7 +27,7 @@ exits, so `run-edl.bat` and `run-ingest.bat` give you two windows side by side.
 
 ```
 Emerald.sln
-├─ src\Emerald.App            the shell: RX preview, and the way in to the modules [WinExe]
+├─ src\Emerald.App            the capture and playback decks, and the way in   [WinExe]
 ├─ src\Emerald.EDL            the EDL generator window and the playout engine
 ├─ src\Emerald.Ingest         the Ingest Controller: scheduling, queue, job store
 ├─ src\Emerald.LiveEdit       the editing workspace (layout only so far)
@@ -397,6 +400,53 @@ scale and rate conversion. It is looked up next to the application, then on `PAT
 Without ffmpeg the app still composes and records the EDL — only playout is skipped, with
 a warning in the log.
 
+## The playback deck
+
+Laid out as the capture deck's opposite number — same scaled design, monitor on the left,
+controls down the right — because it is the same job in the other direction. What differs is
+the configuration: the capture deck has one receiver, this has a **transmitter** to put
+pictures out of and, independently, a **receiver** to watch them come back on. They are
+chosen separately and are usually on different boards.
+
+| Field | Notes |
+|---|---|
+| **Transmit** board / TX port | Where playout goes. Only boards with TX channels are offered; a board with eight receivers and no transmitter is never a playback board. |
+| **Preview** board / RX port | An independent receiver to monitor on, normally the return feed. It takes a **yielding** claim, so a recorder that wants the same input takes it and the preview steps aside rather than failing the recording. |
+
+Nothing here decodes or transmits on its own: the picture comes from `RxPreview`, exactly as
+the capture deck's does, and everything reaching the transmitter goes through the same
+`PlayoutService` the EDL plays out with, cued against the same station clock.
+
+### Tidal lock
+
+Tidal lock puts the capture deck's receiver to air a fixed time later — a minute by default,
+selectable from thirty seconds to five.
+
+1. On the playback deck, choose the transmitter and press **ARM TIDAL LOCK**. Nothing goes
+   to air yet; arming only says that when the capture deck rolls, its output should follow.
+2. Press **Record** on the capture deck. The countdown starts from the station timecode at
+   that moment, and is shown over the picture.
+3. A minute later the delayed feed cuts to the transmitter and stays exactly that far behind.
+
+**Where the delay lives.** A minute of 1080p raw is about 6.2 GB, so it is not held anywhere.
+While tidal lock is armed the recorder writes one extra output — a continuous MPEG-TS under
+`<store>\delay\` — alongside its usual proxy and master. Playout opens that file a minute
+later and reads it at transmission rate, so *the gap between the write head and the read head
+is the delay*, and it holds by itself because the card paces the reader. MP4 and MOV keep
+their index at the end of the file and cannot be read while being written; transport stream
+was made to be read from the middle of a wire, which is the whole reason for the third
+output.
+
+That output is full raster H.264 at 20 Mbps, so what goes to air is not a scaled-up proxy. It
+is written **only** while tidal lock is armed, and only from the next recording — the delay
+line has to be opened by the same encoder pass as everything else, so it cannot be added to a
+recording already under way.
+
+**When the recorder stalls.** Playout is in *follow* mode: reaching the end of the file means
+the recording has stopped or stalled, not that the message has ended, so it holds the last
+frame and picks up where it left off rather than looping back to the start of the recording.
+After ten seconds of nothing it says so and stops.
+
 ## The Ingest Controller
 
 Where the EDL puts something on air, the Ingest Controller takes something off the wire: it
@@ -582,7 +632,8 @@ src/Emerald.LiveEdit/
 
 src/Emerald.App/
   App.xaml(.cs)             the application, the theme, single-instance and --edl/--ingest
-  ShellWindow.xaml(.cs)     preview, board picker, and the module buttons
+  ShellWindow.xaml(.cs)     the capture deck: preview, recorder, and the module buttons
+  PlaybackWindow.xaml(.cs)  the playback deck: transmit, preview, tidal lock
   RxPreview.cs              RX -> a decimated BGRA thumbnail, ~12 fps
 
 build.bat                   build only
