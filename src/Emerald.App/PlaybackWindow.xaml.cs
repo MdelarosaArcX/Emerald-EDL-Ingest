@@ -9,29 +9,65 @@ using System.Windows.Threading;
 using Emerald.Core;
 using Emerald.Deltacast;
 using Emerald.Edl;
+using Emerald.Media;
 using Emerald.Video;
 
 namespace Emerald.App;
 
 /// <summary>
-/// The playback deck: a transmitter, a confidence monitor on whatever is coming back, and
-/// tidal lock.
+/// The playback deck: the media store on the left, the transmitter on the right.
 ///
 /// It is laid out as the capture deck's opposite number — the same scaled design, the same
-/// theme, a monitor on the left and the controls down the right — because it is the same
-/// job in the other direction, and an operator should not have to re-learn the room. What
-/// differs is the configuration: the capture deck has one receiver, this has a
+/// theme, media down the left and the deck down the right — because it is the same job in
+/// the other direction, and an operator should not have to re-learn the room. The capture
+/// deck auditions what has been recorded and records more of it; this auditions the same
+/// store and puts it to air.
+///
+/// The configuration is what differs. The capture deck has one receiver; this has a
 /// <b>transmitter</b> to put pictures out of and, independently, a <b>receiver</b> to watch
 /// them come back on. They are chosen separately and are usually on different boards.
 ///
 /// Nothing here decodes or transmits anything itself. The picture comes from
-/// <see cref="RxPreview"/>, exactly as the capture deck's does, and everything that reaches
-/// the transmitter goes through <see cref="PlayoutService"/> — the same engine the EDL plays
-/// out with, cued the same way against the same station clock.
+/// <see cref="RxPreview"/>, exactly as the capture deck's does; the audition is a WPF
+/// <c>MediaElement</c>, as the capture deck's stage is; and everything that reaches the
+/// transmitter goes through <see cref="PlayoutService"/> — the same engine the EDL plays out
+/// with, cued the same way against the same station clock.
 /// </summary>
 public partial class PlaybackWindow : Window
 {
     private sealed record LogRow(string Time, string Message, Brush Brush);
+
+    /// <summary>One tile in the clip strip. The thumbnail arrives later, hence the notification.</summary>
+    private sealed class ClipItem : INotifyPropertyChanged
+    {
+        public required string Path { get; init; }
+        public required string Display { get; init; }
+        public required string Stamp { get; init; }
+
+        private ImageSource? _thumbnail;
+
+        public ImageSource? Thumbnail
+        {
+            get => _thumbnail;
+            set
+            {
+                _thumbnail = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Thumbnail)));
+            }
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+    }
+
+    private readonly ObservableCollection<ClipItem> _clips = new();
+
+    /// <summary>
+    /// Bumped whenever the strip is rebuilt, so thumbnails from a previous pass are dropped
+    /// rather than landing on tiles that are no longer the ones they were rendered for.
+    /// </summary>
+    private int _stripGeneration;
+
+    private bool _auditionPlaying;
 
     private readonly AppSettings _settings;
     private readonly TimecodeService _timecode = TimecodeLink.Service;
@@ -60,6 +96,7 @@ public partial class PlaybackWindow : Window
         InitializeComponent();
 
         LogList.ItemsSource = _log;
+        ClipStrip.ItemsSource = _clips;
 
         _preview.Status += OnPreviewStatus;
         _preview.FrameReady += OnPreviewFrame;
@@ -101,6 +138,171 @@ public partial class PlaybackWindow : Window
 
         await ScanBoardsAsync();
         RenderTidalLock();
+        RefreshClips();
+    }
+
+    // ------------------------------------------------------------------ media
+
+    /// <summary>
+    /// Reads the same store the capture deck records into and Live Edit lists, so what is on
+    /// this strip is exactly what has been captured — nothing is copied or imported.
+    /// </summary>
+    private void RefreshClips()
+    {
+        int generation = ++_stripGeneration;
+        string? ffmpeg = _playout?.FfmpegPath;
+
+        _clips.Clear();
+        StripEmpty.Text = "reading the capture store...";
+        StripEmpty.Visibility = Visibility.Visible;
+
+        // Listing probes every clip through ffprobe, which is far too slow for the UI thread
+        // once the store has a few hours in it.
+        Task.Run(() => MediaLibrary.List(_settings))
+            .ContinueWith(t =>
+            {
+                if (generation != _stripGeneration) return;
+
+                IReadOnlyList<CapturedClip> clips =
+                    t.IsFaulted ? Array.Empty<CapturedClip>() : t.Result;
+
+                foreach (CapturedClip clip in clips)
+                {
+                    _clips.Add(new ClipItem
+                    {
+                        Path = clip.Path,
+                        Display = clip.Name,
+                        Stamp = $"{clip.DurationText}  |  {clip.SizeText}",
+                    });
+                }
+
+                StripEmpty.Text = "the capture store is empty";
+                StripEmpty.Visibility = clips.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+                if (clips.Count > 0) Log($"{clips.Count} clip(s) in the store.");
+
+                if (ffmpeg is not null) LoadThumbnails(generation, ffmpeg);
+            }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    private void LoadThumbnails(int generation, string ffmpeg)
+    {
+        ClipItem[] tiles = _clips.ToArray();
+
+        Task.Run(() =>
+        {
+            foreach (ClipItem tile in tiles)
+            {
+                if (generation != _stripGeneration) return;
+
+                BitmapImage? thumb = ClipThumbnails.Get(ffmpeg, tile.Path);
+                if (thumb is null) continue;
+
+                Dispatcher.BeginInvoke(() =>
+                {
+                    if (generation == _stripGeneration) tile.Thumbnail = thumb;
+                });
+            }
+        });
+    }
+
+    private void RefreshClips_Click(object sender, RoutedEventArgs e) => RefreshClips();
+
+    private ClipItem? SelectedClip => ClipStrip.SelectedItem as ClipItem;
+
+    private void ClipStrip_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SelectedClip is not { } clip)
+        {
+            Player.Source = null;
+            StagePlaceholder.Visibility = Visibility.Visible;
+            ClipNameText.Text = "-";
+            return;
+        }
+
+        ClipNameText.Text = clip.Display;
+        StagePlaceholder.Visibility = Visibility.Collapsed;
+
+        Player.Source = new Uri(clip.Path);
+        Player.Play();          // a paused MediaElement shows nothing until it has presented
+        _auditionPlaying = true;
+    }
+
+    private void PlayPause_Click(object sender, RoutedEventArgs e)
+    {
+        if (Player.Source is null) return;
+
+        if (_auditionPlaying) Player.Pause();
+        else Player.Play();
+
+        _auditionPlaying = !_auditionPlaying;
+    }
+
+    private void StopAudition_Click(object sender, RoutedEventArgs e)
+    {
+        Player.Stop();
+        _auditionPlaying = false;
+    }
+
+    private void Player_MediaOpened(object sender, RoutedEventArgs e) =>
+        StagePlaceholder.Visibility = Visibility.Collapsed;
+
+    private void Player_MediaEnded(object sender, RoutedEventArgs e)
+    {
+        Player.Stop();
+        _auditionPlaying = false;
+    }
+
+    private void Player_MediaFailed(object sender, ExceptionRoutedEventArgs e)
+    {
+        StagePlaceholder.Text = "this clip cannot be previewed here";
+        StagePlaceholder.Visibility = Visibility.Visible;
+        Log($"Audition failed: {e.ErrorException?.Message}", Level.Warn);
+    }
+
+    /// <summary>
+    /// Puts the selected clip on the transmitter now. The audition on the left is a WPF
+    /// player and reaches no hardware; this is the same engine the EDL plays out with, so
+    /// what goes to air is cued, paced and encoded the way everything else in Emerald is.
+    /// </summary>
+    private void PlayToTx_Click(object sender, RoutedEventArgs e)
+    {
+        if (SelectedClip is not { } clip)
+        {
+            Log("Select a clip first.", Level.Warn);
+            return;
+        }
+
+        if (!TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)) return;
+
+        if (TidalLock.Shared.State is TidalLockState.CountingDown or TidalLockState.OnAir)
+        {
+            Log("Tidal lock has the transmitter. Disarm it before playing a clip out.", Level.Warn);
+            return;
+        }
+
+        int rate = _timecode.FrameRate > 0 ? _timecode.FrameRate : _settings.CaptureFrameRate;
+        Timecode start = _timecode.TryGetCurrent(out Timecode now) ? now : Timecode.Zero(rate);
+
+        _playout!.Enqueue(new PlayoutEntry
+        {
+            Id = Guid.NewGuid().ToString("N")[..8],
+            MediaLabel = clip.Display,
+            Request = new PlayoutRequest(
+                BoardIndex: board!.Index,
+                BoardModel: board.Model,
+                TxChannel: port!.Index,
+                VideoFiles: new[] { clip.Path },
+                Start: start,                  // now: a start already gone by cues immediately
+                DurationFrames: null,
+                FrameRate: rate,
+                Som: Timecode.Zero(rate),
+                SeekOffset: TimeSpan.Zero,
+                PostPlay: PostPlay.BlackScreen,
+                AudioTracks: new[] { new AudioTrack(clip.Display, new[] { clip.Path }) }),
+        });
+
+        Log($"Playing {clip.Display} out of {port.Name} on board {board.Index}.", Level.Ok);
     }
 
     private void Window_Closing(object? sender, CancelEventArgs e)
@@ -310,6 +512,28 @@ public partial class PlaybackWindow : Window
     private TimeSpan SelectedDelay =>
         DelayBox.SelectedItem is DelayOption option ? option.Delay : TidalLock.DefaultDelay;
 
+    /// <summary>
+    /// The transmitter, if one is properly selected. Everything that reaches the card goes
+    /// through this, so a missing board or port is reported once, here, in words.
+    /// </summary>
+    private bool TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)
+    {
+        board = SelectedTxBoard;
+        port = TxPortBox.SelectedItem as ChannelPort;
+
+        if (board is null) { Log("No transmit board is selected.", Level.Warn); return false; }
+        if (board.TxCount == 0) { Log($"{board.Model} has no TX channels.", Level.Warn); return false; }
+        if (port is null) { Log("No TX port is selected.", Level.Warn); return false; }
+
+        if (_playout?.FfmpegPath is null)
+        {
+            Log("ffmpeg was not found, so nothing can be decoded for the transmitter.", Level.Error);
+            return false;
+        }
+
+        return true;
+    }
+
     private void Arm_Click(object sender, RoutedEventArgs e)
     {
         if (TidalLock.Shared.State != TidalLockState.Off)
@@ -321,21 +545,16 @@ public partial class PlaybackWindow : Window
             return;
         }
 
-        if (SelectedTxBoard is not { } board || TxPortBox.SelectedItem is not ChannelPort port)
-        {
-            Log("Select a transmit board and TX port before arming.", Level.Warn);
-            return;
-        }
-
-        if (_playout?.FfmpegPath is null)
-        {
-            Log("ffmpeg is not available, so nothing can be put to air.", Level.Error);
-            return;
-        }
+        if (!TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)) return;
 
         TidalLock.Shared.Arm(SelectedDelay);
-        Log($"Tidal lock armed on {port.Name} of board {board.Index}, " +
-            $"{TidalLock.Describe(SelectedDelay)} behind. Start recording on the capture deck.", Level.Ok);
+
+        // Said plainly, because arming on its own transmits nothing and the next step is in
+        // the other window - which is exactly the thing an operator would wait in vain for.
+        Log($"Tidal lock armed on {port!.Name} of board {board!.Index}, " +
+            $"{TidalLock.Describe(SelectedDelay)} behind.", Level.Ok);
+        Log("Nothing goes to air yet. Press Record on the capture deck to start the countdown.",
+            Level.Warn);
     }
 
     private void OnTidalLockChanged(TidalLock lockState) => Dispatcher.BeginInvoke(() =>
@@ -432,7 +651,19 @@ public partial class PlaybackWindow : Window
         ArmButton.Content = lockState.State == TidalLockState.Off ? "ARM TIDAL LOCK" : "DISARM TIDAL LOCK";
         DelayBox.IsEnabled = lockState.State == TidalLockState.Off;
 
-        if (lockState.State is TidalLockState.Off or TidalLockState.Failed) _tidalEntryId = null;
+        // Which of the three steps is live. The one still to be done by the operator is lit;
+        // arming and then waiting for a window that is not this one is the mistake worth
+        // designing against.
+        Step1Text.Foreground = Brush(lockState.State == TidalLockState.Off ? "IpMint" : "IpDim");
+        Step2Text.Foreground = Brush(lockState.State == TidalLockState.Armed ? "IpMint" : "IpDim");
+        Step3Text.Foreground = Brush(
+            lockState.State is TidalLockState.CountingDown or TidalLockState.OnAir ? "IpMint" : "IpDim");
+
+        // Only a countdown or a live feed has an entry behind it. Clearing this on the way
+        // back to Armed is what lets a second recording cue a second time: without it, tidal
+        // lock worked once and then silently did nothing until it was disarmed and re-armed.
+        if (lockState.State is not (TidalLockState.CountingDown or TidalLockState.OnAir))
+            _tidalEntryId = null;
     }
 
     // ------------------------------------------------------------------ output
@@ -477,10 +708,16 @@ public partial class PlaybackWindow : Window
         AirText.Text = status.State == PlayoutState.Playing ? "ON AIR" : label;
         AirText.Foreground = Brush(brush);
 
-        if (status.State == PlayoutState.Playing) TidalLock.Shared.WentToAir();
+        // Only the tidal lock entry moves the lock's state. A clip played out by hand reaches
+        // the same transmitter and reports the same way, and would otherwise announce that
+        // the delayed feed had gone to air when it had not.
+        if (_tidalEntryId is not null)
+        {
+            if (status.State == PlayoutState.Playing) TidalLock.Shared.WentToAir();
 
-        if (status.State == PlayoutState.Failed && TidalLock.Shared.State != TidalLockState.Off)
-            TidalLock.Shared.Fail(status.Message);
+            if (status.State == PlayoutState.Failed && TidalLock.Shared.State != TidalLockState.Off)
+                TidalLock.Shared.Fail(status.Message);
+        }
 
         // Only the narrative transitions belong in the log; the per-second ticks would bury it.
         if (status.Message.Length > 0 && status.State != PlayoutState.Playing)
@@ -517,25 +754,39 @@ public partial class PlaybackWindow : Window
         // than on a slower tick: an operator watching the last seconds should see every one.
         TidalLock lockState = TidalLock.Shared;
 
-        if (lockState.State == TidalLockState.CountingDown && have && lockState.CueAt is { } cueAt)
+        switch (lockState.State)
         {
-            int rate = now.Rate > 0 ? now.Rate : 25;
-            long perDay = 24L * 3600L * rate;
-            long frames = ((cueAt.TotalFrames - now.TotalFrames) % perDay + perDay) % perDay;
+            case TidalLockState.Armed:
+                // Armed and waiting. Said on the stage, not just in a corner: arming
+                // transmits nothing, and the next move is in the other window.
+                LockPanel.Visibility = Visibility.Visible;
+                LockHeadline.Text = "TIDAL LOCK ARMED";
+                CountdownText.Text = TidalLock.Describe(lockState.Delay);
+                CountdownText.Foreground = Brush("Warn");
+                CountdownDetail.Text = "Waiting for the capture deck. Press Record there to start the countdown.";
+                break;
 
-            // More than half a day away means the cue has just gone by, not that it is
-            // twenty-three hours out.
-            if (frames > perDay / 2) frames = 0;
+            case TidalLockState.CountingDown when have && lockState.CueAt is { } cueAt:
+                int rate = now.Rate > 0 ? now.Rate : 25;
+                long perDay = 24L * 3600L * rate;
+                long frames = ((cueAt.TotalFrames - now.TotalFrames) % perDay + perDay) % perDay;
 
-            var left = TimeSpan.FromSeconds(frames / (double)rate);
+                // More than half a day away means the cue has just gone by, not that it is
+                // twenty-three hours out.
+                if (frames > perDay / 2) frames = 0;
 
-            CountdownPanel.Visibility = Visibility.Visible;
-            CountdownText.Text = $"{(int)left.TotalMinutes:00}:{left.Seconds:00}";
-            CountdownDetail.Text = $"on air at {cueAt}";
-        }
-        else
-        {
-            CountdownPanel.Visibility = Visibility.Collapsed;
+                var left = TimeSpan.FromSeconds(frames / (double)rate);
+
+                LockPanel.Visibility = Visibility.Visible;
+                LockHeadline.Text = "TIDAL LOCK - ON AIR IN";
+                CountdownText.Text = $"{(int)left.TotalMinutes:00}:{left.Seconds:00}";
+                CountdownText.Foreground = Brush("IpMint");
+                CountdownDetail.Text = $"on air at {cueAt}, holding black on the transmitter until then";
+                break;
+
+            default:
+                LockPanel.Visibility = Visibility.Collapsed;
+                break;
         }
     }
 
