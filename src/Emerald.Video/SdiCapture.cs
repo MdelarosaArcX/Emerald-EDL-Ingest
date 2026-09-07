@@ -67,6 +67,24 @@ public sealed class SdiCapture : IDisposable
     /// </summary>
     public event Action<CaptureResult>? Finished;
 
+    /// <summary>
+    /// Every frame off the receiver, raised on the capture thread.
+    ///
+    /// The arrays are freshly allocated per frame and become the handler's own to keep - unlike
+    /// <see cref="PreviewFrame"/>, which hands out a reused buffer. What it shares with
+    /// PreviewFrame is the contract that matters: <b>a handler must not block</b>. This runs
+    /// inside the slot loop, which is the receiver's clock, and the card has four slots of
+    /// headroom. Hand the frame to a queue and return.
+    /// </summary>
+    public event Action<CapturedFrame>? Frame;
+
+    /// <summary>
+    /// The format the receiver actually locked to, raised once, before any frame. The
+    /// recording is built from the operator's chosen rate, which is not necessarily what is
+    /// on the wire - anything that has to match the receiver exactly needs this instead.
+    /// </summary>
+    public event Action<CaptureFormat>? FormatDetected;
+
     /// <summary>How many frames have been taken off the receiver so far, for a progress display.</summary>
     public long FramesRecorded => Interlocked.Read(ref _framesRecorded);
 
@@ -194,6 +212,12 @@ public sealed class SdiCapture : IDisposable
             CaptureFormat format = CaptureFormat.FromStandard(std, request.FrameRate);
             recordedFormat = format;
 
+            // Announced before any frame, so anything that has to match the receiver exactly
+            // - a delay line sizing its ring - can be built from what is really on the wire
+            // rather than from the rate the operator picked.
+            try { FormatDetected?.Invoke(format); }
+            catch (Exception ex) { Fail($"Capture: {ex.Message}"); return; }
+
             VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_SDI_SP_VIDEO_STANDARD, std);
             VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_CORE_SP_BUFFER_PACKING,
                                                 VideoMasterHD.VHD_BUFPACK_VIDEO_YUV422_8);
@@ -304,12 +328,23 @@ public sealed class SdiCapture : IDisposable
                     IntPtr buffer = IntPtr.Zero;
                     uint size = 0;
 
+                    // The frame and its audio, held until both are in hand: the tap wants
+                    // them together, and they are only genuinely the same frame while this
+                    // slot is locked.
+                    byte[]? tapVideo = null;
+                    int tapVideoBytes = 0;
+
                     if (VideoMasterHD.VHD_GetSlotBuffer(slot, VideoMasterHD.VHD_SDI_BT_VIDEO, ref buffer, ref size) == 0
                         && buffer != IntPtr.Zero)
                     {
                         int take = Math.Min(frame.Length, (int)size);
                         var copy = new byte[take];
                         Marshal.Copy(buffer, copy, 0, take);
+
+                        // The same array goes to both consumers. Neither writes to it, so the
+                        // delay line costs no second copy of a four-megabyte frame.
+                        tapVideo = copy;
+                        tapVideoBytes = take;
 
                         // Never block the slot loop: a stalled encoder must cost frames, not
                         // back up into the receiver and cause overruns.
@@ -337,14 +372,25 @@ public sealed class SdiCapture : IDisposable
                         Report("Capture: encoder attached to the audio pipe.");
                     }
 
-                    if (pipeReady)
+                    // Audio is extracted for whoever wants it. It used to be pulled only once
+                    // ffmpeg had attached its pipe, which is fine for a recording that starts
+                    // when the encoder is ready — but a delay line needs the audio that came
+                    // with frame zero, and the encoder attaches a few frames in.
+                    Action<CapturedFrame>? tap = Frame;
+                    byte[]? tapAudio = null;
+                    int tapAudioBytes = 0;
+                    bool audioReal = false;
+
+                    if (pipeReady || tap is not null)
                     {
                         int bytes = ExtractAudio(slot, audioInfo, leftBuf, rightBuf, audioCapacity, interleaved);
+                        audioReal = bytes > 0;
 
                         // A frame's worth of audio goes out even when the slot carried none —
                         // black during a cue has no embedded audio, and a muxer starved on one
                         // input stops draining the other, which deadlocks the whole capture.
-                        // Silence keeps the two inputs advancing together.
+                        // Silence keeps the two inputs advancing together, and a transmitter
+                        // needs continuous audio for the same reason.
                         if (bytes <= 0)
                         {
                             bytes = silenceBytes;
@@ -353,7 +399,27 @@ public sealed class SdiCapture : IDisposable
 
                         var chunk = new byte[bytes];
                         Buffer.BlockCopy(interleaved, 0, chunk, 0, bytes);
-                        audioQueue.TryAdd(chunk);
+
+                        if (pipeReady) audioQueue.TryAdd(chunk);
+
+                        tapAudio = chunk;
+                        tapAudioBytes = bytes;
+                    }
+
+                    // Last, with both halves of the frame in hand. The handler must not block:
+                    // this is the receiver's clock.
+                    if (tap is not null && tapVideo is not null)
+                    {
+                        try
+                        {
+                            tap.Invoke(new CapturedFrame(tapVideo, tapVideoBytes,
+                                                         tapAudio, tapAudioBytes, audioReal,
+                                                         frames - 1));
+                        }
+                        catch
+                        {
+                            // A subscriber that throws must not take the recording down with it.
+                        }
                     }
                 }
                 finally
@@ -455,7 +521,7 @@ public sealed class SdiCapture : IDisposable
         // the EDL records with whatever they were left on.
         foreach (string a in request.Profile.EncoderArguments(
                      format, pipeName, request.Folder, request.NamePrefix, SampleRate,
-                     request.SingleFile, request.StartTimecode, request.DelayFile))
+                     request.SingleFile, request.StartTimecode))
             info.ArgumentList.Add(a);
 
         Process ff = Process.Start(info) ?? throw new InvalidOperationException("Could not start ffmpeg for capture.");
@@ -546,25 +612,55 @@ public sealed record CaptureResult(
     public bool Succeeded => Error is null && Frames > 0;
 }
 
-/// <summary>Raster and rate of whatever the RX is locked to.</summary>
-public sealed record CaptureFormat(string Name, int Width, int Height, int FrameRate)
+/// <summary>
+/// One frame off the receiver, with the audio that arrived in the same slot.
+///
+/// Video and audio are picked up inside a single lock on the slot, so the two genuinely
+/// belong to each other - which is the whole reason a delay line can be fed from here rather
+/// than by pairing up two streams after the fact.
+/// </summary>
+/// <param name="AudioReal">
+/// False when the slot carried no embedded audio and silence was substituted. The silence is
+/// sent either way, because a transmitter needs continuous audio, but the distinction is
+/// worth reporting rather than quietly transmitting nothing.
+/// </param>
+public readonly record struct CapturedFrame(
+    byte[] Video, int VideoBytes,
+    byte[]? Audio, int AudioBytes, bool AudioReal,
+    long Sequence);
+
+/// <summary>
+/// Raster and rate of whatever the RX is locked to, plus the SDI standard it came from.
+///
+/// <see cref="Standard"/> is kept because raster and rate alone do not identify a format:
+/// 1080i50 and 1080p25 are both 1920x1080 counted at 25, and anything deciding whether a
+/// frame may be transmitted has to be able to tell them apart. Losing that distinction is
+/// how interlaced fields end up going out as progressive.
+/// </summary>
+public sealed record CaptureFormat(string Name, int Width, int Height, int FrameRate, uint Standard = uint.MaxValue)
 {
+    /// <summary>Used when the format did not come from the SDK's standard table.</summary>
+    public const uint UnknownStandard = uint.MaxValue;
+
     public int FrameBytes => Width * Height * 2;
+
+    /// <summary>True for the two standards the SDK reports as interlaced.</summary>
+    public bool IsInterlaced => Standard is 2 or 3;
 
     /// <summary>VHD_VIDEOSTANDARD values, from VideoMasterHD_Sdi.h.</summary>
     public static CaptureFormat FromStandard(uint std, int fallbackRate) => std switch
     {
-        0 => new("1080p25", 1920, 1080, 25),
-        1 => new("1080p30", 1920, 1080, 30),
-        2 => new("1080i50", 1920, 1080, 25),
-        3 => new("1080i60", 1920, 1080, 30),
-        4 => new("720p50", 1280, 720, 50),
-        5 => new("720p60", 1280, 720, 60),
-        6 => new("PAL", 720, 576, 25),
-        7 => new("NTSC", 720, 486, 30),
-        8 => new("1080p24", 1920, 1080, 24),
-        9 => new("1080p60", 1920, 1080, 60),
-        10 => new("1080p50", 1920, 1080, 50),
-        _ => new($"standard {std}", 1920, 1080, fallbackRate),
+        0 => new("1080p25", 1920, 1080, 25, std),
+        1 => new("1080p30", 1920, 1080, 30, std),
+        2 => new("1080i50", 1920, 1080, 25, std),
+        3 => new("1080i60", 1920, 1080, 30, std),
+        4 => new("720p50", 1280, 720, 50, std),
+        5 => new("720p60", 1280, 720, 60, std),
+        6 => new("PAL", 720, 576, 25, std),
+        7 => new("NTSC", 720, 486, 30, std),
+        8 => new("1080p24", 1920, 1080, 24, std),
+        9 => new("1080p60", 1920, 1080, 60, std),
+        10 => new("1080p50", 1920, 1080, 50, std),
+        _ => new($"standard {std}", 1920, 1080, fallbackRate, std),
     };
 }

@@ -23,13 +23,6 @@ public sealed record PlayoutStatus(
 /// <summary>One selectable audio track — a language — and the files behind it.</summary>
 public sealed record AudioTrack(string Label, IReadOnlyList<string> Files);
 
-/// <param name="Follow">
-/// The media is still being written, and playout should stay behind it rather than treat the
-/// end of the file as the end of the message. This is what tidal lock runs on: the recorder
-/// is a minute ahead, so the reader never normally reaches the end at all — and when it does,
-/// because the recorder stalled, the right answer is to wait and pick up where it left off,
-/// not to loop back to the head.
-/// </param>
 public sealed record PlayoutRequest(
     uint BoardIndex,
     string BoardModel,
@@ -41,8 +34,7 @@ public sealed record PlayoutRequest(
     Timecode Som,
     TimeSpan SeekOffset,
     PostPlay PostPlay,
-    IReadOnlyList<AudioTrack>? AudioTracks = null,
-    bool Follow = false)
+    IReadOnlyList<AudioTrack>? AudioTracks = null)
 {
     public bool HasVideo => VideoFiles is { Count: > 0 };
     public bool HasAudio => AudioTracks is { Count: > 0 };
@@ -390,29 +382,6 @@ public sealed class PlayoutService : IDisposable
     private static List<short[]> ChannelsFor(List<AudioBed> beds) =>
         new(new short[Math.Min(beds.Count * 2, SdiOutput.MaxAudioChannels)][]);
 
-    /// <summary>
-    /// How many half-second holds a following playout will sit through before deciding the
-    /// recording really has stopped. Twenty is ten seconds — long enough to ride out a disk
-    /// hiccup, short enough that a stopped recorder is reported while it still matters.
-    /// </summary>
-    private const int FollowGiveUpPasses = 20;
-
-    /// <summary>
-    /// Pushes the same frame for a short while, keeping the audio beds advancing so they do
-    /// not drift against the picture when playout resumes. Returns false if the card gives up.
-    /// </summary>
-    private bool HoldFrames(SdiOutput output, byte[] frame, List<short[]> channels,
-                            List<AudioBed> beds, int frames, CancellationToken ct)
-    {
-        for (int i = 0; i < frames && !ct.IsCancellationRequested; i++)
-        {
-            AdvanceBeds(beds, channels);
-            if (!output.PushFrame(frame, channels)) return false;
-        }
-
-        return true;
-    }
-
     /// <summary>Video drives the loop: the playlist wraps to fill the duration.</summary>
     private long PlayWithVideo(PlayoutEntry entry, SdiOutput output, List<AudioBed> beds,
                                ref byte[]? lastFrame, CancellationToken ct)
@@ -435,12 +404,8 @@ public sealed class PlayoutService : IDisposable
 
             // The SOM is an in-point on the media source, so it applies to the first file
             // on the first pass only; loops and later files play from their own start.
-            //
-            // Following is the exception: the file is being written under us, so every
-            // re-open has to resume where the last one stopped rather than start again.
-            TimeSpan? seek =
-                req.Follow && framesOut > 0 ? TimeSpan.FromSeconds(framesOut / (double)req.FrameRate)
-                : fileIndex == 0 && framesOut == 0 && req.SeekOffset > TimeSpan.Zero ? req.SeekOffset
+            TimeSpan? seek = fileIndex == 0 && framesOut == 0 && req.SeekOffset > TimeSpan.Zero
+                ? req.SeekOffset
                 : null;
 
             try
@@ -493,37 +458,6 @@ public sealed class PlayoutService : IDisposable
             }
 
             barrenPasses = framesFromThisFile > 0 ? 0 : barrenPasses + 1;
-
-            if (req.Follow)
-            {
-                // Caught up with the recorder. Under tidal lock this should not happen — the
-                // writer is a minute ahead — so it means the recording has stalled or ended.
-                // Hold, and try again from where we stopped; the operator sees it in the log
-                // rather than the output looping back to the start of the recording.
-                if (framesFromThisFile == 0)
-                {
-                    if (barrenPasses == 1)
-                        Report(new PlayoutStatus(PlayoutState.Playing,
-                            $"Caught up with the recorder on {Path.GetFileName(file)} - holding for more.",
-                            framesOut, target, Path.GetFileName(file)));
-
-                    if (barrenPasses >= FollowGiveUpPasses)
-                    {
-                        Fail(entry, $"Nothing more has been written to {Path.GetFileName(file)}; " +
-                                    "the recording has stopped.", framesOut, target);
-                        return framesOut;
-                    }
-
-                    if (!HoldFrames(output, lastFrame ?? output.BlackFrame(), channels, beds,
-                                    req.FrameRate / 2, ct))
-                    {
-                        Fail(entry, "The card stopped accepting frames.", framesOut, target);
-                        return framesOut;
-                    }
-                }
-
-                continue;   // never advance the playlist, and never loop back to the head
-            }
 
             if (barrenPasses >= files.Count)
             {

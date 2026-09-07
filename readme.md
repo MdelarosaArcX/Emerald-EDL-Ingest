@@ -36,7 +36,8 @@ Emerald.sln
 ├─ src\Emerald.Deltacast      VideoMaster interop, boards, TX output, RX arbitration
 ├─ src\Emerald.Core           timecode, the shared station clock, settings
 ├─ tests\Emerald.Core.Tests
-└─ tests\Emerald.Ingest.Tests
+├─ tests\Emerald.Ingest.Tests
+└─ tests\Emerald.Video.Tests
 ```
 
 References run one way only, `Core ← Deltacast ← Video ← Media`, with the UI projects on top
@@ -419,33 +420,60 @@ the capture deck's does, and everything reaching the transmitter goes through th
 
 ### Tidal lock
 
-Tidal lock puts the capture deck's receiver to air a fixed time later — a minute by default,
+Tidal lock puts the capture deck.s receiver to air a fixed time later — a minute by default,
 selectable from thirty seconds to five.
 
 1. On the playback deck, choose the transmitter and press **ARM TIDAL LOCK**. Nothing goes
    to air yet; arming only says that when the capture deck rolls, its output should follow.
-2. Press **Record** on the capture deck. The countdown starts from the station timecode at
-   that moment, and is shown over the picture.
+2. Press **Record** on the capture deck. The delay begins filling, and the countdown over the
+   picture shows how much of it is buffered.
 3. A minute later the delayed feed cuts to the transmitter and stays exactly that far behind.
 
-**Where the delay lives.** A minute of 1080p raw is about 6.2 GB, so it is not held anywhere.
-While tidal lock is armed the recorder writes one extra output — a continuous MPEG-TS under
-`<store>\delay\` — alongside its usual proxy and master. Playout opens that file a minute
-later and reads it at transmission rate, so *the gap between the write head and the read head
-is the delay*, and it holds by itself because the card paces the reader. MP4 and MOV keep
-their index at the end of the file and cannot be read while being written; transport stream
-was made to be read from the middle of a wire, which is the whole reason for the third
-output.
+**Where the delay lives.** In a ring of **raw frames**, memory-mapped from a file that is
+allocated once and reused: `RX → recorder → ring → transmitter`. Nothing is encoded, nothing
+is written to a container, nothing is parsed back — the bytes the receiver produced are the
+bytes the transmitter sends, and the delay is a number of frames rather than something that
+emerges from how fast a decoder happens to read.
 
-That output is full raster H.264 at 20 Mbps, so what goes to air is not a scaled-up proxy. It
-is written **only** while tidal lock is armed, and only from the next recording — the delay
-line has to be opened by the same encoder pass as everything else, so it cannot be added to a
-recording already under way.
+That is the difference between a delay line and a recording played back late. There is no
+codec in the path to air, so no generation loss and nothing to go wrong beyond the copy
+itself; and because the recorder and the transmitter are both paced by the same SDI plant,
+the gap between the write head and the read head does not move.
 
-**When the recorder stalls.** Playout is in *follow* mode: reaching the end of the file means
-the recording has stopped or stalled, not that the message has ended, so it holds the last
-frame and picks up where it left off rather than looping back to the start of the recording.
-After ten seconds of nothing it says so and stops.
+A minute of 1080p25 is 1550 slots of 4 MB — **6.0 GB**, allocated up front under
+`%LOCALAPPDATA%\Emerald\delay` (override with `tidalLockRingFolder` in `settings.json`). It
+is checked for free space before arming and refused, in words, if it will not fit. Rings left
+behind by a crash are swept at start-up.
+
+**How it stays safe.** There is no lock on the hot path — a 4 MB copy under a lock would put
+the transmitter's cadence at the mercy of the writer. Each slot carries its own sequence
+number, written last and checked by the reader both before and after copying; if it changed
+in between, the writer came round mid-copy and the frame is discarded rather than transmitted
+torn. The reader alternates between two buffers so a discarded frame is never the one it was
+about to fall back on. The capture loop itself only ever does one bounded, non-blocking
+hand-off — the copy into the ring happens on the line's own thread, because the receiver has
+four slots of headroom and cannot wait for a disk.
+
+**Only progressive 1080 is transmitted.** Nothing in a raw path scales, and
+`VideoFormat.ForFrameRate` silently falls back to 1080p25 for a rate it does not carry — so a
+720p receiver would have its 1.8 MB frames copied into the top of a 4 MB raster and put
+garbage on air. Tidal lock therefore works from an allowlist of known progressive 1080
+standards and refuses everything else by name, interlaced included: 1080i50 is 1920×1080
+counted at 25 and would otherwise pass a raster-and-rate check.
+
+**What happens when things go wrong.**
+
+| | |
+|---|---|
+| Ring not yet full | Black. This *is* the countdown. |
+| Reader catches the writer | Repeat the picture, but mute the audio — repeating samples clicks, one silent frame does not. |
+| Writer laps the reader | Re-establish the delay and report it loudly: that is a visible cut, and the operator has to know it happened. |
+| Clocks drift apart | Corrected a frame at a time, outside a ±0.5 s deadband. A fixed delay does not need to be fixed to the frame. |
+| Receiver goes quiet | Hold the last frame for ten seconds, then cut to black — a freeze is indistinguishable from a working feed on a monitor. |
+| **Recording stops** | **Keep going.** A whole delay of programme is still in the ring and has not been to air. Stop-record does not mean stop-transmit; the lock shows `DRAINING` until the ring empties. |
+
+All of that is `DelayPacer.Decide`, a pure function over integers, so the behaviour that
+matters most on air is the part that is easiest to test without a card.
 
 ## The Ingest Controller
 
@@ -596,6 +624,10 @@ src/Emerald.Deltacast/
   RxLease.cs                who owns a receiver: preview yields, recording does not
 
 src/Emerald.Video/
+  DelayLine.cs              the tidal lock ring: raw frames, memory-mapped
+  DelayTransmitter.cs       drains the ring to a transmitter, N frames behind
+  DelayPacer.cs             what to do when the two ends of the delay disagree
+  DelayFormats.cs           which receiver formats may be transmitted raw
   Ffmpeg.cs                 one answer per run for where ffmpeg lives
   FrameSource.cs            ffmpeg -> raw UYVY frames
   AudioSource.cs            ffmpeg -> a ring of 16-bit stereo samples, per language

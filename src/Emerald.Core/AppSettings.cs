@@ -90,6 +90,13 @@ public sealed class AppSettings
     [JsonPropertyName("ingestTimingMode")] public string IngestTimingMode { get; set; } = "duration";
 
     /// <summary>
+    /// Where the tidal lock delay ring is written. Empty means a local folder under
+    /// %LOCALAPPDATA%, which is the right default: the ring needs a fast local disk and has
+    /// no business on a network share or in a synced folder.
+    /// </summary>
+    [JsonPropertyName("tidalLockRingFolder")] public string TidalLockRingFolder { get; set; } = "";
+
+    /// <summary>
     /// Runs the Ingest Controller against simulated boards and a simulated recorder, so the
     /// queue and the UI can be worked on where there is no card. Off unless asked for.
     /// </summary>

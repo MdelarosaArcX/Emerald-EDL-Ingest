@@ -855,38 +855,102 @@ public partial class ShellWindow : Window
         _settings.CaptureFrameRate = SelectedRate();
         _settings.CaptureFolder = folder;
 
-        // Tidal lock is armed from the playback deck, and only takes effect from the next
-        // recording: the delay line has to be opened by the same encoder pass as the rest, so
-        // it cannot be added to a recording already under way.
-        bool tidalLock = TidalLock.Shared.State == TidalLockState.Armed;
-
         if (!RecordingSetup.TryBuild(_settings, board.Index, port.Index, folder, SelectedRate(),
-                                     RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem,
-                                     withDelayFile: tidalLock))
+                                     RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem))
         {
             SetStatus(problem!, true);
-            if (tidalLock) TidalLock.Shared.Fail($"Recording could not start: {problem}");
+
+            if (TidalLock.Shared.State == TidalLockState.Armed)
+                TidalLock.Shared.Fail($"Recording could not start: {problem}");
+
             return;
         }
 
         _recordLimit = ParseSetDuration(SelectedRate());
         _recordStartedUtc = DateTime.UtcNow;
 
+        // Armed from the playback deck, and only ever from the next recording: the delay line
+        // is sized from the format the receiver locks to, which is not known until it does.
+        if (TidalLock.Shared.State == TidalLockState.Armed)
+            _capture.FormatDetected += OnTidalLockFormat;
+
         _capture.Start(request!);
 
         _recording = true;
         UpdateRecordUi();
+    }
 
-        // The playback deck cues off this: the delay is counted from the station clock at the
-        // moment the recorder rolled, not from when the operator got round to arming.
-        if (tidalLock && request!.DelayFile is { } delayFile)
+    // ------------------------------------------------------------------ tidal lock
+
+    private DelayLine? _delayLine;
+
+    /// <summary>
+    /// The receiver has locked and said what it is carrying, which is the first moment a
+    /// delay line can be sized. Raised on the capture thread, so everything here hops to the
+    /// dispatcher before touching the lock or the log.
+    /// </summary>
+    private void OnTidalLockFormat(CaptureFormat format)
+    {
+        _capture.FormatDetected -= OnTidalLockFormat;
+        Dispatcher.BeginInvoke(() => OpenDelayLine(format));
+    }
+
+    private void OpenDelayLine(CaptureFormat format)
+    {
+        if (TidalLock.Shared.State != TidalLockState.Armed) return;
+
+        // Refused here rather than at the card. The transmitter carries only progressive
+        // 1080-line standards and nothing in this path scales, so a receiver on anything else
+        // would put a wrongly sized picture to air.
+        if (!DelayFormats.TryMatch(format, out _, out string? why))
         {
-            if (_timecode.TryGetCurrent(out Timecode rolledAt))
-                TidalLock.Shared.RecordingRolled(delayFile, rolledAt);
-            else
-                TidalLock.Shared.Fail("Tidal lock needs the station clock to time the delay, " +
-                                      "and there is none.");
+            TidalLock.Shared.Fail(why!);
+            return;
         }
+
+        try
+        {
+            _delayLine = DelayLine.Create(App.TidalLockRingFolder(_settings), format, TidalLock.Shared.Delay);
+        }
+        catch (DelayLineException ex)
+        {
+            // The recording carries on regardless. Losing the delay must not cost the
+            // operator the recording they actually pressed the button for.
+            TidalLock.Shared.Fail(ex.Message);
+            return;
+        }
+
+        _capture.Frame += _delayLine.Offer;
+
+        // The station clock is reported, not depended on: the countdown runs off frames in
+        // the line, so a timecode outage does not stop the delay.
+        Timecode? rolledAt = _timecode.TryGetCurrent(out Timecode now) ? now : null;
+        TidalLock.Shared.RecordingRolled(_delayLine, rolledAt);
+    }
+
+    /// <summary>
+    /// Lets go of the delay line. The transmitter keeps its own reference and goes on
+    /// draining, so the last minute of the recording still reaches air.
+    /// </summary>
+    private void ReleaseDelayLine()
+    {
+        _capture.FormatDetected -= OnTidalLockFormat;
+
+        if (_delayLine is null) return;
+
+        _capture.Frame -= _delayLine.Offer;
+        _delayLine.Seal();
+
+        // Said out loud rather than left in a counter. A ring that could not keep up has put
+        // gaps in what went to air, and an operator who does not know that cannot act on it.
+        if (_delayLine.Fault is { } fault)
+            SetStatus($"the delay line stopped: {fault}", true);
+        else if (_delayLine.Dropped > 0)
+            SetStatus($"the delay line dropped {_delayLine.Dropped} frame(s) - the disk could not keep up.", true);
+
+        TidalLock.Shared.RecordingStopped();
+        _delayLine.Release();
+        _delayLine = null;
     }
 
     private async void StopRecording()
@@ -899,10 +963,11 @@ public partial class ShellWindow : Window
 
         // Stop joins the capture thread so the encoder can finalise the file, which takes
         // long enough to be worth keeping off the UI thread.
+        // Stopped first, so the capture thread has joined and no further frame can be offered
+        // to a line that is about to be sealed.
         await Task.Run(() => _capture.Stop());
 
-        // Nothing more is being written for the playback deck to follow.
-        TidalLock.Shared.RecordingStopped();
+        ReleaseDelayLine();
 
         UpdateRecordUi();
         RefreshClips();

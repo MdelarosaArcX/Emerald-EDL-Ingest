@@ -4,6 +4,7 @@ using System.Windows;
 using Emerald.Core;
 using Emerald.Edl;
 using Emerald.Ingest;
+using Emerald.Video;
 
 namespace Emerald.App;
 
@@ -46,6 +47,14 @@ public partial class App : Application
     /// </summary>
     public static AppSettings Settings { get; } = AppSettings.Load();
 
+    /// <summary>Where the tidal lock delay ring is written. Local by default: it needs a fast disk.</summary>
+    public static string TidalLockRingFolder(AppSettings settings) =>
+        string.IsNullOrWhiteSpace(settings.TidalLockRingFolder)
+            ? System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Emerald", "delay")
+            : settings.TidalLockRingFolder;
+
     private CancellationTokenSource? _listener;
 
     private void App_Startup(object sender, StartupEventArgs e)
@@ -78,6 +87,11 @@ public partial class App : Application
 
         // Either we are the first, or there is a stale mutex and nobody is listening. Both
         // mean this process is the one that runs.
+        //
+        // Six gigabytes of delay ring survives a crash perfectly well, and three crashes
+        // would be eighteen. Swept once, here, before anything can allocate another.
+        DelayLine.SweepOrphans(TidalLockRingFolder(Settings));
+
         StartListening();
         OpenModule(mode);
     }

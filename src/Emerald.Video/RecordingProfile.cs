@@ -66,31 +66,6 @@ public sealed record RecordingProfile(
         PixelFormat: "yuv422p10le",
         HalfSize: false);
 
-    /// <summary>
-    /// The delay line: one continuous MPEG-TS, written only while tidal lock is running.
-    ///
-    /// It exists because neither of the other two can be read while it is being written. MP4
-    /// and MOV keep their index at the end of the file, so a recording in progress is not a
-    /// playable file at all — whereas transport stream was designed to be read from the
-    /// middle of a wire, and opens happily at the head while the tail is still growing. That
-    /// is the whole trick behind tidal lock: playout reads this file a minute behind the
-    /// recorder, and the gap is the delay.
-    ///
-    /// Full raster, so what goes to air is not a scaled-up proxy.
-    /// </summary>
-    public static RecordingOutput Delay { get; } = new(
-        Key: "delay",
-        Folder: "delay",
-        Extension: "ts",
-        Muxer: "mpegts",
-        VideoCodec: "libx264",
-        VideoLabel: "H.264",
-        PixelFormat: "yuv420p",
-        HalfSize: false);
-
-    /// <summary>What the delay line is encoded at. Generous: it goes to air.</summary>
-    public const int DelayBitrateKbps = 20000;
-
     /// <summary>Both outputs, proxy first, which is the order ffmpeg is given them in.</summary>
     public static IReadOnlyList<RecordingOutput> Outputs { get; } = new[] { LowRes, HighRes };
 
@@ -192,15 +167,9 @@ public sealed record RecordingProfile(
     /// Only meaningful with <paramref name="singleFile"/>: a segmented capture would stamp
     /// every segment with the same start, which is worse than stamping none of them.
     /// </param>
-    /// <param name="delayFile">
-    /// When set, a continuous <see cref="Delay"/> transport stream is written to this path as
-    /// well, for tidal lock to read back behind the recorder. It is never segmented: the
-    /// reader follows one growing file.
-    /// </param>
     public IEnumerable<string> EncoderArguments(CaptureFormat format, string pipeName,
                                                 string folder, string namePrefix, int inputSampleRate,
-                                                bool singleFile = false, string? startTimecode = null,
-                                                string? delayFile = null)
+                                                bool singleFile = false, string? startTimecode = null)
     {
         var args = new List<string>
         {
@@ -273,33 +242,6 @@ public sealed record RecordingProfile(
                 args.Add(Path.Combine(FolderFor(output, folder),
                                       $"{namePrefix}_%Y-%m-%d_%H-%M-%S.{output.Extension}"));
             }
-        }
-
-        if (delayFile is { Length: > 0 })
-        {
-            args.Add("-map"); args.Add("0:v:0");
-            args.Add("-map"); args.Add("1:a:0");
-
-            args.Add("-c:v"); args.Add(Delay.VideoCodec);
-            args.Add("-preset"); args.Add("ultrafast");
-            args.Add("-tune"); args.Add("zerolatency");
-            args.Add("-b:v"); args.Add($"{DelayBitrateKbps}k");
-            args.Add("-maxrate"); args.Add($"{DelayBitrateKbps}k");
-            args.Add("-bufsize"); args.Add($"{DelayBitrateKbps}k");
-
-            // A keyframe a second. The reader opens this file at the head and, if it ever has
-            // to re-seek, lands on a boundary within a second rather than decoding from the
-            // start of a long GOP.
-            args.Add("-g"); args.Add(format.FrameRate.ToString());
-
-            args.Add("-pix_fmt"); args.Add(Delay.PixelFormat);
-
-            args.Add("-c:a"); args.Add(AudioCodec);
-            args.Add("-b:a"); args.Add($"{AudioBitrateKbps}k");
-            if (AudioSampleRate != inputSampleRate) { args.Add("-ar"); args.Add(AudioSampleRate.ToString()); }
-
-            args.Add("-f"); args.Add(Delay.Muxer);
-            args.Add(delayFile);
         }
 
         return args;

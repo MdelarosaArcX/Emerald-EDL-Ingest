@@ -83,8 +83,8 @@ public partial class PlaybackWindow : Window
     /// <summary>Suppresses field handlers while the deck is being populated programmatically.</summary>
     private bool _loading = true;
 
-    /// <summary>The entry tidal lock is running, so a second countdown cannot queue another.</summary>
-    private string? _tidalEntryId;
+    /// <summary>The delayed feed, while one is running.</summary>
+    private DelayTransmitter? _delayTx;
 
     private WriteableBitmap? _previewBitmap;
     private string _lastAirRender = "";
@@ -328,6 +328,7 @@ public partial class PlaybackWindow : Window
         if (TidalLock.Shared.State != TidalLockState.Off)
             TidalLock.Shared.Disarm("Playback deck closed - tidal lock released.");
 
+        StopDelayedFeed();
         _preview.Dispose();
         _playout?.Dispose();
 
@@ -539,8 +540,7 @@ public partial class PlaybackWindow : Window
         if (TidalLock.Shared.State != TidalLockState.Off)
         {
             TidalLock.Shared.Disarm();
-            _tidalEntryId = null;
-            _playout?.StopAll();
+            StopDelayedFeed();
             Log("Tidal lock disarmed.", Level.Warn);
             return;
         }
@@ -565,7 +565,7 @@ public partial class PlaybackWindow : Window
         {
             case TidalLockState.CountingDown:
                 Log(lockState.Detail, Level.Ok);
-                CueDelayedPlayout(lockState);
+                StartDelayTransmitter(lockState);
                 break;
 
             case TidalLockState.Failed:
@@ -579,55 +579,112 @@ public partial class PlaybackWindow : Window
     });
 
     /// <summary>
-    /// Queues the delayed feed. The engine does the waiting: it opens the transmitter now,
-    /// holds black on it through the countdown, and cuts to the recording at the cue — which
-    /// is the recorder's roll point plus the delay, so the file it opens is already that far
-    /// behind the write head.
+    /// Starts draining the line to the transmitter. The transmitter does the waiting: it
+    /// opens the output now and holds black on it until a whole delay has accumulated, so
+    /// what it cuts to is already that far behind the receiver.
+    ///
+    /// Nothing here goes through <see cref="PlayoutService"/>. That engine decodes files and
+    /// cues them against the station clock, which is the right thing for the EDL and the
+    /// wrong thing for a delay: there is no file to decode and no cue to wait for, only a
+    /// ring of frames and a fixed distance to keep from its head.
     /// </summary>
-    private void CueDelayedPlayout(TidalLock lockState)
+    private void StartDelayTransmitter(TidalLock lockState)
     {
-        if (_playout is null || _tidalEntryId is not null) return;
+        if (_delayTx is not null) return;
 
-        if (SelectedTxBoard is not { } board || TxPortBox.SelectedItem is not ChannelPort port)
+        if (lockState.Line is not DelayLine line)
         {
-            TidalLock.Shared.Fail("No transmit board and TX port are selected.");
+            TidalLock.Shared.Fail("The capture deck did not open a delay line.");
             return;
         }
 
-        if (lockState.DelayFile is not { } file || lockState.CueAt is not { } cueAt)
+        if (!TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)) return;
+
+        // A TX channel cannot be opened twice, and PlayoutService holds its output open
+        // indefinitely once the queue drains. It has to let go first.
+        _playout?.StopAll();
+
+        try
         {
-            TidalLock.Shared.Fail("The capture deck did not say what it was recording to.");
+            _delayTx = new DelayTransmitter(board!.Index, port!.Index, line, lockState.Delay);
+        }
+        catch (DelayLineException ex)
+        {
+            TidalLock.Shared.Fail(ex.Message);
             return;
         }
 
-        int rate = _timecode.FrameRate > 0 ? _timecode.FrameRate : _settings.CaptureFrameRate;
+        _delayTx.Status += OnDelayStatus;
+        _delayTx.Start();
 
-        var request = new PlayoutRequest(
-            BoardIndex: board.Index,
-            BoardModel: board.Model,
-            TxChannel: port.Index,
-            VideoFiles: new[] { file },
-            Start: cueAt,
-            DurationFrames: null,               // runs until the recording stops or STOP is pressed
-            FrameRate: rate,
-            Som: Timecode.Zero(rate),
-            SeekOffset: TimeSpan.Zero,          // the delay is the head start, not a seek
-            PostPlay: PostPlay.BlackScreen,
-            // The recording's own audio, read back from the same delay line.
-            AudioTracks: new[] { new AudioTrack("delay line", new[] { file }) },
-            Follow: true);
+        Log($"Delaying {line.Width}x{line.Height}{line.FrameRate} to {port!.Name} on board " +
+            $"{board!.Index}, {TidalLock.Describe(lockState.Delay)} behind. " +
+            $"Ring: {line.SlotCount} frames at {line.Path}.", Level.Ok);
+    }
 
-        _tidalEntryId = Guid.NewGuid().ToString("N")[..8];
-
-        _playout.Enqueue(new PlayoutEntry
+    /// <summary>The transmitter reports from its own thread; everything here marshals.</summary>
+    private void OnDelayStatus(DelayStatus status) => Dispatcher.BeginInvoke(() =>
+    {
+        (string label, string brush) = status.Phase switch
         {
-            Id = _tidalEntryId,
-            Request = request,
-            MediaLabel = $"tidal lock - {Path.GetFileName(file)}",
-        });
+            DelayPhase.Opening => ("Opening the transmitter", "IpMuted"),
+            DelayPhase.Filling => ("Filling the delay", "Warn"),
+            DelayPhase.OnAir => ("ON AIR", "Ok"),
+            DelayPhase.Holding => ("Holding - the receiver has paused", "Warn"),
+            DelayPhase.Draining => ("Draining the last of the recording", "IpTeal"),
+            DelayPhase.Finished => ("Finished", "IpTeal"),
+            _ => ("Failed", "IpRed"),
+        };
 
-        Log($"Cued the delayed feed on {port.Name} for {cueAt} " +
-            $"({TidalLock.Describe(lockState.Delay)} behind {lockState.RecordingStarted}).", Level.Ok);
+        OutputStateText.Text = label;
+        OutputStateText.Foreground = Brush(brush);
+
+        OutputDetailText.Text = status.Phase == DelayPhase.Filling
+            ? $"{status.Buffered} of {status.Target} frames buffered"
+            : $"{status.FramesOut} frames out";
+
+        AirDot.Fill = Brush(brush);
+        AirText.Text = label;
+        AirText.Foreground = Brush(brush);
+
+        StopOutputButton.IsEnabled = status.Phase is not (DelayPhase.Finished or DelayPhase.Failed);
+
+        if (status.Message.Length > 0)
+        {
+            Log(status.Message, status.Phase switch
+            {
+                DelayPhase.Failed => Level.Error,
+                DelayPhase.Holding => Level.Warn,
+                DelayPhase.OnAir => Level.Ok,
+                _ => Level.Info,
+            });
+        }
+
+        switch (status.Phase)
+        {
+            case DelayPhase.OnAir:
+                TidalLock.Shared.WentToAir();
+                break;
+
+            case DelayPhase.Finished:
+                TidalLock.Shared.DrainComplete();
+                ClearDelayTransmitter();
+                break;
+
+            case DelayPhase.Failed:
+                TidalLock.Shared.Fail(status.Message.Length > 0 ? status.Message : "The delayed feed stopped.");
+                ClearDelayTransmitter();
+                break;
+        }
+    });
+
+    private void ClearDelayTransmitter()
+    {
+        if (_delayTx is null) return;
+
+        _delayTx.Status -= OnDelayStatus;
+        _delayTx.Dispose();
+        _delayTx = null;
     }
 
     private void RenderTidalLock()
@@ -657,13 +714,21 @@ public partial class PlaybackWindow : Window
         Step1Text.Foreground = Brush(lockState.State == TidalLockState.Off ? "IpMint" : "IpDim");
         Step2Text.Foreground = Brush(lockState.State == TidalLockState.Armed ? "IpMint" : "IpDim");
         Step3Text.Foreground = Brush(
-            lockState.State is TidalLockState.CountingDown or TidalLockState.OnAir ? "IpMint" : "IpDim");
+            lockState.State is TidalLockState.CountingDown or TidalLockState.OnAir
+                             or TidalLockState.Draining ? "IpMint" : "IpDim");
+    }
 
-        // Only a countdown or a live feed has an entry behind it. Clearing this on the way
-        // back to Armed is what lets a second recording cue a second time: without it, tidal
-        // lock worked once and then silently did nothing until it was disarmed and re-armed.
-        if (lockState.State is not (TidalLockState.CountingDown or TidalLockState.OnAir))
-            _tidalEntryId = null;
+    /// <summary>
+    /// Ends the delayed feed. Note this is a deliberate act: stopping the <i>recording</i>
+    /// does not come through here, because a whole delay's worth of programme is still in the
+    /// line and has not been transmitted yet.
+    /// </summary>
+    private void StopDelayedFeed()
+    {
+        if (_delayTx is null) return;
+
+        _delayTx.Stop();
+        ClearDelayTransmitter();
     }
 
     // ------------------------------------------------------------------ output
@@ -671,8 +736,9 @@ public partial class PlaybackWindow : Window
     private void StopOutput_Click(object sender, RoutedEventArgs e)
     {
         Log("Stop requested - releasing the transmitter.", Level.Warn);
+
+        StopDelayedFeed();
         _playout?.StopAll();
-        _tidalEntryId = null;
 
         if (TidalLock.Shared.State != TidalLockState.Off)
             TidalLock.Shared.Disarm("Output stopped by the operator.");
@@ -707,17 +773,6 @@ public partial class PlaybackWindow : Window
         AirDot.Fill = Brush(brush);
         AirText.Text = status.State == PlayoutState.Playing ? "ON AIR" : label;
         AirText.Foreground = Brush(brush);
-
-        // Only the tidal lock entry moves the lock's state. A clip played out by hand reaches
-        // the same transmitter and reports the same way, and would otherwise announce that
-        // the delayed feed had gone to air when it had not.
-        if (_tidalEntryId is not null)
-        {
-            if (status.State == PlayoutState.Playing) TidalLock.Shared.WentToAir();
-
-            if (status.State == PlayoutState.Failed && TidalLock.Shared.State != TidalLockState.Off)
-                TidalLock.Shared.Fail(status.Message);
-        }
 
         // Only the narrative transitions belong in the log; the per-second ticks would bury it.
         if (status.Message.Length > 0 && status.State != PlayoutState.Playing)
@@ -766,22 +821,31 @@ public partial class PlaybackWindow : Window
                 CountdownDetail.Text = "Waiting for the capture deck. Press Record there to start the countdown.";
                 break;
 
-            case TidalLockState.CountingDown when have && lockState.CueAt is { } cueAt:
-                int rate = now.Rate > 0 ? now.Rate : 25;
-                long perDay = 24L * 3600L * rate;
-                long frames = ((cueAt.TotalFrames - now.TotalFrames) % perDay + perDay) % perDay;
-
-                // More than half a day away means the cue has just gone by, not that it is
-                // twenty-three hours out.
-                if (frames > perDay / 2) frames = 0;
-
-                var left = TimeSpan.FromSeconds(frames / (double)rate);
+            case TidalLockState.CountingDown:
+                // Counted in frames actually in the line, not against the station clock. The
+                // receiver's own cadence is the truth about how much delay exists, so this
+                // stays honest through a timecode outage and cannot reach zero before the
+                // frames to fill the delay have really arrived.
+                TimeSpan left = lockState.TimeToAir;
 
                 LockPanel.Visibility = Visibility.Visible;
                 LockHeadline.Text = "TIDAL LOCK - ON AIR IN";
                 CountdownText.Text = $"{(int)left.TotalMinutes:00}:{left.Seconds:00}";
                 CountdownText.Foreground = Brush("IpMint");
-                CountdownDetail.Text = $"on air at {cueAt}, holding black on the transmitter until then";
+
+                CountdownDetail.Text =
+                    $"{lockState.FramesBuffered:N0} of {lockState.Line?.TargetFrames ?? 0:N0} frames buffered" +
+                    (lockState.CueAt is { } cue ? $"  |  on air at {cue}" : "") +
+                    "  |  holding black on the transmitter until then";
+                break;
+
+            case TidalLockState.Draining:
+                LockPanel.Visibility = Visibility.Visible;
+                LockHeadline.Text = "TIDAL LOCK - DRAINING";
+                CountdownText.Text = TidalLock.Describe(lockState.Delay);
+                CountdownText.Foreground = Brush("IpTeal");
+                CountdownDetail.Text =
+                    "The recording has stopped. What is left in the delay is still going to air.";
                 break;
 
             default:
