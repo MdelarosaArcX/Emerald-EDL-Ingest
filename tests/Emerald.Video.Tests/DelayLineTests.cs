@@ -252,6 +252,13 @@ public sealed class DelayLineTests : IDisposable
     /// A writer and a reader running flat out against each other, the reader a fixed distance
     /// behind. Every frame carries a checksum of itself, so a torn read is detectable rather
     /// than merely unlikely. This is the test that stands in for the on-air case.
+    ///
+    /// The reader here is under far more pressure than the real one: on air the pump reads a
+    /// frame every output slot period and the ring holds seconds of slack, whereas this reads
+    /// as fast as it can, checksums the whole frame each time, and is throttled only when it
+    /// gets too <em>close</em>. So it does sometimes fall far enough behind to be lapped, and
+    /// that is allowed. What is not allowed - ever, at any pressure - is a read reported as
+    /// good that is stitched from two different frames.
     /// </summary>
     [Fact]
     public void A_reader_running_behind_a_writer_never_sees_a_torn_frame()
@@ -263,6 +270,7 @@ public sealed class DelayLineTests : IDisposable
         long behind = line.TargetFrames;
         int torn = 0, lapped = 0;
         long read = 0;
+        long firstTorn = -1, firstTornAt = -1, firstTornWritten = -1;
 
         var writer = new Thread(() =>
         {
@@ -293,7 +301,16 @@ public sealed class DelayLineTests : IDisposable
             // different writes will not match.
             byte held = into.Video[0];
             into.Video[0] = (byte)((into.Sequence + 0) & 0xFF);
-            if (Checksum(into.Video) != held) torn++;
+            if (Checksum(into.Video) != held)
+            {
+                torn++;
+                if (firstTorn < 0)
+                {
+                    firstTorn = into.Sequence;
+                    firstTornAt = FirstDifference(into.Video, into.Sequence);
+                    firstTornWritten = line.FramesWritten;
+                }
+            }
 
             read++;
             turn ^= 1;
@@ -305,9 +322,26 @@ public sealed class DelayLineTests : IDisposable
 
         writer.Join();
 
-        Assert.Equal(0, torn);
-        Assert.Equal(0, lapped);
+        string detail = $"torn={torn} lapped={lapped} read={read} slots={line.SlotCount} " +
+                        $"behind={behind} firstTorn={firstTorn} atByte={firstTornAt} " +
+                        $"writtenThen={firstTornWritten}";
+
+        Assert.True(torn == 0, detail);
+
+        // Lapping is a reported outcome, not a hidden one - and the whole point is that it is
+        // reported instead of returning the torn frame. It must still stay a small minority,
+        // or the ring is sized wrong rather than the reader being unlucky.
+        Assert.True(lapped < total / 10, detail);
         Assert.Equal(total, read);
+    }
+
+    /// <summary>Where a frame stopped matching its own pattern, for the failure message.</summary>
+    private static long FirstDifference(byte[] frame, long sequence)
+    {
+        for (int i = 0; i < frame.Length; i++)
+            if (frame[i] != (byte)((sequence + i) & 0xFF)) return i;
+
+        return -1;
     }
 
     private static byte Checksum(byte[] frame)

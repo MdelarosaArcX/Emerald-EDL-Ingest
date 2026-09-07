@@ -82,7 +82,8 @@ public sealed class SdiIngestRecorder : IIngestRecorder
                 // first frame reads back as exactly what the operator typed. This is what
                 // puts a tmcd track in the container at all, and it is why SOM is a label
                 // rather than a time — the recording rolls at the start timecode either way.
-                startTimecode: job.Som))
+                startTimecode: job.Som,
+                extraAudio: job.AudioTracks))
         {
             return false;
         }

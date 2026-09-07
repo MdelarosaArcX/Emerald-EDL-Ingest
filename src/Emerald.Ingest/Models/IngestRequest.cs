@@ -1,3 +1,5 @@
+using Emerald.Video;
+
 namespace Emerald.Ingest;
 
 /// <summary>
@@ -40,6 +42,12 @@ public sealed record IngestRequest
     public string ClipName { get; init; } = "";
     public string Metadata { get; init; } = "";
     public string Directory { get; init; } = "";
+
+    /// <summary>
+    /// Audio files to record alongside the receiver's own sound. The original is always kept
+    /// and is always the first track; these follow it.
+    /// </summary>
+    public IReadOnlyList<CaptureAudioTrack> AudioTracks { get; init; } = Array.Empty<CaptureAudioTrack>();
 
     /// <summary>Recorded from the simulated receiver, because there is no card to record from.</summary>
     public bool Mock { get; init; }
@@ -90,5 +98,6 @@ public static class IngestFields
     public const string Duration = "duration";
     public const string ClipName = "clipName";
     public const string Directory = "directory";
+    public const string Audio = "audio";
     public const string Schedule = "schedule";
 }

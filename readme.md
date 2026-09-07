@@ -513,11 +513,32 @@ station timecode takes over and the decision becomes frame-accurate. A start tha
 missed by more than five seconds **fails with a reason** rather than rolling late and
 quietly producing a clip that is not the one that was ordered.
 
+### Audio
+
+The receiver's own sound is always recorded and is always **track 1**, labelled `Original`.
+Nothing you do in the *Audio* panel replaces it.
+
+Beyond that you can add up to eight further audio files — language beds, commentaries, a
+clean mix — with **Add track…** or by dropping them on the panel. Each becomes its own track
+in the recorded file, in list order, after the original:
+
+| Track | What it is |
+|---|---|
+| 1 | `Original` — embedded SDI audio off the receiver. Marked as the default track. |
+| 2… | The files you added, in the order shown, under whatever name you type next to each. |
+
+A track shorter than the ingest repeats to fill it, and the recording still ends on the
+duration rather than on the audio — so a thirty-second bed under a fifteen-minute ingest is
+fine. Files are checked before the receiver is opened, so a path that has moved is refused
+while it is still only a form, not a recording. `ffprobe` on the result shows every track
+with its name against it.
+
 ### What it writes
 
 Each ingest produces the pair Emerald records everywhere: a ProRes 422 master under
 `<directory>\high\` and an H.264 proxy under `<directory>\low\`, both named after the clip
 and both stamped with the SOM timecode, so the EDL and any NLE read the marks back correctly.
+Both carry the same audio tracks.
 
 ### Nothing is lost, and nothing is overwritten
 

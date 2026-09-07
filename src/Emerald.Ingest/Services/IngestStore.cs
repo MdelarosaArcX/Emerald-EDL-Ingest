@@ -71,7 +71,33 @@ public sealed class SqliteIngestStore : IIngestStore
 
             using IngestDbContext db = Open();
             db.Database.EnsureCreated();
+
+            // EnsureCreated builds the schema for a new file and does nothing at all to an
+            // existing one, so a database written before a column existed would fail every
+            // query against that table. Rather than take on migrations for a store this
+            // small, each added column is named here and added if it is missing. Adding a
+            // column SQLite already has is the only failure mode, and it is caught.
+            AddColumnIfMissing(db, "Jobs", "AudioTracksJson", "TEXT NOT NULL DEFAULT ''");
         }
+    }
+
+    /// <summary>
+    /// Adds a column to an older database. Idempotent: on a database that already has it,
+    /// nothing happens.
+    /// </summary>
+    private static void AddColumnIfMissing(IngestDbContext db, string table, string column, string definition)
+    {
+        using var command = db.Database.GetDbConnection().CreateCommand();
+
+        db.Database.OpenConnection();
+
+        command.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'";
+        bool present = Convert.ToInt64(command.ExecuteScalar() ?? 0L) > 0;
+
+        if (present) return;
+
+        command.CommandText = $"ALTER TABLE \"{table}\" ADD COLUMN \"{column}\" {definition}";
+        command.ExecuteNonQuery();
     }
 
     public void Save(IngestJob job)
@@ -209,6 +235,7 @@ public sealed class SqliteIngestStore : IIngestStore
         to.ActualStartTimecode = from.ActualStartTimecode;
         to.Directory = from.Directory;
         to.Metadata = from.Metadata;
+        to.AudioTracksJson = from.AudioTracksJson;
         to.Status = from.Status;
         to.CreatedAt = from.CreatedAt;
         to.ScheduledAt = from.ScheduledAt;

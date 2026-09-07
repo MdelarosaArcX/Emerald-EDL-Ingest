@@ -73,6 +73,9 @@ public sealed record RecordingProfile(
     public const string AudioCodec = "aac";
     public const string AudioLabel = "AAC";
 
+    /// <summary>What the receiver's own sound is called in a file that carries more than one track.</summary>
+    public const string OriginalAudioLabel = "Original";
+
     public static RecordingProfile Default { get; } = new(0, 192, 48000, 120);
 
     // The lists the deck offers. They live here so the values ffmpeg is given and the words
@@ -167,9 +170,19 @@ public sealed record RecordingProfile(
     /// Only meaningful with <paramref name="singleFile"/>: a segmented capture would stamp
     /// every segment with the same start, which is worse than stamping none of them.
     /// </param>
+    /// <param name="extraAudio">
+    /// Audio files to record alongside the receiver's own sound, each becoming a further
+    /// stream in both files. The receiver's audio is always stream 0 and is never replaced.
+    ///
+    /// Each is looped, and the outputs are cut to the shortest input. The receiver's own
+    /// audio and the video both end together when the recording stops, so that makes the
+    /// picture the thing that decides the length: a bed shorter than the recording repeats
+    /// instead of falling silent, and one longer than it does not run past the end.
+    /// </param>
     public IEnumerable<string> EncoderArguments(CaptureFormat format, string pipeName,
                                                 string folder, string namePrefix, int inputSampleRate,
-                                                bool singleFile = false, string? startTimecode = null)
+                                                bool singleFile = false, string? startTimecode = null,
+                                                IReadOnlyList<CaptureAudioTrack>? extraAudio = null)
     {
         var args = new List<string>
         {
@@ -179,10 +192,24 @@ public sealed record RecordingProfile(
             "-f", "s16le", "-ar", inputSampleRate.ToString(), "-ac", "2", "-i", $@"\\.\pipe\{pipeName}",
         };
 
+        IReadOnlyList<CaptureAudioTrack> beds = extraAudio ?? Array.Empty<CaptureAudioTrack>();
+
+        // Inputs 2 onwards. -stream_loop comes before the -i it applies to.
+        foreach (CaptureAudioTrack track in beds)
+        {
+            args.Add("-stream_loop"); args.Add("-1");
+            args.Add("-i"); args.Add(track.Path);
+        }
+
         foreach (RecordingOutput output in Outputs)
         {
             args.Add("-map"); args.Add("0:v:0");
             args.Add("-map"); args.Add("1:a:0");
+
+            for (int i = 0; i < beds.Count; i++)
+            {
+                args.Add("-map"); args.Add($"{i + 2}:a:0");
+            }
 
             if (output.HalfSize)
             {
@@ -217,6 +244,24 @@ public sealed record RecordingProfile(
             args.Add("-c:a"); args.Add(AudioCodec);
             args.Add("-b:a"); args.Add($"{AudioBitrateKbps}k");
             if (AudioSampleRate != inputSampleRate) { args.Add("-ar"); args.Add(AudioSampleRate.ToString()); }
+
+            if (beds.Count > 0)
+            {
+                // Named, so the tracks can be told apart in a player or an NLE rather than
+                // being "Audio 1, Audio 2, Audio 3" and left to guess.
+                args.Add("-metadata:s:a:0"); args.Add($"title={OriginalAudioLabel}");
+                args.Add("-disposition:a:0"); args.Add("default");
+
+                for (int i = 0; i < beds.Count; i++)
+                {
+                    args.Add($"-metadata:s:a:{i + 1}"); args.Add($"title={beds[i].Label}");
+                    args.Add($"-disposition:a:{i + 1}"); args.Add("0");
+                }
+
+                // The beds are looped, so they never end; the picture and the receiver's own
+                // audio do. That makes the picture what decides the length of the file.
+                args.Add("-shortest");
+            }
 
             // Before the output, so it applies to this file and not to the input.
             if (singleFile && !string.IsNullOrWhiteSpace(startTimecode))

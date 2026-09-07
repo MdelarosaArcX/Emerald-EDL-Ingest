@@ -223,7 +223,101 @@
                             <TextBlock Style="{StaticResource Hint}"
                                        Text="Free-form. Stored with the ingest record, not written into the file."/>
 
-                            <TextBlock Text="Directory" Style="{StaticResource FieldLabel}" Margin="0,14,0,5"/>
+                            <Border Height="1" Background="{StaticResource Line}" Margin="0,18,0,16"/>
+
+                            <Grid Margin="0,0,0,5">
+                                <TextBlock Text="AUDIO" Style="{StaticResource SectionHeader}" Margin="0"/>
+                                <Button x:Name="AddAudioButton" Content="Add track..."
+                                        Style="{StaticResource GhostButton}" HorizontalAlignment="Right"
+                                        Height="22" Padding="10,0" FontSize="11" Click="AddAudio_Click"/>
+                            </Grid>
+
+                            <!-- The receiver's own sound is not a choice: it is always recorded and
+                                 always the first track. Shown as a row so the file's layout can be
+                                 read off the panel. -->
+                            <Border Background="{StaticResource PanelDeep}" BorderBrush="{StaticResource Line}"
+                                    BorderThickness="1" CornerRadius="4" Padding="9,6">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Border Grid.Column="0" Background="#151A21" BorderBrush="{StaticResource Line}"
+                                            BorderThickness="1" CornerRadius="3" Padding="7,2" Margin="0,0,9,0">
+                                        <TextBlock Text="1" FontFamily="Consolas" FontSize="11"
+                                                   Foreground="{StaticResource Ok}"/>
+                                    </Border>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="Original - from the receiver"
+                                                   Foreground="{StaticResource Ok}" FontSize="12"/>
+                                        <TextBlock x:Name="OriginalAudioHint" Style="{StaticResource Hint}"
+                                                   Margin="0,1,0,0"
+                                                   Text="Always recorded, always first. Embedded SDI audio, group 1 channels 1-2."/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+
+                            <Border x:Name="AudioDropZone" AllowDrop="True" MinHeight="46" CornerRadius="4"
+                                    Background="{StaticResource PanelDeep}" BorderBrush="{StaticResource Line}"
+                                    BorderThickness="1" Padding="9,6" Margin="0,5,0,0"
+                                    Drop="AudioDropZone_Drop" DragOver="AudioDropZone_DragOver"
+                                    DragLeave="AudioDropZone_DragLeave">
+                                <StackPanel>
+                                    <TextBlock x:Name="AudioEmptyText" Foreground="#5C6474" FontSize="11.5"
+                                               TextWrapping="Wrap"
+                                               Text="No extra audio. Drop files here, or Add track, to record them alongside the original."/>
+
+                                    <ItemsControl x:Name="AudioTrackList">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Background="#151A21" CornerRadius="4" Padding="7,5"
+                                                        Margin="0,0,0,4" BorderThickness="1"
+                                                        BorderBrush="{StaticResource Line}"
+                                                        ToolTip="{Binding Path}">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="*" MinWidth="70"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                        </Grid.ColumnDefinitions>
+
+                                                        <Border Grid.Column="0" Background="{StaticResource PanelDeep}"
+                                                                BorderBrush="{StaticResource Line}" BorderThickness="1"
+                                                                CornerRadius="3" Padding="7,2" Margin="0,0,7,0"
+                                                                VerticalAlignment="Center">
+                                                            <TextBlock Text="{Binding TrackNumber}" FontFamily="Consolas"
+                                                                       FontSize="11" Foreground="{StaticResource Tc}"/>
+                                                        </Border>
+
+                                                        <StackPanel Grid.Column="1">
+                                                            <TextBox Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}"
+                                                                     FontSize="12" Height="24" Padding="5,2"
+                                                                     ToolTip="What this track is called in the file"/>
+                                                            <TextBlock Text="{Binding FileName}" Style="{StaticResource Hint}"
+                                                                       Margin="0,2,0,0" TextTrimming="CharacterEllipsis"/>
+                                                        </StackPanel>
+
+                                                        <Button Grid.Column="2" Content="&#215;"
+                                                                Style="{StaticResource GhostButton}"
+                                                                Width="25" Height="24" Padding="0" FontSize="12"
+                                                                Margin="6,0,0,0" VerticalAlignment="Top"
+                                                                Click="RemoveAudio_Click" ToolTip="Remove this track"/>
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </StackPanel>
+                            </Border>
+
+                            <TextBlock x:Name="AudioError" Style="{StaticResource Hint}"
+                                       Foreground="{StaticResource Bad}" Visibility="Collapsed"/>
+                            <TextBlock x:Name="AudioHint" Style="{StaticResource Hint}"
+                                       Text="Each becomes its own track in the recorded file, after the original. A track shorter than the ingest repeats to fill it."/>
+
+                            <Border Height="1" Background="{StaticResource Line}" Margin="0,18,0,16"/>
+
+                            <TextBlock Text="Directory" Style="{StaticResource FieldLabel}" Margin="0,0,0,5"/>
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>

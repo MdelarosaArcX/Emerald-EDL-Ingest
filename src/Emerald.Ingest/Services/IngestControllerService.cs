@@ -53,6 +53,12 @@ public sealed class IngestControllerService : IIngestControllerService
     /// <summary>Room that should still be free after the recording has been written.</summary>
     private const long HeadroomBytes = 5L * 1024 * 1024 * 1024;
 
+    /// <summary>
+    /// Extra audio tracks an ingest will carry, beside the receiver's own. Eight is the same
+    /// ceiling the EDL uses, and well beyond what a container or an operator wants.
+    /// </summary>
+    public const int MaxAudioTracks = 8;
+
     private readonly AppSettings _settings;
     private readonly IIngestStore _store;
 
@@ -190,6 +196,12 @@ public sealed class IngestControllerService : IIngestControllerService
         Log.Write($"    duration  {job.Duration}   records {job.RecordedLength} in total");
         Log.Write($"    directory {job.Directory}");
 
+        if (job.AudioTracks.Count > 0)
+        {
+            Log.Write($"    audio     {RecordingProfile.OriginalAudioLabel} (from the receiver), then " +
+                      string.Join(", ", job.AudioTracks.Select(t => t.Label)));
+        }
+
         Scheduler.Enqueue(job);
         return validation;
     }
@@ -276,6 +288,26 @@ public sealed class IngestControllerService : IIngestControllerService
         // SOM is a label on the file, not a preroll, so neither of these involves it.
         Timecode actualStart = reference;
         Timecode recordedLength = duration;
+
+        // ---- audio. The receiver's own sound is always recorded; these are extra tracks
+        // beside it, so a missing file is a refusal rather than a silent omission — an
+        // operator would not find out until they opened the clip.
+        if (request.AudioTracks.Count > MaxAudioTracks)
+        {
+            v.Add(IngestFields.Audio,
+                  $"{request.AudioTracks.Count} audio tracks is more than the {MaxAudioTracks} an ingest carries.");
+        }
+        else
+        {
+            foreach (CaptureAudioTrack track in request.AudioTracks)
+            {
+                if (!File.Exists(track.Path))
+                {
+                    v.Add(IngestFields.Audio, $"The audio track \"{track.Label}\" is not there: {track.Path}");
+                    break;
+                }
+            }
+        }
 
         // ---- clip name
         string clipName = request.ClipName.Trim();
@@ -371,6 +403,7 @@ public sealed class IngestControllerService : IIngestControllerService
                     ActualStartTimecode = actualStart.ToString(),
                     Directory = directory,
                     Metadata = request.Metadata.Trim(),
+                    AudioTracks = request.AudioTracks,
                     Status = IngestStatus.Created,
                     CreatedAt = DateTime.Now,
                     ScheduledAt = scheduledAt,

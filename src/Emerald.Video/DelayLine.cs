@@ -503,6 +503,13 @@ public sealed class DelayLine : IDelayLine, IDisposable
                 Buffer.MemoryCopy(slot + SlotHeaderBytes + FrameBytes, dst, into.Audio.Length, audioBytes);
         }
 
+        // A full fence, not an acquire. Volatile.Read only stops later loads from being
+        // hoisted above it; it does nothing to stop the copy above from sinking below it,
+        // which would let the check pass on a frame that was still being copied as the
+        // writer overwrote it. Release builds do exactly that, and the torn-frame test
+        // catches it. The barrier pins the copy in front of the check.
+        Interlocked.MemoryBarrier();
+
         // Read the sequence again. If the writer came all the way round while this was
         // copying, the buffer now holds half of two different frames - and it is deliberately
         // not the buffer the caller is still holding on to.

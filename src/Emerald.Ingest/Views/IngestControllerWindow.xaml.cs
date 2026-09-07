@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -8,6 +9,7 @@ using System.Windows.Threading;
 using Emerald.Core;
 using Emerald.Deltacast;
 using Emerald.Media;
+using Emerald.Video;
 using Microsoft.Win32;
 
 namespace Emerald.Ingest;
@@ -80,6 +82,7 @@ public partial class IngestControllerWindow : Window
         InitializeComponent();
 
         LogList.ItemsSource = _log;
+        AudioTrackList.ItemsSource = _audioRows;
         QueueList.ItemsSource = _queueRows;
         RecentList.ItemsSource = _recentRows;
 
@@ -364,6 +367,139 @@ public partial class IngestControllerWindow : Window
         }
     }
 
+    // ------------------------------------------------------------------ audio tracks
+
+    /// <summary>
+    /// One extra audio track on the form. The label is editable, so it notifies; the number
+    /// is its position in the file, which moves when a track above it is removed.
+    /// </summary>
+    private sealed class AudioRow : INotifyPropertyChanged
+    {
+        public required string Path { get; init; }
+
+        private string _label = "";
+        public string Label
+        {
+            get => _label;
+            set { _label = value; Notify(); }
+        }
+
+        private int _index;
+
+        /// <summary>Position among the extra tracks, from zero.</summary>
+        public int Index
+        {
+            get => _index;
+            set { _index = value; Notify(); Notify(nameof(TrackNumber)); }
+        }
+
+        /// <summary>What this track is in the finished file. The original is always 1.</summary>
+        public string TrackNumber => (_index + 2).ToString();
+
+        public string FileName => System.IO.Path.GetFileName(Path);
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        private void Notify([CallerMemberName] string? name = null) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
+
+    private readonly ObservableCollection<AudioRow> _audioRows = new();
+
+    private void AddAudio_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "Select audio to record alongside the original",
+            Filter = "Audio files|*.wav;*.mp3;*.aac;*.m4a;*.flac;*.ogg;*.opus;*.ac3;*.eac3;*.mp2;*.aif;*.aiff" +
+                     "|Media files|*.mxf;*.mov;*.mp4;*.mkv;*.ts;*.avi|All files|*.*",
+            Multiselect = true,
+        };
+
+        if (dialog.ShowDialog(this) != true) return;
+
+        foreach (string path in dialog.FileNames) AddAudioTrack(path);
+    }
+
+    private void AudioDropZone_DragOver(object sender, DragEventArgs e)
+    {
+        bool ok = e.Data.GetDataPresent(DataFormats.FileDrop);
+        e.Effects = ok ? DragDropEffects.Copy : DragDropEffects.None;
+        if (ok) AudioDropZone.BorderBrush = Brush("Accent");
+        e.Handled = true;
+    }
+
+    private void AudioDropZone_DragLeave(object sender, DragEventArgs e) =>
+        AudioDropZone.BorderBrush = Brush("Line");
+
+    private void AudioDropZone_Drop(object sender, DragEventArgs e)
+    {
+        AudioDropZone.BorderBrush = Brush("Line");
+
+        if (e.Data.GetData(DataFormats.FileDrop) is not string[] { Length: > 0 } paths) return;
+
+        foreach (string path in paths) AddAudioTrack(path);
+    }
+
+    private void AddAudioTrack(string path)
+    {
+        if (_audioRows.Count >= IngestControllerService.MaxAudioTracks)
+        {
+            Log($"An ingest carries at most {IngestControllerService.MaxAudioTracks} extra tracks; " +
+                $"\"{System.IO.Path.GetFileName(path)}\" was not added.", IngestLogLevel.Warn);
+            return;
+        }
+
+        if (!File.Exists(path))
+        {
+            Log($"No such audio file: {path}", IngestLogLevel.Error);
+            return;
+        }
+
+        if (_audioRows.Any(r => string.Equals(r.Path, path, StringComparison.OrdinalIgnoreCase)))
+        {
+            Log($"\"{System.IO.Path.GetFileName(path)}\" is already on the list.", IngestLogLevel.Warn);
+            return;
+        }
+
+        // The file name is the obvious first guess at what the track is called, and it is
+        // what an operator would have typed anyway.
+        _audioRows.Add(new AudioRow
+        {
+            Path = path,
+            Label = System.IO.Path.GetFileNameWithoutExtension(path),
+        });
+
+        RenumberAudio();
+        Log($"Audio track added: {System.IO.Path.GetFileName(path)}");
+    }
+
+    private void RemoveAudio_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not AudioRow row) return;
+
+        _audioRows.Remove(row);
+        RenumberAudio();
+        Log($"Audio track removed: {row.FileName}");
+    }
+
+    private void RenumberAudio()
+    {
+        for (int i = 0; i < _audioRows.Count; i++) _audioRows[i].Index = i;
+
+        AudioEmptyText.Visibility = _audioRows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        AddAudioButton.IsEnabled = _audioRows.Count < IngestControllerService.MaxAudioTracks;
+
+        Recompute();
+    }
+
+    /// <summary>The tracks as the recorder wants them: label and path, in list order.</summary>
+    private IReadOnlyList<CaptureAudioTrack> CurrentAudioTracks() =>
+        _audioRows.Select(r => new CaptureAudioTrack(
+                              string.IsNullOrWhiteSpace(r.Label) ? r.FileName : r.Label.Trim(),
+                              r.Path))
+                  .ToList();
+
     private void ApplyApi_Click(object sender, RoutedEventArgs e)
     {
         if (!TimecodeLink.TrySetUrl(ApiUrlBox.Text, out string? problem))
@@ -475,6 +611,7 @@ public partial class IngestControllerWindow : Window
             ClipName = ClipNameBox.Text.Trim(),
             Metadata = MetadataBox.Text,
             Directory = DirectoryBox.Text.Trim(),
+            AudioTracks = CurrentAudioTracks(),
             Mock = _controller?.Hardware.IsMock ?? false,
         };
     }
@@ -535,6 +672,7 @@ public partial class IngestControllerWindow : Window
         ShowError(SomEomError, validation.For(IngestFields.Som) ?? validation.For(IngestFields.Eom));
         ShowError(DurationError, validation.For(IngestFields.Duration));
         ShowError(ClipNameError, validation.For(IngestFields.ClipName));
+        ShowError(AudioError, validation.For(IngestFields.Audio));
 
         RenderDirectoryHint(validation);
         RenderPreview(validation, reference, som, rate, haveReference && haveSom);

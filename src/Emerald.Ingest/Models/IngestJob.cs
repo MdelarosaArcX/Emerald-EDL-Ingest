@@ -2,7 +2,9 @@ using System.ComponentModel;
 using System.ComponentModel.DataAnnotations.Schema;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using Emerald.Core;
+using Emerald.Video;
 
 namespace Emerald.Ingest;
 
@@ -70,6 +72,44 @@ public sealed class IngestJob : INotifyPropertyChanged
 
     /// <summary>The operator's free-form note about what this is.</summary>
     public string Metadata { get; set; } = "";
+
+    // ------------------------------------------------------------------ audio
+
+    /// <summary>
+    /// The extra audio tracks, as JSON in one column.
+    ///
+    /// A table of its own would be the tidier schema, but this is a handful of labels and
+    /// paths that are only ever read back with the job that owns them — a join and a second
+    /// entity for that is more machinery than the thing is worth.
+    /// </summary>
+    public string AudioTracksJson { get; set; } = "";
+
+    /// <summary>
+    /// Audio files recorded alongside the receiver's own sound. The original is always kept
+    /// and is always the first track in the file; these are added after it.
+    /// </summary>
+    [NotMapped]
+    public IReadOnlyList<CaptureAudioTrack> AudioTracks
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(AudioTracksJson)) return Array.Empty<CaptureAudioTrack>();
+
+            try
+            {
+                return JsonSerializer.Deserialize<List<CaptureAudioTrack>>(AudioTracksJson)
+                       ?? (IReadOnlyList<CaptureAudioTrack>)Array.Empty<CaptureAudioTrack>();
+            }
+            catch (JsonException)
+            {
+                // A job whose audio list cannot be read still records its picture and its
+                // original sound, which is far better than not recording at all.
+                return Array.Empty<CaptureAudioTrack>();
+            }
+        }
+
+        set => AudioTracksJson = value is { Count: > 0 } ? JsonSerializer.Serialize(value) : "";
+    }
 
     // ------------------------------------------------------------------ state
 

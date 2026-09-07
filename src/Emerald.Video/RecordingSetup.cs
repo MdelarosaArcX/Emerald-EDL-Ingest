@@ -3,6 +3,15 @@ using Emerald.Core;
 
 namespace Emerald.Video;
 
+/// <summary>
+/// An audio file to record alongside the receiver's own sound — a language bed, a
+/// commentary, a clean mix.
+///
+/// It becomes a further audio stream in the recorded file rather than replacing anything, so
+/// what comes off the wire is always still there as the first track.
+/// </summary>
+public sealed record CaptureAudioTrack(string Label, string Path);
+
 /// <summary>Everything <see cref="SdiCapture"/> needs to record one receiver.</summary>
 /// <param name="FrameLimit">
 /// Stop after this many frames have been taken off the receiver, or null to record until
@@ -25,7 +34,8 @@ public sealed record CaptureRequest(
     RecordingProfile Profile,
     long? FrameLimit = null,
     bool SingleFile = false,
-    string? StartTimecode = null)
+    string? StartTimecode = null,
+    IReadOnlyList<CaptureAudioTrack>? ExtraAudio = null)
 {
     /// <summary>The files this request will write, proxy first — the order ffmpeg is given them in.</summary>
     public IReadOnlyList<string> OutputPaths => SingleFile
@@ -57,7 +67,8 @@ public static class RecordingSetup
         out string? problem,
         long? frameLimit = null,
         bool singleFile = false,
-        string? startTimecode = null)
+        string? startTimecode = null,
+        IReadOnlyList<CaptureAudioTrack>? extraAudio = null)
     {
         request = null;
         folder = folder.Trim();
@@ -84,6 +95,18 @@ public static class RecordingSetup
         {
             problem = "no RX port is selected.";
             return false;
+        }
+
+        // Checked here rather than at the encoder: ffmpeg refusing to open an input takes the
+        // whole recording down, and a missing bed is worth naming before the receiver is
+        // touched at all.
+        foreach (CaptureAudioTrack track in extraAudio ?? Array.Empty<CaptureAudioTrack>())
+        {
+            if (!File.Exists(track.Path))
+            {
+                problem = $"the audio track \"{track.Label}\" is not there: {track.Path}";
+                return false;
+            }
         }
 
         RecordingProfile profile = RecordingProfile.From(settings);
@@ -113,7 +136,8 @@ public static class RecordingSetup
             Profile: profile,
             FrameLimit: frameLimit,
             SingleFile: singleFile,
-            StartTimecode: startTimecode);
+            StartTimecode: startTimecode,
+            ExtraAudio: extraAudio);
 
         problem = null;
         return true;
