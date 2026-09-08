@@ -51,10 +51,30 @@ public sealed class SdiAudioReader : IDisposable
     /// </summary>
     public int ChannelsPresent { get; private set; }
 
-    /// <summary>Whether each channel carried anything, indexed as channel 1 is 0.</summary>
+    /// <summary>Whether the card returned data for each channel, indexed as channel 1 is 0.</summary>
     private readonly bool[] _present;
 
+    /// <summary>Whether that data was anything other than silence.</summary>
+    private readonly bool[] _signal;
+
+    /// <summary>
+    /// Whether the card returned samples for this channel.
+    ///
+    /// This is <b>not</b> the same as the feed carrying audio there. A DELTACAST receiver
+    /// hands back a full buffer of zeros for a channel nothing is embedded on, so on a real
+    /// card every one of the sixteen reads as "present" whatever is actually on the wire.
+    /// Use <see cref="HasSignal"/> to tell a language from an empty channel.
+    /// </summary>
     public bool IsPresent(int channel) => channel >= 0 && channel < _wantChannels && _present[channel];
+
+    /// <summary>
+    /// Whether this channel carried a sample that was not zero in the last read.
+    ///
+    /// The only honest test available: the card does not say which groups are embedded, so
+    /// the audio itself has to. A real language does fall silent between words, which is why
+    /// callers hold this over a window rather than believing a single frame.
+    /// </summary>
+    public bool HasSignal(int channel) => channel >= 0 && channel < _wantChannels && _signal[channel];
 
     /// <summary>
     /// De-interleaved samples, one array per channel. Reused between reads, so a caller that
@@ -80,6 +100,7 @@ public sealed class SdiAudioReader : IDisposable
         _channelBuffers = new IntPtr[_wantChannels];
         Channels = new short[_wantChannels][];
         _present = new bool[_wantChannels];
+        _signal = new bool[_wantChannels];
 
         for (int i = 0; i < _wantChannels; i++)
         {
@@ -136,6 +157,7 @@ public sealed class SdiAudioReader : IDisposable
         Samples = 0;
         ChannelsPresent = 0;
         Array.Clear(_present);
+        Array.Clear(_signal);
 
         if (_info == IntPtr.Zero) return 0;
 
@@ -175,6 +197,14 @@ public sealed class SdiAudioReader : IDisposable
             _present[i] = true;
             ChannelsPresent++;
             longest = Math.Max(longest, samples);
+
+            for (int s = 0; s < samples; s++)
+            {
+                if (Channels[i][s] == 0) continue;
+
+                _signal[i] = true;
+                break;
+            }
         }
 
         Samples = longest;
@@ -214,8 +244,13 @@ public sealed class SdiAudioReader : IDisposable
     }
 
     /// <summary>
-    /// How many stereo pairs actually carried audio, counting from the first — so a feed on
-    /// channels 1-2 and 3-4 reports two, and one on 1-2 alone reports one.
+    /// How many stereo pairs carried actual audio in this read, counting from the first — so
+    /// a feed on channels 1-2 and 3-4 reports two, and one on 1-2 alone reports one.
+    ///
+    /// Signal, not bytes: the card returns a full buffer of zeros for a channel nothing is
+    /// embedded on, so counting what it handed back would report all eight pairs on every
+    /// feed. This is one frame's worth of evidence and a language does fall silent between
+    /// words, so callers take the highest count over a window rather than this alone.
     ///
     /// Counted from the front rather than by highest occupied pair: a gap would otherwise
     /// silently renumber the languages after it, and recording a silent pair to hold the
@@ -227,7 +262,7 @@ public sealed class SdiAudioReader : IDisposable
 
         for (int p = 0; p * 2 + 1 < _asking; p++)
         {
-            if (!_present[p * 2] && !_present[p * 2 + 1]) break;
+            if (!_signal[p * 2] && !_signal[p * 2 + 1]) break;
             pairs++;
         }
 

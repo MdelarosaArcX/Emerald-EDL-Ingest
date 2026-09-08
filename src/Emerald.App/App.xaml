@@ -513,6 +513,69 @@
             </Setter>
         </Style>
 
+        <!--
+            Small flat controls for inside a deck card. IpDeckTab is the vertical rotated tab
+            down the side of the window and is a ToggleButton; these are what a button in a
+            panel wants, and there are two because WPF matches a style to its TargetType
+            exactly - a ToggleButton style on a Button throws at load rather than at build.
+        -->
+        <Style x:Key="IpSmallButton" TargetType="Button">
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Foreground" Value="{StaticResource IpMuted}"/>
+            <Setter Property="FontSize" Value="9"/>
+            <Setter Property="Height" Value="19"/>
+            <Setter Property="Padding" Value="8,0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="b" Background="#141C27" BorderBrush="{StaticResource IpLine}"
+                                BorderThickness="1" CornerRadius="3" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="b" Property="Background" Value="#1B2634"/>
+                                <Setter Property="Foreground" Value="{StaticResource IpText}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="b" Property="Opacity" Value="0.4"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="IpSmallToggle" TargetType="ToggleButton">
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Foreground" Value="{StaticResource IpMuted}"/>
+            <Setter Property="FontSize" Value="9"/>
+            <Setter Property="Height" Value="19"/>
+            <Setter Property="Padding" Value="8,0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToggleButton">
+                        <Border x:Name="b" Background="#141C27" BorderBrush="{StaticResource IpLine}"
+                                BorderThickness="1" CornerRadius="3" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="b" Property="Background" Value="#1B2634"/>
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="b" Property="Background" Value="#123A44"/>
+                                <Setter TargetName="b" Property="BorderBrush" Value="{StaticResource IpTeal}"/>
+                                <Setter Property="Foreground" Value="{StaticResource IpMint}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- Card chrome for the capture deck down the right-hand side. -->
         <Style x:Key="IpCardBorder" TargetType="Border">
             <Setter Property="Background" Value="{StaticResource IpCard}"/>

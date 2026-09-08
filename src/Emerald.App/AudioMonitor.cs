@@ -42,10 +42,25 @@ public sealed class AudioMonitor : IDisposable
     /// <summary>When audio was last seen at all, so a dead feed can empty the meters.</summary>
     private long _lastTicks;
 
+    /// <summary>
+    /// When each channel last carried something other than silence.
+    ///
+    /// Presence is held for <see cref="SignalHold"/> after that, because a language falls
+    /// silent between words and a row that vanished every pause would be unusable. It is the
+    /// only test available: the card returns a buffer of zeros for a channel nothing is
+    /// embedded on rather than saying so, and believing it would show all eight pairs on
+    /// every feed — which is exactly what the deck did on its first run.
+    /// </summary>
+    private readonly long[] _signalTicks;
+
+    /// <summary>Long enough to cover a pause in speech, short enough to notice a feed change.</summary>
+    private static readonly TimeSpan SignalHold = TimeSpan.FromSeconds(3);
+
     public AudioMonitor()
     {
         _meters = new AudioMeter[SdiAudioReader.MaxChannels];
         _levels = new AudioLevel[SdiAudioReader.MaxChannels];
+        _signalTicks = new long[SdiAudioReader.MaxChannels];
 
         for (int i = 0; i < _meters.Length; i++)
         {
@@ -78,6 +93,28 @@ public sealed class AudioMonitor : IDisposable
     public string? ListenProblem
     {
         get { lock (_gate) return _speakers?.Problem; }
+    }
+
+    /// <summary>
+    /// Pairs carrying a language, counted from the first. Held over
+    /// <see cref="SignalHold"/>, so a pause in speech does not drop a row. Caller holds
+    /// <see cref="_levelGate"/>.
+    /// </summary>
+    private int CountPairs(long now, long holdTicks)
+    {
+        int pairs = 0;
+
+        for (int p = 0; p * 2 + 1 < _signalTicks.Length; p++)
+        {
+            bool live = Live(p * 2) || Live(p * 2 + 1);
+            if (!live) break;
+
+            pairs++;
+        }
+
+        return pairs;
+
+        bool Live(int c) => _signalTicks[c] != 0 && now - _signalTicks[c] <= holdTicks;
     }
 
     /// <summary>A snapshot of every channel's level, safe to read from the UI thread.</summary>
@@ -158,8 +195,10 @@ public sealed class AudioMonitor : IDisposable
     public void Push(SdiAudioReader reader)
     {
         int samples = reader.Samples;
-        PairsPresent = reader.PairsPresent();
-        Volatile.Write(ref _lastTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        long holdTicks = (long)(SignalHold.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
+
+        Volatile.Write(ref _lastTicks, now);
 
         // One acquire for all sixteen channels, not sixteen. The meters themselves are behind
         // it too: the UI thread lets them decay when audio stops arriving, and they were
@@ -168,10 +207,17 @@ public sealed class AudioMonitor : IDisposable
         {
             for (int c = 0; c < _meters.Length && c < reader.ChannelCount; c++)
             {
-                bool present = reader.IsPresent(c);
+                if (reader.HasSignal(c)) _signalTicks[c] = now;
+
+                // Present means "this channel is carrying a language", not "the card handed
+                // back a buffer" - which it does for all sixteen regardless.
+                bool present = _signalTicks[c] != 0 && now - _signalTicks[c] <= holdTicks;
+
                 _meters[c].Push(reader.Channels[c], present ? samples : 0, present);
                 _levels[c] = _meters[c].Level;
             }
+
+            PairsPresent = CountPairs(now, holdTicks);
         }
 
         int pair;
@@ -214,6 +260,8 @@ public sealed class AudioMonitor : IDisposable
 
         lock (_levelGate)
         {
+            Array.Clear(_signalTicks);
+
             for (int c = 0; c < _meters.Length; c++)
             {
                 _meters[c].Idle(elapsed);
@@ -231,6 +279,7 @@ public sealed class AudioMonitor : IDisposable
         PairsPresent = 0;
         _lastTicks = 0;
 
+        lock (_levelGate) Array.Clear(_signalTicks);
         lock (_gate) _speakers?.Flush();
     }
 

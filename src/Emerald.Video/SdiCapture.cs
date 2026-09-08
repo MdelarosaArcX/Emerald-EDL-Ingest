@@ -598,9 +598,10 @@ public sealed class SdiCapture : IDisposable
                 VideoMasterHD.VHD_UnlockSlotHandle(slot);
             }
 
-            // A pair can be momentarily quiet without being absent, so several slots are read
-            // rather than believing the first one that carries anything.
-            if (best > 0 && looking.Elapsed > TimeSpan.FromMilliseconds(300)) break;
+            // Kept looking for the whole window rather than stopping at the first answer. A
+            // pair is counted on having carried a sample that was not zero, and a language
+            // falls silent between words - so the highest count over two seconds is a far
+            // better guess at the track layout than whatever the first slot happened to hold.
         }
 
         return Math.Max(1, best);
