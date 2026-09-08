@@ -36,6 +36,7 @@ Emerald.sln
 ├─ src\Emerald.Deltacast      VideoMaster interop, boards, TX output, RX arbitration
 ├─ src\Emerald.Core           timecode, the shared station clock, settings
 ├─ tests\Emerald.Core.Tests
+├─ tests\Emerald.Edl.Tests
 ├─ tests\Emerald.Ingest.Tests
 └─ tests\Emerald.Video.Tests
 ```
@@ -238,7 +239,7 @@ audio tracks carry across from the pre-Emerald app.
 | **EOM** (out-point, from the head) | Where to stop, on the same elapsed scale, so `EOM − SOM` is the duration. A 3-minute clip with SOM `00:01:00:00` and EOM `00:03:00:00` plays its last two minutes. Choosing a file **seeds SOM to `00:00:00:00` and EOM to the clip's length**, so it plays whole until you trim it. **Set EOM equal to SOM** for no fixed duration: the media loops until stopped. |
 | **Duration** | **Editable**, and tied to EOM both ways: type a duration and EOM follows (`SOM + duration`); type an EOM and the duration follows (`EOM − SOM`). There is no mode to choose — whichever you last typed into is the one you are driving, and the calculated one is tinted. Moving **SOM** then leaves the field you set alone and re-derives the other. |
 | **Stop Time** | **Read-only** — start timecode + duration, wrapped at 24 h. Start `20:57:26:00` with a two-minute duration stops at `20:59:26:00`, whatever SOM is. |
-| **Audio Tracks** | A list of language beds, each with its own source. **All of them are transmitted at once**, each on its own SDI channel pair — track 1 on CH 1-2, track 2 on CH 3-4, up to 8 tracks (16 channels). The pair is shown on each row. Each has its own **+ / −** trim at **10 ms per tick** (±500 ms) and a **0** reset, independent per language and adjustable while on air. |
+| **Audio Tracks** | **Selecting media loads every language embedded in it**, one row per audio stream, named from the stream's own title or language tag. Beds in separate files can be added alongside with **Add track...** or by dropping them. **All of them are transmitted at once**, each on its own SDI channel pair — track 1 on CH 1-2, track 2 on CH 3-4, up to 8 tracks (16 channels). The pair is shown on each row. Each has its own **+ / −** trim at **10 ms per tick** (±500 ms) and a **0** reset, independent per language and adjustable while on air. |
 | **Media Source** | **Optional.** Drop a folder or file onto the panel, or browse. Folders are scanned one level deep for playable containers (`.mxf .mov .mp4 .avi .mkv .ts .m2t .mpg .dv .gxf .lxf .webm .yuv .wav` …) and sent as an ordered playlist. |
 | **Post Play** | What the TX carries once the message ends and until the next one cues: **Black Screen** or **Freeze on last frame**. |
 | **Recording folder** | Where RX recordings are written, in 2-minute segments, while a message is on air. Leave empty to record nothing. Validated as you type, with free space shown. |
@@ -266,11 +267,27 @@ The QUEUE panel lists every message with its live state:
 | State | Meaning |
 |---|---|
 | **QUEUED** | Loaded and waiting its turn. |
-| **CUED** | Next up and holding — the countdown to its start timecode is shown. |
-| **PLAYING** | On air, with elapsed time counting up. |
+| **CUED** | Next up and holding. |
+| **PLAYING** | On air. |
 | **DONE** / **STOPPED** / **FAILED** | Finished. **Clear finished** removes them. |
 
 Each row carries start, duration, stop time, TX channel and post-play setting.
+
+### The countdown
+
+Every row that has somewhere to be shows a live countdown on the right, in timecode:
+
+| Row | Reads | Counting to |
+|---|---|---|
+| **QUEUED** / **CUED** | `T- 00:01:23:04`, **to air** | Its start timecode. This is the clock that starts the moment you press **Send EDL**. |
+| **PLAYING** | `T- 00:00:41:11`, **left** | Its stop time — how much of the message is still to run. |
+| **PLAYING**, no fixed duration | `ON AIR`, **open-ended** | Nothing; it loops until stopped. |
+
+It turns amber inside ten seconds and red inside one, and it runs on the **house clock**,
+not on wall time — it is the same sum the engine waits out, so the number on screen reaches
+zero on the frame the message cues. A start timecode that has already gone by reads `ON AIR`
+rather than counting down the best part of a day to it, which is also what the engine does
+with it.
 
 The engine holds **one** output open for the whole queue — a TX channel cannot be opened
 twice, so giving each message its own output would make back-to-back playout impossible.
@@ -309,7 +326,7 @@ The generator drives the SDI output itself through VideoMaster.
 
   The file's own embedded timecode is deliberately **not** part of this arithmetic. It is
   read and shown under the drop zone
-  (`length 00:03:00:00, has audio, media TC starts 00:01:00:00`) and travels in the record as
+  (`length 00:03:00:00, 2 audio tracks, media TC starts 00:01:00:00`) and travels in the record as
   `mediaStartTimecode`, but the marks do not follow it — otherwise the same SOM would mean a
   different frame on every clip, which is precisely the trap a clip ingested with its own
   start timecode sets.
@@ -340,6 +357,26 @@ no bearing on the other:
 | Video + several tracks | Video with **every language at once**, one per channel pair |
 
 At least one of the two is required; either alone is a valid message.
+
+### Where the languages come from
+
+**Selecting media loads its own languages.** A multi-language master already carries them, so
+choosing the file fills the Audio Tracks panel with one row per audio stream, in file order,
+each named from the stream's own `title` / `name` tag and falling back to its language code
+(`eng`, `ara`) and then to `Track 2`. Each row shows what it actually is underneath —
+`master.mov  -  stream 2 - aac 2ch [ara]` — because on a master every row names the same file
+and the stream is the only thing telling them apart. `und` is not treated as a language.
+
+Tracks in **separate files** still work exactly as before: **Add track…** or drop them on the
+panel, and they sit after the media's own. The two kinds mix freely.
+
+Choosing different media replaces the tracks that came from the old media and **leaves
+hand-added ones alone**. Names you type and trims you set survive a restart, matched back to
+their stream.
+
+Under the hood each language is one ffmpeg process reading `-map 0:a:N` — so eight languages
+in one master are eight readers of the same file at different streams, which is the same
+arrangement as eight separate bed files and behaves identically from here on.
 
 ### Multiple languages
 
@@ -662,7 +699,7 @@ src/Emerald.Media/
 src/Emerald.EDL/
   PlayoutService.cs         cue on timecode, loop the playlist, honour the duration
   EdlCommand.cs             the EDL record, rendered as JSON in the UI
-  AudioTrackRow.cs          one language row in the Audio Tracks panel
+  AudioTrackRow.cs          one language row - a bed file, or a stream of the media
   EdlWindow.xaml(.cs)       the EDL UI
 
 src/Emerald.Ingest/

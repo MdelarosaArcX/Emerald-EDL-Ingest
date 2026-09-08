@@ -20,8 +20,15 @@ public sealed record PlayoutStatus(
     long? FramesTotal = null,
     string? CurrentFile = null);
 
-/// <summary>One selectable audio track — a language — and the files behind it.</summary>
-public sealed record AudioTrack(string Label, IReadOnlyList<string> Files);
+/// <summary>
+/// One selectable audio track — a language — and the files behind it.
+///
+/// <paramref name="StreamIndex"/> is which audio stream of those files to take, counted among
+/// the audio streams alone. A message whose languages are separate .wav files leaves it at -1
+/// and gets each file's only track; a message whose languages are all embedded in one clip
+/// has several tracks over the same file list, distinguished by this.
+/// </summary>
+public sealed record AudioTrack(string Label, IReadOnlyList<string> Files, int StreamIndex = -1);
 
 public sealed record PlayoutRequest(
     uint BoardIndex,
@@ -589,12 +596,28 @@ public sealed class PlayoutService : IDisposable
     /// How many frames until the cue. A start timecode in the recent past cues immediately
     /// rather than waiting almost a full day for the clock to come round.
     /// </summary>
-    private long FramesUntilCue(PlayoutRequest request)
-    {
-        if (!_timecode.TryGetCurrent(out Timecode now)) return 0;
+    private long FramesUntilCue(PlayoutRequest request) =>
+        _timecode.TryGetCurrent(out Timecode now)
+            ? FramesUntil(request.Start, now, request.FrameRate)
+            : 0;
 
-        long perDay = 24L * 3600L * request.FrameRate;
-        long delta = ((request.Start.TotalFrames - now.TotalFrames) % perDay + perDay) % perDay;
+    /// <summary>
+    /// Frames from <paramref name="now"/> until <paramref name="target"/> on a clock that
+    /// wraps at midnight, and zero once the target is behind.
+    ///
+    /// "Behind" has to be a judgement, because a timecode that repeats every 24 hours cannot
+    /// tell a start five seconds late from one 23 hours 59 minutes early. Half a day is the
+    /// line: anything further ahead than that is read as having already gone.
+    ///
+    /// Public because the queue display counts down with it. The number on screen and the
+    /// number the engine waits out are then the same number, which is the whole point.
+    /// </summary>
+    public static long FramesUntil(Timecode target, Timecode now, int frameRate)
+    {
+        if (frameRate <= 0) return 0;
+
+        long perDay = 24L * 3600L * frameRate;
+        long delta = ((target.TotalFrames - now.TotalFrames) % perDay + perDay) % perDay;
 
         return delta > perDay / 2 ? 0 : delta;
     }
@@ -612,6 +635,7 @@ public sealed class PlayoutService : IDisposable
         private readonly string _ffmpegPath;
         private readonly IReadOnlyList<string> _files;
         private readonly int _frameRate;
+        private readonly int _streamIndex;
 
         private AudioSource _source;
         private int _index;
@@ -626,6 +650,7 @@ public sealed class PlayoutService : IDisposable
             _ffmpegPath = ffmpegPath;
             _files = track.Files;
             _frameRate = frameRate;
+            _streamIndex = track.StreamIndex;
             Label = track.Label;
 
             int samplesPerFrame = AudioSource.SampleRate / frameRate;
@@ -633,7 +658,7 @@ public sealed class PlayoutService : IDisposable
             Right = new short[samplesPerFrame];
 
             _source = _files.Count > 0
-                ? AudioSource.Open(ffmpegPath, _files[0], frameRate)
+                ? AudioSource.Open(ffmpegPath, _files[0], frameRate, _streamIndex)
                 : AudioSource.Silent(frameRate);
         }
 
@@ -651,7 +676,7 @@ public sealed class PlayoutService : IDisposable
             AudioSource spent = _source;
 
             _index = (_index + 1) % _files.Count;
-            _source = AudioSource.Open(_ffmpegPath, _files[_index], _frameRate);
+            _source = AudioSource.Open(_ffmpegPath, _files[_index], _frameRate, _streamIndex);
             _position = 0;
 
             // Disposal kills an ffmpeg process and joins the decoder thread, up to ~4 s.

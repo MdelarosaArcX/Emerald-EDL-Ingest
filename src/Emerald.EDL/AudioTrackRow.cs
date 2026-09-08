@@ -24,6 +24,21 @@ public sealed class AudioTrackRow : INotifyPropertyChanged
 
     public required MediaSelection Selection { get; init; }
 
+    /// <summary>
+    /// Which audio stream of <see cref="Selection"/> this track is, counted among the audio
+    /// streams alone - so 0 is the first language embedded in the clip, 1 the second.
+    ///
+    /// -1 means the file has one track and it is whichever ffmpeg picks, which is what a
+    /// standalone .wav bed wants. Anything else came out of the selected media itself.
+    /// </summary>
+    public int SourceStream { get; init; } = -1;
+
+    /// <summary>True when this track lives inside the message's own media rather than beside it.</summary>
+    public bool IsEmbedded => SourceStream >= 0;
+
+    /// <summary>What the stream is, technically - shown under the label so two can be told apart.</summary>
+    public string StreamDetail { get; init; } = "";
+
     private int _index;
 
     /// <summary>Position in the list, which is also the engine's track index.</summary>
@@ -81,10 +96,17 @@ public sealed class AudioTrackRow : INotifyPropertyChanged
 
     public string Source => Selection.Path;
 
-    public string Summary =>
-        Selection.Kind == "file"
-            ? Path.GetFileName(Selection.Path)
-            : $"{Selection.Files.Count} file(s)";
+    public string Summary
+    {
+        get
+        {
+            string source = Selection.Kind == "file"
+                ? Path.GetFileName(Selection.Path)
+                : $"{Selection.Files.Count} file(s)";
+
+            return StreamDetail.Length > 0 ? $"{source}  -  {StreamDetail}" : source;
+        }
+    }
 
     /// <summary>Full paths for playout; MediaSelection stores bare names against a folder.</summary>
     public IReadOnlyList<string> FullPaths =>

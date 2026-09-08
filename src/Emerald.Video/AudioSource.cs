@@ -71,7 +71,16 @@ public sealed class AudioSource : IDisposable
 
     public static AudioSource Silent(int frameRate) => new(null, SampleRate / frameRate);
 
-    public static AudioSource Open(string ffmpegPath, string mediaPath, int frameRate)
+    /// <summary>
+    /// Decodes one media file to stereo 48 kHz.
+    ///
+    /// <paramref name="streamIndex"/> picks which audio stream of the file to take, counted
+    /// among the audio streams only - stream 0 is the first, 1 the second, and so on. A file
+    /// carrying several languages is therefore several sources, one per language, all reading
+    /// the same file. Left at -1, ffmpeg picks the file's own preferred track, which is what
+    /// a standalone audio file wants.
+    /// </summary>
+    public static AudioSource Open(string ffmpegPath, string mediaPath, int frameRate, int streamIndex = -1)
     {
         // Every rate the app outputs divides 48000 exactly, so a frame is a whole number of
         // samples and audio cannot drift against picture.
@@ -89,6 +98,11 @@ public sealed class AudioSource : IDisposable
         info.ArgumentList.Add("-loglevel"); info.ArgumentList.Add("error");
         info.ArgumentList.Add("-nostdin");
         info.ArgumentList.Add("-i"); info.ArgumentList.Add(mediaPath);
+
+        // -map before -vn: naming the stream explicitly overrides ffmpeg's default choice,
+        // which is the loudest/most-channels track and not necessarily the one wanted.
+        if (streamIndex >= 0) { info.ArgumentList.Add("-map"); info.ArgumentList.Add($"0:a:{streamIndex}"); }
+
         info.ArgumentList.Add("-vn");
         info.ArgumentList.Add("-ar"); info.ArgumentList.Add(SampleRate.ToString());
         info.ArgumentList.Add("-ac"); info.ArgumentList.Add(Channels.ToString());

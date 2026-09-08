@@ -134,6 +134,13 @@ public sealed class EdlCommand
         [JsonPropertyName("offsetMs")] public int OffsetMs { get; set; }
 
         /// <summary>
+        /// Which audio stream of <see cref="Source"/> this language is, counted among the
+        /// audio streams alone. -1 means the source has one track and this is it — a separate
+        /// bed file. 0 and above name a language embedded in the message's own media.
+        /// </summary>
+        [JsonPropertyName("stream")] public int Stream { get; set; } = -1;
+
+        /// <summary>
         /// The SDI channel pair this language is embedded on, as "1-2". Every track listed is
         /// transmitted at once, so this — not a "default" — is what says where to find it.
         /// </summary>

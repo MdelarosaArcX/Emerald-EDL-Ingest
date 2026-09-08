@@ -11,6 +11,15 @@ public sealed class AudioTrackSetting
     [JsonPropertyName("source")] public string Source { get; set; } = "";
     [JsonPropertyName("offsetMs")] public int OffsetMs { get; set; }
     [JsonPropertyName("isDefault")] public bool IsDefault { get; set; }
+
+    /// <summary>
+    /// Which audio stream of the source this track is, among the audio streams alone. -1 is
+    /// "the file's own single track", which is what a separate .wav bed is; 0 and above name
+    /// a language embedded in the message's media.
+    /// </summary>
+    [JsonPropertyName("stream")] public int Stream { get; set; } = -1;
+
+    [JsonPropertyName("streamDetail")] public string StreamDetail { get; set; } = "";
 }
 
 /// <summary>User-visible configuration, persisted to %APPDATA%\Emerald\settings.json.</summary>

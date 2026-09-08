@@ -4,6 +4,7 @@ using Emerald.Video;
 using Emerald.Media;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -16,8 +17,57 @@ namespace Emerald.Edl;
 
 public sealed record LogEntry(string Time, string Message, Brush Brush);
 
-/// <summary>One row in the queue panel: everything already flattened for display.</summary>
-public sealed record QueueRow(string Headline, string Timing, string Media, Brush Accent);
+/// <summary>
+/// One row in the queue panel: everything already flattened for display.
+///
+/// The static half is set once when the row is built, on a queue change. The countdown is
+/// not: it is rewritten on the UI tick, which is why this notifies rather than being a record
+/// that would have to be replaced — replacing the whole collection 40 times a second to move
+/// one number would fight the operator for the scroll position.
+/// </summary>
+public sealed class QueueRow : INotifyPropertyChanged
+{
+    public required string Headline { get; init; }
+    public required string Timing { get; init; }
+    public required string Media { get; init; }
+    public required Brush Accent { get; init; }
+
+    /// <summary>What the countdown is worked out from, captured when the row is built.</summary>
+    public required EntryState State { get; init; }
+    public required Timecode Start { get; init; }
+    public required Timecode Stop { get; init; }
+    public required bool OpenEnded { get; init; }
+    public required int FrameRate { get; init; }
+
+    private string _countdown = "";
+    private string _caption = "";
+    private Brush _countdownBrush = Brushes.Transparent;
+
+    /// <summary>The clock itself, as "T- 00:00:12:05". Empty on a row with nothing to count to.</summary>
+    public string Countdown
+    {
+        get => _countdown;
+        set { if (_countdown == value) { return; } _countdown = value; Notify(); }
+    }
+
+    /// <summary>What it is counting to, under the clock — "to air", "on air until", "left".</summary>
+    public string CountdownCaption
+    {
+        get => _caption;
+        set { if (_caption == value) { return; } _caption = value; Notify(); }
+    }
+
+    public Brush CountdownBrush
+    {
+        get => _countdownBrush;
+        set { if (ReferenceEquals(_countdownBrush, value)) { return; } _countdownBrush = value; Notify(); }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void Notify([CallerMemberName] string? name = null) =>
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}
 
 public partial class EdlWindow : Window
 {
@@ -151,6 +201,8 @@ public partial class EdlWindow : Window
                 Source = t.Selection.Path,
                 OffsetMs = t.OffsetMs,
                 IsDefault = t.IsDefault,
+                Stream = t.SourceStream,
+                StreamDetail = t.StreamDetail,
             })
             .ToList();
         if (CaptureBoard is { } cb) _settings.CaptureBoardIndex = cb.Index;
@@ -314,6 +366,10 @@ public partial class EdlWindow : Window
     {
         TcDisplay.Text = _timecode.TryGetCurrent(out Timecode now) ? now.ToString() : "--:--:--:--";
 
+        // The queue's clocks move with this one; nothing in the queue itself changes while a
+        // message waits for its cue, so a queue event would never fire to move them.
+        TickQueueCountdowns();
+
         int rate = _timecode.FrameRate;
         if (rate > 0 && rate != _frameRate)
         {
@@ -461,6 +517,10 @@ public partial class EdlWindow : Window
             // not choose - and on media that starts at 01:00:00:00, an invalid one.
             if (announce) SeedMarksFromMedia();
         }
+
+        // The media's own languages become the audio tracks. Done for a cleared selection
+        // too, so the tracks that came from the old media go with it.
+        LoadEmbeddedAudioTracks(selection, announce);
 
         if (selection is null)
         {
@@ -723,6 +783,7 @@ public partial class EdlWindow : Window
                     FileCount = t.Selection.Files.Count,
                     Files = t.Selection.Files.ToList(),
                     OffsetMs = t.OffsetMs,
+                    Stream = t.SourceStream,
                     Channels = $"{t.Index * 2 + 1}-{t.Index * 2 + 2}",
                 }).ToList(),
         };
@@ -953,6 +1014,84 @@ public partial class EdlWindow : Window
         RenumberAudioTracks();
     }
 
+    /// <summary>
+    /// Fills the Audio Tracks panel from the languages inside the selected media.
+    ///
+    /// A multi-language master already carries its languages; making the operator go and add
+    /// each one by hand — as separate files that do not exist — was never going to work. So
+    /// selecting media loads every audio stream it has, in file order, named from the stream's
+    /// own title or language tag.
+    ///
+    /// Tracks added by hand are left exactly where they are. Only the ones that came from a
+    /// previous media selection are cleared, because they belong to media that is no longer
+    /// loaded. The media's own languages go first, since they are the message's real audio and
+    /// the list index is the SDI channel pair.
+    /// </summary>
+    private void LoadEmbeddedAudioTracks(MediaSelection? selection, bool announce)
+    {
+        int had = _audioTracks.Count;
+
+        for (int i = _audioTracks.Count - 1; i >= 0; i--)
+            if (_audioTracks[i].IsEmbedded) _audioTracks.RemoveAt(i);
+
+        int dropped = had - _audioTracks.Count;
+
+        if (selection is not { IsEmpty: false } || _mediaInfo is not { } info)
+        {
+            if (dropped > 0)
+            {
+                RenumberAudioTracks();
+                if (announce) Log($"Audio tracks: {dropped} from the previous media removed.", LogLevel.Info);
+            }
+
+            return;
+        }
+
+        if (info.Audio.Count == 0)
+        {
+            RenumberAudioTracks();
+
+            if (announce)
+                Log(info.HasAudio
+                    ? "Media carries audio, but ffprobe listed no streams - add tracks by hand if it plays silent."
+                    : "Media carries no audio. Add tracks by hand, or it goes to air silent.", LogLevel.Warn);
+
+            return;
+        }
+
+        // Room is counted against what is already there, so hand-added beds are never
+        // silently displaced by a master that happens to carry more languages than fit.
+        int room = PlayoutService.MaxAudioTracks - _audioTracks.Count;
+        int taking = Math.Min(info.Audio.Count, Math.Max(0, room));
+
+        for (int i = 0; i < taking; i++)
+        {
+            MediaAudioStream stream = info.Audio[i];
+
+            _audioTracks.Insert(i, new AudioTrackRow
+            {
+                Selection = selection,
+                SourceStream = stream.Index,
+                StreamDetail = stream.Detail,
+                Label = stream.Label,
+                IsDefault = i == 0,
+            });
+        }
+
+        RenumberAudioTracks();
+
+        if (!announce) return;
+
+        Log($"Audio tracks loaded from the media: {taking} of {info.Audio.Count}.", LogLevel.Info);
+
+        foreach (AudioTrackRow row in _audioTracks.Where(t => t.IsEmbedded))
+            Log($"    {row.ChannelLabel}  {row.Label}   ({row.StreamDetail})", LogLevel.Info);
+
+        if (taking < info.Audio.Count)
+            Log($"{info.Audio.Count - taking} further track(s) in the media were not loaded - " +
+                $"SDI carries {PlayoutService.MaxAudioTracks} stereo pairs and the list is full.", LogLevel.Warn);
+    }
+
     private void RemoveAudioTrack_Click(object sender, RoutedEventArgs e)
     {
         if (RowOf(sender) is not { } row) return;
@@ -1006,9 +1145,29 @@ public partial class EdlWindow : Window
 
     private AudioTrackRow? RowOf(object sender) => (sender as FrameworkElement)?.DataContext as AudioTrackRow;
 
-    /// <summary>Rebuilds a track from settings, silently skipping anything no longer on disk.</summary>
+    /// <summary>
+    /// Rebuilds a track from settings, silently skipping anything no longer on disk.
+    ///
+    /// A track that came out of the media is not rebuilt: reloading the media has already
+    /// produced it from the file as it is now, which is the more truthful version — the file
+    /// may have been re-mastered since. What is carried over is what the operator chose about
+    /// it, the name they typed and the trim they set, matched by source and stream.
+    /// </summary>
     private void RestoreAudioTrack(AudioTrackSetting saved)
     {
+        if (saved.Stream >= 0)
+        {
+            AudioTrackRow? live = _audioTracks.FirstOrDefault(
+                t => t.SourceStream == saved.Stream &&
+                     string.Equals(t.Selection.Path, saved.Source, StringComparison.OrdinalIgnoreCase));
+
+            if (live is null) return;
+
+            if (!string.IsNullOrWhiteSpace(saved.Label)) live.Label = saved.Label;
+            live.OffsetMs = saved.OffsetMs;
+            return;
+        }
+
         MediaSelection? selection = MediaScanner.ResolveAudio(saved.Source);
         if (selection is null || selection.IsEmpty) return;
 
@@ -1046,7 +1205,7 @@ public partial class EdlWindow : Window
                 : _media.Files.Select(name => Path.Combine(_media.Path, name)).ToList();
 
         List<AudioTrack> tracks = _audioTracks
-            .Select(t => new AudioTrack(t.Label, t.FullPaths))
+            .Select(t => new AudioTrack(t.Label, t.FullPaths, t.SourceStream))
             .ToList();
 
         // Each language's trim is pushed before the entry runs, so a bed starts at whatever
@@ -1244,13 +1403,92 @@ public partial class EdlWindow : Window
             ? $"  {new Timecode(e.FramesOut, e.Request.FrameRate)}"
             : e.Detail.Length > 0 ? $"  ({e.Detail})" : "";
 
-        return new QueueRow(
-            Headline: $"{label}  {e.Id}{progress}",
-            Timing: $"start {e.Request.Start}   dur {e.DurationLabel}   stop {e.StopLabel}   " +
-                    $"TX{e.Request.TxChannel}   {PlayoutService.Describe(e.Request.PostPlay)}",
-            Media: e.MediaLabel,
-            Accent: Brush(brush));
+        return new QueueRow
+        {
+            Headline = $"{label}  {e.Id}{progress}",
+            Timing = $"start {e.Request.Start}   dur {e.DurationLabel}   stop {e.StopLabel}   " +
+                     $"TX{e.Request.TxChannel}   {PlayoutService.Describe(e.Request.PostPlay)}",
+            Media = e.MediaLabel,
+            Accent = Brush(brush),
+            State = e.State,
+            Start = e.Request.Start,
+            Stop = e.Stop,
+            OpenEnded = e.Request.DurationFrames is null,
+            FrameRate = e.Request.FrameRate,
+        };
     }
+
+    /// <summary>
+    /// Moves every countdown in the queue on.
+    ///
+    /// Called from the UI tick rather than from a queue change, because nothing about the
+    /// queue changes while a message waits for its cue — the only thing moving is the clock.
+    /// Each row compares before it writes, so a tick that changes no digits costs nothing.
+    /// </summary>
+    private void TickQueueCountdowns()
+    {
+        if (_queueRows.Count == 0) return;
+
+        bool haveClock = _timecode.TryGetCurrent(out Timecode now);
+
+        foreach (QueueRow row in _queueRows)
+        {
+            if (!haveClock || row.FrameRate <= 0)
+            {
+                row.Countdown = "";
+                row.CountdownCaption = "";
+                continue;
+            }
+
+            switch (row.State)
+            {
+                // Waiting for its cue. This is the countdown the operator watches after
+                // pressing SEND EDL, and it runs on the station clock, not on wall time.
+                case EntryState.Queued:
+                case EntryState.Cued:
+                {
+                    long frames = PlayoutService.FramesUntil(row.Start, now, row.FrameRate);
+
+                    row.Countdown = frames == 0 ? "ON AIR" : $"T- {new Timecode(frames, row.FrameRate)}";
+                    row.CountdownCaption = frames == 0 ? "starting" : "to air";
+                    row.CountdownBrush = Urgency(frames, row.FrameRate);
+                    break;
+                }
+
+                // Already on air. The number that matters now is how much is left, which is
+                // the same sum against the stop timecode.
+                case EntryState.Playing when !row.OpenEnded:
+                {
+                    long frames = PlayoutService.FramesUntil(row.Stop, now, row.FrameRate);
+
+                    row.Countdown = $"T- {new Timecode(frames, row.FrameRate)}";
+                    row.CountdownCaption = "left";
+                    row.CountdownBrush = Urgency(frames, row.FrameRate);
+                    break;
+                }
+
+                case EntryState.Playing:
+                    row.Countdown = "ON AIR";
+                    row.CountdownCaption = "open-ended";
+                    row.CountdownBrush = Brush("Ok");
+                    break;
+
+                default:
+                    row.Countdown = "";
+                    row.CountdownCaption = "";
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// How alarming a countdown looks. Ten seconds is the point at which an operator stops
+    /// having time to fix anything, and one second is the point at which it is happening.
+    /// </summary>
+    private Brush Urgency(long frames, int rate) =>
+        frames <= rate ? Brush("Bad")
+        : frames <= rate * 10 ? Brush("Warn")
+        : Brush("Info");
 
     /// <summary>
     /// Logs which message is on air and which one follows, but only when that pair
