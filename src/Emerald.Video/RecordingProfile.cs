@@ -182,14 +182,24 @@ public sealed record RecordingProfile(
     public IEnumerable<string> EncoderArguments(CaptureFormat format, string pipeName,
                                                 string folder, string namePrefix, int inputSampleRate,
                                                 bool singleFile = false, string? startTimecode = null,
-                                                IReadOnlyList<CaptureAudioTrack>? extraAudio = null)
+                                                IReadOnlyList<CaptureAudioTrack>? extraAudio = null,
+                                                int embeddedPairs = 1)
     {
+        // The receiver's audio arrives on one pipe carrying every channel it had. One pair is
+        // the ordinary case and is left exactly as it always was, straight through as stereo.
+        // More than one has to be split, because a feed carrying four languages on four pairs
+        // must come back as four tracks rather than one eight-channel jumble no player will
+        // make sense of.
+        int pairs = Math.Clamp(embeddedPairs, 1, SdiAudioReader.MaxPairs);
+        int pipeChannels = pairs * 2;
+
         var args = new List<string>
         {
             "-hide_banner", "-loglevel", "error", "-nostdin",
             "-f", "rawvideo", "-pix_fmt", "uyvy422",
             "-s", $"{format.Width}x{format.Height}", "-r", format.FrameRate.ToString(), "-i", "pipe:0",
-            "-f", "s16le", "-ar", inputSampleRate.ToString(), "-ac", "2", "-i", $@"\\.\pipe\{pipeName}",
+            "-f", "s16le", "-ar", inputSampleRate.ToString(), "-ac", pipeChannels.ToString(),
+            "-i", $@"\\.\pipe\{pipeName}",
         };
 
         IReadOnlyList<CaptureAudioTrack> beds = extraAudio ?? Array.Empty<CaptureAudioTrack>();
@@ -201,10 +211,30 @@ public sealed record RecordingProfile(
             args.Add("-i"); args.Add(track.Path);
         }
 
+        if (pairs > 1)
+        {
+            args.Add("-filter_complex"); args.Add(PairSplitGraph(pairs, Outputs.Count));
+        }
+
+        int outputIndex = 0;
+
         foreach (RecordingOutput output in Outputs)
         {
             args.Add("-map"); args.Add("0:v:0");
-            args.Add("-map"); args.Add("1:a:0");
+
+            if (pairs == 1)
+            {
+                args.Add("-map"); args.Add("1:a:0");
+            }
+            else
+            {
+                // Each pair was split once per output, because a filter output can only be
+                // mapped a single time and both the master and the proxy want all of them.
+                for (int p = 0; p < pairs; p++)
+                {
+                    args.Add("-map"); args.Add($"[{PairLabel(p, outputIndex)}]");
+                }
+            }
 
             for (int i = 0; i < beds.Count; i++)
             {
@@ -245,19 +275,26 @@ public sealed record RecordingProfile(
             args.Add("-b:a"); args.Add($"{AudioBitrateKbps}k");
             if (AudioSampleRate != inputSampleRate) { args.Add("-ar"); args.Add(AudioSampleRate.ToString()); }
 
-            if (beds.Count > 0)
+            if (beds.Count > 0 || pairs > 1)
             {
                 // Named, so the tracks can be told apart in a player or an NLE rather than
                 // being "Audio 1, Audio 2, Audio 3" and left to guess.
-                args.Add("-metadata:s:a:0"); args.Add($"title={OriginalAudioLabel}");
-                args.Add("-disposition:a:0"); args.Add("default");
+                for (int p = 0; p < pairs; p++)
+                {
+                    args.Add($"-metadata:s:a:{p}");
+                    args.Add($"title={(pairs == 1 ? OriginalAudioLabel : $"{OriginalAudioLabel} {p + 1} (CH {p * 2 + 1}-{p * 2 + 2})")}");
+                    args.Add($"-disposition:a:{p}"); args.Add(p == 0 ? "default" : "0");
+                }
 
                 for (int i = 0; i < beds.Count; i++)
                 {
-                    args.Add($"-metadata:s:a:{i + 1}"); args.Add($"title={beds[i].Label}");
-                    args.Add($"-disposition:a:{i + 1}"); args.Add("0");
+                    args.Add($"-metadata:s:a:{pairs + i}"); args.Add($"title={beds[i].Label}");
+                    args.Add($"-disposition:a:{pairs + i}"); args.Add("0");
                 }
+            }
 
+            if (beds.Count > 0)
+            {
                 // The beds are looped, so they never end; the picture and the receiver's own
                 // audio do. That makes the picture what decides the length of the file.
                 args.Add("-shortest");
@@ -287,9 +324,38 @@ public sealed record RecordingProfile(
                 args.Add(Path.Combine(FolderFor(output, folder),
                                       $"{namePrefix}_%Y-%m-%d_%H-%M-%S.{output.Extension}"));
             }
+
+            outputIndex++;
         }
 
         return args;
+    }
+
+    /// <summary>The filter label carrying pair <paramref name="pair"/> for one output file.</summary>
+    private static string PairLabel(int pair, int output) => $"p{pair}o{output}";
+
+    /// <summary>
+    /// Splits the receiver's multi-channel pipe into one stereo stream per pair, duplicated
+    /// once for each output file.
+    ///
+    /// <c>pan</c> rather than <c>channelsplit</c> because pan names the source channels
+    /// explicitly and does not care what channel layout ffmpeg guessed for eight raw channels;
+    /// <c>asplit</c> because a filter output may be mapped only once, and both the ProRes
+    /// master and the H.264 proxy want every pair.
+    /// </summary>
+    private static string PairSplitGraph(int pairs, int outputs)
+    {
+        var chains = new List<string>();
+
+        for (int p = 0; p < pairs; p++)
+        {
+            var labels = new System.Text.StringBuilder();
+            for (int o = 0; o < outputs; o++) labels.Append($"[{PairLabel(p, o)}]");
+
+            chains.Add($"[1:a]pan=stereo|c0=c{p * 2}|c1=c{p * 2 + 1},asplit={outputs}{labels}");
+        }
+
+        return string.Join(";", chains);
     }
 
     /// <summary>

@@ -96,6 +96,23 @@ public sealed class PlayoutService : IDisposable
     private readonly int[] _trackOffsetsMs = new int[MaxAudioTracks];
 
     /// <summary>
+    /// Per-track gain, as a linear multiplier. 1 is the file as it is; stored as bits so it
+    /// can be written from the UI thread and read from the play loop without a lock.
+    /// </summary>
+    private readonly long[] _trackGains = new long[MaxAudioTracks];
+
+    /// <summary>Per-track mute. Solo is every other track muted, decided by the caller.</summary>
+    private readonly int[] _trackMuted = new int[MaxAudioTracks];
+
+    /// <summary>
+    /// The last frame's peak for each track, as dBFS, for the meters.
+    ///
+    /// Taken after gain and mute, so the bar shows what is actually going to air rather than
+    /// what is in the file — which is the whole point of watching it while trimming a level.
+    /// </summary>
+    private readonly long[] _trackPeaks = new long[MaxAudioTracks];
+
+    /// <summary>
     /// Per-track audio offset in milliseconds, live. Each language keeps its own delay, so
     /// switching between them preserves whatever each was trimmed to.
     /// </summary>
@@ -106,6 +123,66 @@ public sealed class PlayoutService : IDisposable
     {
         if (track >= 0 && track < MaxAudioTracks) Volatile.Write(ref _trackOffsetsMs[track], offsetMs);
     }
+
+    /// <summary>Loudest and quietest a track can be set to: +12 dB up, silence down.</summary>
+    public const double MaxGainDb = 12.0;
+    public const double MinGainDb = -40.0;
+
+    /// <summary>
+    /// A track's level, in decibels. 0 is the file untouched; below <see cref="MinGainDb"/>
+    /// is treated as silence, because there is no useful difference below that and a bar has
+    /// to bottom out somewhere.
+    ///
+    /// Applied to the samples on their way to the card, so it is what goes to air — unlike
+    /// the deck's monitor volume, which only changes what the operator hears.
+    /// </summary>
+    public double GetTrackGainDb(int track) =>
+        track >= 0 && track < MaxAudioTracks
+            ? BitConverter.Int64BitsToDouble(Interlocked.Read(ref _trackGains[track]))
+            : 0;
+
+    public void SetTrackGainDb(int track, double db)
+    {
+        if (track < 0 || track >= MaxAudioTracks) return;
+
+        Interlocked.Exchange(ref _trackGains[track],
+                             BitConverter.DoubleToInt64Bits(Math.Clamp(db, MinGainDb, MaxGainDb)));
+    }
+
+    public bool IsTrackMuted(int track) =>
+        track >= 0 && track < MaxAudioTracks && Volatile.Read(ref _trackMuted[track]) != 0;
+
+    /// <summary>
+    /// Mutes a track on air. Every track is still decoded and still advanced — a muted bed
+    /// that stopped reading would be at the wrong position the moment it came back — it is
+    /// simply embedded as silence.
+    /// </summary>
+    public void SetTrackMuted(int track, bool muted)
+    {
+        if (track >= 0 && track < MaxAudioTracks) Volatile.Write(ref _trackMuted[track], muted ? 1 : 0);
+    }
+
+    /// <summary>
+    /// Solos one track: it is unmuted and every other is muted. Passing -1 clears the solo and
+    /// unmutes everything, which is how an operator gets back to hearing the whole message.
+    /// </summary>
+    public void SoloTrack(int track, int trackCount)
+    {
+        for (int i = 0; i < MaxAudioTracks; i++)
+            SetTrackMuted(i, track >= 0 && i < trackCount && i != track);
+    }
+
+    /// <summary>
+    /// The last frame's peak for a track, in dBFS, or <see cref="SilenceDb"/> when there was
+    /// nothing. Read by the UI on its own timer; written by the play loop every frame.
+    /// </summary>
+    public double GetTrackPeakDb(int track) =>
+        track >= 0 && track < MaxAudioTracks
+            ? BitConverter.Int64BitsToDouble(Interlocked.Read(ref _trackPeaks[track]))
+            : SilenceDb;
+
+    /// <summary>The bottom of the meter scale, matching the deck's.</summary>
+    public const double SilenceDb = -60.0;
 
     private Thread? _worker;
     private CancellationTokenSource? _cts;
@@ -119,6 +196,11 @@ public sealed class PlayoutService : IDisposable
     {
         _timecode = timecode;
         _ffmpegPath = ffmpegPath;
+
+        // Zero bits read back as 0 dB, which for a gain is exactly right and for a peak would
+        // be a full meter before a frame has played.
+        for (int i = 0; i < MaxAudioTracks; i++)
+            _trackPeaks[i] = BitConverter.DoubleToInt64Bits(SilenceDb);
     }
 
     public IReadOnlyList<PlayoutEntry> Snapshot()
@@ -376,13 +458,61 @@ public sealed class PlayoutService : IDisposable
         {
             beds[i].Advance(GetTrackOffset(i));
 
+            // Level and mute are applied here, to the samples on their way to the card, and
+            // the meter is read after them - so the bar shows what is going to air rather
+            // than what is in the file. A muted track is still advanced, for the same reason
+            // an unsent one is: stalling its decoder would leave it at the wrong position.
+            double gainDb = GetTrackGainDb(i);
+            bool muted = IsTrackMuted(i);
+
+            double peak = muted ? SilenceDb : ApplyGain(beds[i], gainDb);
+            Interlocked.Exchange(ref _trackPeaks[i], BitConverter.DoubleToInt64Bits(peak));
+
             // A bed past the card's channel count still advances — leaving it stalled would
             // put it at the wrong position if the limit ever changed — it simply is not sent.
             if (i * 2 + 1 >= channels.Count) continue;
 
-            channels[i * 2] = beds[i].Left;
-            channels[i * 2 + 1] = beds[i].Right;
+            channels[i * 2] = muted ? beds[i].Silence : beds[i].Left;
+            channels[i * 2 + 1] = muted ? beds[i].Silence : beds[i].Right;
         }
+    }
+
+    /// <summary>
+    /// Scales one bed's frame in place and returns its peak in dBFS.
+    ///
+    /// In place because the buffers are the bed's own and are refilled every frame; a copy
+    /// per track per frame would be pure garbage at 25 frames a second. Clamped rather than
+    /// wrapped, so a track pushed past full scale distorts the way an overdriven desk does
+    /// instead of inverting into noise.
+    /// </summary>
+    private static double ApplyGain(AudioBed bed, double gainDb)
+    {
+        double scale = gainDb == 0 ? 1.0
+                     : gainDb <= MinGainDb ? 0.0
+                     : Math.Pow(10, gainDb / 20.0);
+
+        int peak = 0;
+
+        for (int half = 0; half < 2; half++)
+        {
+            short[] samples = half == 0 ? bed.Left : bed.Right;
+
+            for (int s = 0; s < samples.Length; s++)
+            {
+                int v = samples[s];
+
+                if (scale != 1.0)
+                {
+                    v = (int)Math.Clamp(v * scale, short.MinValue, short.MaxValue);
+                    samples[s] = (short)v;
+                }
+
+                int magnitude = v < 0 ? -v : v;
+                if (magnitude > peak) peak = magnitude;
+            }
+        }
+
+        return peak <= 0 ? SilenceDb : Math.Max(SilenceDb, 20.0 * Math.Log10(peak / 32768.0));
     }
 
     /// <summary>The channel buffer for one message: two entries per track, capped at the SDI limit.</summary>
@@ -645,6 +775,9 @@ public sealed class PlayoutService : IDisposable
         public short[] Left { get; }
         public short[] Right { get; }
 
+        /// <summary>A frame of silence, for a muted track. Never written to, so one is enough.</summary>
+        public short[] Silence { get; }
+
         public AudioBed(string ffmpegPath, AudioTrack track, int frameRate)
         {
             _ffmpegPath = ffmpegPath;
@@ -656,6 +789,7 @@ public sealed class PlayoutService : IDisposable
             int samplesPerFrame = AudioSource.SampleRate / frameRate;
             Left = new short[samplesPerFrame];
             Right = new short[samplesPerFrame];
+            Silence = new short[samplesPerFrame];
 
             _source = _files.Count > 0
                 ? AudioSource.Open(ffmpegPath, _files[0], frameRate, _streamIndex)

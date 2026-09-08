@@ -252,7 +252,7 @@
                                                    Foreground="{StaticResource Ok}" FontSize="12"/>
                                         <TextBlock x:Name="OriginalAudioHint" Style="{StaticResource Hint}"
                                                    Margin="0,1,0,0"
-                                                   Text="Always recorded, always first. Embedded SDI audio, group 1 channels 1-2."/>
+                                                   Text="Always recorded, always first. Every embedded stereo pair on the wire, one track each."/>
                                     </StackPanel>
                                 </Grid>
                             </Border>

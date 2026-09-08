@@ -47,6 +47,16 @@ public sealed class RxPreview : IDisposable
     /// </summary>
     public event Action<CaptureFormat?>? FormatChanged;
 
+    /// <summary>
+    /// Every slot's embedded audio, de-interleaved, raised on the preview thread - for the
+    /// deck's meters and its speaker monitor.
+    ///
+    /// Subscribed to before <see cref="Start"/>: the reader is built once per lock, so a
+    /// handler attached later is not picked up until the signal is re-detected. The buffers
+    /// are reused on the next slot and <b>a handler must not block</b>.
+    /// </summary>
+    public event Action<SdiAudioReader>? Audio;
+
     private WriteableBitmap? _bitmap;
     private int _bitmapWidth, _bitmapHeight;
 
@@ -167,10 +177,12 @@ public sealed class RxPreview : IDisposable
 
             int setupLock = 0;
 
-            // Video only: the preview has no use for ANC, and the lighter processing mode
-            // leaves the audio path entirely to the recorder.
+            // JOINED, so the slots carry ANC and the embedded audio can be read. The preview
+            // used to open video only, on the reasoning that audio was the recorder's business
+            // - which left the deck's meters with nothing to show unless a recording was
+            // running, and no way to hear what was arriving at all.
             rc = VideoMasterHD.VHD_OpenStreamHandle(brd, VideoMasterHD.RxStreamType(channel),
-                    VideoMasterHD.VHD_SDI_STPROC_DISJOINED_VIDEO, ref setupLock, ref strm, IntPtr.Zero);
+                    VideoMasterHD.VHD_SDI_STPROC_JOINED, ref setupLock, ref strm, IntPtr.Zero);
 
             if (rc != 0)
             {
@@ -262,6 +274,14 @@ public sealed class RxPreview : IDisposable
 
     private void Pump(IntPtr strm, CaptureFormat format, CancellationToken ct)
     {
+        // Built only when somebody is listening: allocating sixteen channel buffers and
+        // asking the card for ANC audio on every slot is work a deck with no meters up does
+        // not need to do.
+        Action<SdiAudioReader>? listener = Audio;
+        using SdiAudioReader? audio = listener is null
+            ? null
+            : new SdiAudioReader(SdiAudioReader.MaxChannels, format.FrameRate);
+
         int outW = UyvyPreview.OutputWidth(format.Width);
         int outH = UyvyPreview.OutputHeight(format.Height);
         // Two buffers, used alternately: the worker fills one while the UI thread is still
@@ -295,6 +315,17 @@ public sealed class RxPreview : IDisposable
             timeouts = 0;
             try
             {
+                // Audio first, and on every slot. Picture is decimated because nobody is
+                // measuring a thumbnail; sound cannot be - a meter fed one frame in four
+                // misses the transients, and a monitor fed one frame in four is a stutter.
+                if (audio is not null && listener is not null)
+                {
+                    audio.Read(slotHandle);
+
+                    try { listener.Invoke(audio); }
+                    catch { /* a meter that throws must not stop the monitor */ }
+                }
+
                 if (slot++ % convertEvery != 0) continue;
 
                 IntPtr buffer = IntPtr.Zero;

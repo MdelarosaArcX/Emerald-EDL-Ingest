@@ -78,6 +78,99 @@ public sealed class AudioTrackRow : INotifyPropertyChanged
     public bool CanDecrease => _offsetMs > -LimitMs;
     public bool CanIncrease => _offsetMs < LimitMs;
 
+    // ------------------------------------------------------------------ level
+
+    /// <summary>One press of + or -, in decibels. A dB at a time is how a desk trims.</summary>
+    public const double GainStepDb = 1.0;
+
+    private double _gainDb;
+    private bool _muted;
+    private double _meter;
+    private string _peakText = "-";
+
+    /// <summary>
+    /// This language's level, in decibels, applied on the way to the card. 0 is the file as
+    /// it is. Unlike the deck's monitor volume, this is what goes to air.
+    /// </summary>
+    public double GainDb
+    {
+        get => _gainDb;
+        set
+        {
+            _gainDb = Math.Clamp(value, PlayoutService.MinGainDb, PlayoutService.MaxGainDb);
+            Notify();
+            Notify(nameof(GainText));
+            Notify(nameof(CanTurnDown));
+            Notify(nameof(CanTurnUp));
+            Notify(nameof(IsBoosted));
+        }
+    }
+
+    public string GainText => _gainDb <= PlayoutService.MinGainDb ? "-inf" : $"{_gainDb:+0.#;-0.#;0} dB";
+
+    public bool CanTurnDown => _gainDb > PlayoutService.MinGainDb;
+    public bool CanTurnUp => _gainDb < PlayoutService.MaxGainDb;
+
+    /// <summary>Turned up past the file's own level, which is worth showing as a deliberate act.</summary>
+    public bool IsBoosted => _gainDb > 0;
+
+    /// <summary>
+    /// Muted on air. Solo works by muting every other track, so this is what both buttons
+    /// end up setting.
+    /// </summary>
+    public bool Muted
+    {
+        get => _muted;
+        set { _muted = value; Notify(); Notify(nameof(MuteText)); }
+    }
+
+    public string MuteText => _muted ? "MUTED" : "mute";
+
+    /// <summary>Bar length, 0 to 1, on a -60..0 dBFS scale — the deck's meters use the same one.</summary>
+    public double Meter
+    {
+        get => _meter;
+        private set { _meter = value; Notify(); }
+    }
+
+    /// <summary>The number beside the bar: peak in dBFS while playing, a dash otherwise.</summary>
+    public string PeakText
+    {
+        get => _peakText;
+        private set { _peakText = value; Notify(); }
+    }
+
+    private bool _hot, _clipping;
+
+    /// <summary>Past -10 dBFS. Amber, as on a desk.</summary>
+    public bool Hot { get => _hot; private set { _hot = value; Notify(); } }
+
+    /// <summary>At full scale, which after a boost is a real possibility. Red.</summary>
+    public bool Clipping { get => _clipping; private set { _clipping = value; Notify(); } }
+
+    /// <summary>
+    /// Takes this track's live peak off the engine. Called on the UI timer while a message is
+    /// on air; <paramref name="playing"/> false empties the bar rather than leaving it frozen
+    /// where the last frame left it.
+    /// </summary>
+    public void UpdateMeter(PlayoutService? playout, bool playing)
+    {
+        if (playout is null || !playing)
+        {
+            Meter = 0;
+            PeakText = "-";
+            Hot = Clipping = false;
+            return;
+        }
+
+        double db = playout.GetTrackPeakDb(Index);
+
+        Meter = Math.Clamp((db - PlayoutService.SilenceDb) / -PlayoutService.SilenceDb, 0, 1);
+        PeakText = db <= PlayoutService.SilenceDb ? "silent" : $"{db,5:0.0} dB";
+        Hot = db >= -10.0;
+        Clipping = db >= -0.5;
+    }
+
     /// <summary>The track that goes on air when the message starts.</summary>
     public bool IsDefault
     {

@@ -349,100 +349,166 @@
                         <!-- Audio tracks -->
                         <Border Style="{StaticResource IpCardBorder}" Margin="0,6,0,0">
                             <StackPanel>
-                                <StackPanel Orientation="Horizontal" Margin="0,0,0,7">
-                                    <Path Data="{StaticResource IconForward}" Fill="{StaticResource IpMuted}"
-                                          Stretch="Uniform" Width="9" Height="9" Margin="0,0,7,0"
-                                          VerticalAlignment="Center"/>
-                                    <TextBlock Text="Audio Tracks" Style="{StaticResource IpCardTitle}"/>
-                                </StackPanel>
+                                <Grid Margin="0,0,0,7">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Path Data="{StaticResource IconForward}" Fill="{StaticResource IpMuted}"
+                                              Stretch="Uniform" Width="9" Height="9" Margin="0,0,7,0"
+                                              VerticalAlignment="Center"/>
+                                        <TextBlock Text="Audio Tracks" Style="{StaticResource IpCardTitle}"/>
+                                    </StackPanel>
 
-                                <!-- Group 1, channels 1-2 is what the recorder muxes; the rest of
-                                     the pairs are listed so the layout matches the desk, and are
-                                     disabled rather than pretending to switch. -->
-                                <Grid x:Name="AudioTrackRows">
-                                    <Grid.RowDefinitions>
-                                        <RowDefinition Height="Auto"/>
-                                        <RowDefinition Height="Auto"/>
-                                        <RowDefinition Height="Auto"/>
-                                        <RowDefinition Height="Auto"/>
-                                    </Grid.RowDefinitions>
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                        <TextBlock x:Name="AudioPairsText" Text="" FontSize="9"
+                                                   Foreground="{StaticResource IpMuted}"
+                                                   VerticalAlignment="Center" Margin="0,0,7,0"/>
+                                        <ToggleButton x:Name="ListenButton" Content="LISTEN"
+                                                      Style="{StaticResource IpDeckTab}" Height="19"
+                                                      Padding="8,0" FontSize="9"
+                                                      Checked="Listen_Changed" Unchecked="Listen_Changed"
+                                                      ToolTip="Hear the selected pair on this PC. Monitoring only - it changes nothing that is recorded or transmitted."/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <!-- Monitor volume. Applied by the sound device, so what is
+                                     heard changes and what is recorded does not. -->
+                                <Grid x:Name="ListenVolumeRow" Margin="0,0,0,6" Visibility="Collapsed">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="82"/>
                                         <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-
-                                    <RadioButton Grid.Row="0" Grid.Column="0" Content="Stereo 1"
-                                                 Style="{StaticResource IpTrackRadio}" IsChecked="True"
-                                                 GroupName="AudioPair"
-                                                 ToolTip="Group 1, channels 1-2 - what the recorder muxes"/>
-                                    <StackPanel Grid.Row="0" Grid.Column="1">
-                                        <Grid Height="7" Margin="0,0,0,2">
-                                            <Border Background="#16202C" CornerRadius="2"/>
-                                            <Border Background="{StaticResource IpMeterFill}" CornerRadius="2"
-                                                    HorizontalAlignment="Left" Width="196"/>
-                                            <TextBlock Text="3 dB" FontSize="7" Foreground="#06120E"
-                                                       Margin="5,0,0,0" VerticalAlignment="Center"/>
-                                        </Grid>
-                                        <Grid Height="7">
-                                            <Border Background="#16202C" CornerRadius="2"/>
-                                            <Border Background="{StaticResource IpMeterFill}" CornerRadius="2"
-                                                    HorizontalAlignment="Left" Width="196"/>
-                                            <TextBlock Text="3 dB" FontSize="7" Foreground="#06120E"
-                                                       Margin="5,0,0,0" VerticalAlignment="Center"/>
-                                        </Grid>
-                                    </StackPanel>
-
-                                    <RadioButton Grid.Row="1" Grid.Column="0" Content="Stereo 2"
-                                                 Style="{StaticResource IpTrackRadio}" IsEnabled="False"
-                                                 GroupName="AudioPair" Margin="0,3,0,0"
-                                                 ToolTip="Emerald records group 1, channels 1-2"/>
-                                    <StackPanel Grid.Row="1" Grid.Column="1" Margin="0,3,0,0">
-                                        <Grid Height="7" Margin="0,0,0,2">
-                                            <Border Background="#16202C" CornerRadius="2"/>
-                                            <TextBlock Text="3 dB" FontSize="7" Foreground="#4A5765"
-                                                       Margin="5,0,0,0" VerticalAlignment="Center"/>
-                                        </Grid>
-                                        <Grid Height="7">
-                                            <Border Background="#16202C" CornerRadius="2"/>
-                                            <TextBlock Text="3 dB" FontSize="7" Foreground="#4A5765"
-                                                       Margin="5,0,0,0" VerticalAlignment="Center"/>
-                                        </Grid>
-                                    </StackPanel>
-
-                                    <RadioButton Grid.Row="2" Grid.Column="0" Content="Stereo 3"
-                                                 Style="{StaticResource IpTrackRadio}" IsEnabled="False"
-                                                 GroupName="AudioPair" Margin="0,3,0,0"
-                                                 ToolTip="Emerald records group 1, channels 1-2"/>
-                                    <StackPanel Grid.Row="2" Grid.Column="1" Margin="0,3,0,0">
-                                        <Grid Height="7" Margin="0,0,0,2">
-                                            <Border Background="#16202C" CornerRadius="2"/>
-                                            <TextBlock Text="3 dB" FontSize="7" Foreground="#4A5765"
-                                                       Margin="5,0,0,0" VerticalAlignment="Center"/>
-                                        </Grid>
-                                        <Grid Height="7">
-                                            <Border Background="#16202C" CornerRadius="2"/>
-                                            <TextBlock Text="3 dB" FontSize="7" Foreground="#4A5765"
-                                                       Margin="5,0,0,0" VerticalAlignment="Center"/>
-                                        </Grid>
-                                    </StackPanel>
-
-                                    <RadioButton Grid.Row="3" Grid.Column="0" Content="Stereo 4"
-                                                 Style="{StaticResource IpTrackRadio}" IsEnabled="False"
-                                                 GroupName="AudioPair" Margin="0,3,0,0"
-                                                 ToolTip="Emerald records group 1, channels 1-2"/>
-                                    <StackPanel Grid.Row="3" Grid.Column="1" Margin="0,3,0,0">
-                                        <Grid Height="7" Margin="0,0,0,2">
-                                            <Border Background="#16202C" CornerRadius="2"/>
-                                            <TextBlock Text="3 dB" FontSize="7" Foreground="#4A5765"
-                                                       Margin="5,0,0,0" VerticalAlignment="Center"/>
-                                        </Grid>
-                                        <Grid Height="7">
-                                            <Border Background="#16202C" CornerRadius="2"/>
-                                            <TextBlock Text="3 dB" FontSize="7" Foreground="#4A5765"
-                                                       Margin="5,0,0,0" VerticalAlignment="Center"/>
-                                        </Grid>
-                                    </StackPanel>
+                                    <TextBlock Grid.Column="0" Text="Monitor" FontSize="9.5"
+                                               Foreground="{StaticResource IpMuted}" VerticalAlignment="Center"/>
+                                    <Slider x:Name="ListenVolume" Grid.Column="1" Minimum="0" Maximum="1"
+                                            Value="0.7" VerticalAlignment="Center"
+                                            ValueChanged="ListenVolume_Changed"/>
+                                    <TextBlock x:Name="ListenVolumeText" Grid.Column="2" Text="70%"
+                                               FontSize="9" FontFamily="Consolas" Width="30"
+                                               Foreground="{StaticResource IpMuted}"
+                                               TextAlignment="Right" VerticalAlignment="Center"/>
                                 </Grid>
+
+                                <!-- One row per stereo pair on the wire, meters live. A pair the
+                                     feed is not carrying is dimmed and cannot be selected, which
+                                     is a different thing from one that is present and silent. -->
+                                <ItemsControl x:Name="AudioTrackRows">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Margin="0,0,0,3">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="82"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+
+                                                <!-- Selecting a pair is what sends it to the
+                                                     speakers. Absent pairs cannot be picked,
+                                                     rather than selecting silence. -->
+                                                <RadioButton Grid.Column="0" Content="{Binding Name}"
+                                                             Style="{StaticResource IpTrackRadio}"
+                                                             GroupName="AudioPair"
+                                                             IsChecked="{Binding Listening, Mode=TwoWay}"
+                                                             IsEnabled="{Binding Present}"
+                                                             Checked="AudioPair_Checked"
+                                                             ToolTip="{Binding ChannelLabel}"/>
+
+                                                <StackPanel Grid.Column="1">
+                                                    <ProgressBar x:Name="LeftMeter"
+                                                                 Style="{StaticResource IpMeter}"
+                                                                 Value="{Binding Left, Mode=OneWay}"
+                                                                 Margin="0,0,0,2"/>
+                                                    <ProgressBar x:Name="RightMeter"
+                                                                 Style="{StaticResource IpMeter}"
+                                                                 Value="{Binding Right, Mode=OneWay}"/>
+                                                </StackPanel>
+
+                                                <TextBlock x:Name="Readout" Grid.Column="2"
+                                                           Text="{Binding Readout}"
+                                                           FontFamily="Consolas" FontSize="8.5"
+                                                           Width="48" TextAlignment="Right"
+                                                           Margin="6,0,0,0" VerticalAlignment="Center"
+                                                           Foreground="{StaticResource IpMuted}"/>
+                                            </Grid>
+
+                                            <!-- Amber past -10 dBFS, red at full scale: the
+                                                 colours a desk meter uses, so a level that is
+                                                 about to be a problem reads as one at a glance. -->
+                                            <DataTemplate.Triggers>
+                                                <DataTrigger Binding="{Binding Hot}" Value="True">
+                                                    <Setter TargetName="LeftMeter" Property="Foreground"
+                                                            Value="{StaticResource IpMeterHot}"/>
+                                                    <Setter TargetName="RightMeter" Property="Foreground"
+                                                            Value="{StaticResource IpMeterHot}"/>
+                                                    <Setter TargetName="Readout" Property="Foreground"
+                                                            Value="{StaticResource IpMeterHot}"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Clipping}" Value="True">
+                                                    <Setter TargetName="LeftMeter" Property="Foreground"
+                                                            Value="{StaticResource IpMeterOver}"/>
+                                                    <Setter TargetName="RightMeter" Property="Foreground"
+                                                            Value="{StaticResource IpMeterOver}"/>
+                                                    <Setter TargetName="Readout" Property="Foreground"
+                                                            Value="{StaticResource IpMeterOver}"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Present}" Value="False">
+                                                    <Setter TargetName="LeftMeter" Property="Opacity" Value="0.35"/>
+                                                    <Setter TargetName="RightMeter" Property="Opacity" Value="0.35"/>
+                                                </DataTrigger>
+                                            </DataTemplate.Triggers>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+
+                                <Border Height="1" Background="{StaticResource IpLine}" Margin="0,8,0,7"/>
+
+                                <!-- Audio to record alongside the receiver's own: a language
+                                     bed, a commentary, a clean mix. They become further tracks
+                                     in the file, after every embedded pair. -->
+                                <Grid Margin="0,0,0,5">
+                                    <TextBlock Text="Added tracks" FontSize="9.5"
+                                               Foreground="{StaticResource IpMuted}" VerticalAlignment="Center"/>
+                                    <Button x:Name="AddCaptureAudioButton" Content="Add track..."
+                                            Style="{StaticResource IpDeckTab}" HorizontalAlignment="Right"
+                                            Height="19" Padding="8,0" FontSize="9"
+                                            Click="AddCaptureAudio_Click"
+                                            ToolTip="Record an audio file alongside the receiver's own sound"/>
+                                </Grid>
+
+                                <TextBlock x:Name="CaptureAudioEmpty" FontSize="9"
+                                           Foreground="{StaticResource IpDim}" TextWrapping="Wrap"
+                                           Text="None. What is on the wire is recorded on its own."/>
+
+                                <ItemsControl x:Name="CaptureAudioList">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Margin="0,0,0,3" ToolTip="{Binding Path}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="82"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+
+                                                <TextBlock Grid.Column="0" Text="{Binding TrackLabel}"
+                                                           FontSize="9.5" FontFamily="Consolas"
+                                                           Foreground="{StaticResource IpMuted}"
+                                                           VerticalAlignment="Center"/>
+
+                                                <TextBox Grid.Column="1"
+                                                         Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}"
+                                                         Style="{StaticResource IpMiniTextBox}"
+                                                         FontSize="9.5"
+                                                         ToolTip="What this track is called in the file"/>
+
+                                                <Button Grid.Column="2" Content="&#215;"
+                                                        Style="{StaticResource IpDeckTab}"
+                                                        Width="20" Height="19" Padding="0" FontSize="9"
+                                                        Margin="4,0,0,0"
+                                                        Click="RemoveCaptureAudio_Click"
+                                                        ToolTip="Remove this track"/>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
                             </StackPanel>
                         </Border>
 

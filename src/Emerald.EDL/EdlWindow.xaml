@@ -302,6 +302,74 @@
                                                                 Click="RemoveAudioTrack_Click" ToolTip="Remove this track"/>
                                                     </Grid>
 
+                                                    <!-- Level: the meter, the trim, and which
+                                                         language is being listened to on its own. -->
+                                                    <Grid Margin="63,4,0,0">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*" MinWidth="50"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                        </Grid.ColumnDefinitions>
+
+                                                        <ProgressBar x:Name="Meter" Grid.Column="0"
+                                                                     Style="{StaticResource EdlMeter}"
+                                                                     Value="{Binding Meter, Mode=OneWay}"
+                                                                     VerticalAlignment="Center"
+                                                                     ToolTip="Level going to air on this track"/>
+
+                                                        <TextBlock x:Name="Peak" Grid.Column="1"
+                                                                   Text="{Binding PeakText}"
+                                                                   FontFamily="Consolas" FontSize="9"
+                                                                   Width="46" TextAlignment="Right"
+                                                                   Margin="6,0,0,0" VerticalAlignment="Center"
+                                                                   Foreground="#6B7382"/>
+
+                                                        <Button Grid.Column="2" Content="&#8211;"
+                                                                Style="{StaticResource GhostButton}"
+                                                                Width="22" Height="20" FontSize="12" Padding="0"
+                                                                Margin="7,0,0,0"
+                                                                IsEnabled="{Binding CanTurnDown}"
+                                                                Click="AudioGainDown_Click"
+                                                                ToolTip="Turn this language down by 1 dB"/>
+
+                                                        <Border Grid.Column="3" Background="{StaticResource PanelDeep}"
+                                                                BorderBrush="{StaticResource Line}" BorderThickness="1"
+                                                                CornerRadius="4" Margin="3,0" Width="52" Height="20">
+                                                            <TextBlock x:Name="Gain" Text="{Binding GainText}"
+                                                                       FontFamily="Consolas" FontSize="10"
+                                                                       Foreground="{StaticResource Muted}"
+                                                                       HorizontalAlignment="Center"
+                                                                       VerticalAlignment="Center"/>
+                                                        </Border>
+
+                                                        <Button Grid.Column="4" Content="+"
+                                                                Style="{StaticResource GhostButton}"
+                                                                Width="22" Height="20" FontSize="12" Padding="0"
+                                                                IsEnabled="{Binding CanTurnUp}"
+                                                                Click="AudioGainUp_Click"
+                                                                ToolTip="Turn this language up by 1 dB"/>
+
+                                                        <Button Grid.Column="5" Content="0"
+                                                                Style="{StaticResource GhostButton}"
+                                                                Width="20" Height="20" FontSize="10" Padding="0"
+                                                                Margin="3,0,0,0"
+                                                                Click="AudioGainReset_Click"
+                                                                ToolTip="Back to the file's own level"/>
+
+                                                        <!-- Solo mutes every other track, so one
+                                                             language can be checked on its own. -->
+                                                        <Button x:Name="Solo" Grid.Column="6" Content="SOLO"
+                                                                Style="{StaticResource GhostButton}"
+                                                                Height="20" FontSize="9" Padding="7,0"
+                                                                Margin="5,0,0,0"
+                                                                Click="AudioSolo_Click"
+                                                                ToolTip="Hear this language alone - every other track is muted on air"/>
+                                                    </Grid>
+
                                                     <!-- Where this language actually comes from. On a
                                                          multi-language master every row names the same
                                                          file, so the stream is the only thing telling
@@ -311,6 +379,35 @@
                                                                TextTrimming="CharacterEllipsis"/>
                                                     </StackPanel>
                                                 </Border>
+
+                                            <DataTemplate.Triggers>
+                                                <DataTrigger Binding="{Binding Hot}" Value="True">
+                                                    <Setter TargetName="Meter" Property="Foreground"
+                                                            Value="{StaticResource Warn}"/>
+                                                    <Setter TargetName="Peak" Property="Foreground"
+                                                            Value="{StaticResource Warn}"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Clipping}" Value="True">
+                                                    <Setter TargetName="Meter" Property="Foreground"
+                                                            Value="{StaticResource Bad}"/>
+                                                    <Setter TargetName="Peak" Property="Foreground"
+                                                            Value="{StaticResource Bad}"/>
+                                                </DataTrigger>
+
+                                                <!-- A boosted track and a muted one both need to be
+                                                     obvious: either is a deliberate change to what
+                                                     is going to air, and neither is visible in the
+                                                     picture. -->
+                                                <DataTrigger Binding="{Binding IsBoosted}" Value="True">
+                                                    <Setter TargetName="Gain" Property="Foreground"
+                                                            Value="{StaticResource Tc}"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Muted}" Value="True">
+                                                    <Setter TargetName="Meter" Property="Opacity" Value="0.3"/>
+                                                    <Setter TargetName="Solo" Property="Foreground"
+                                                            Value="{StaticResource Warn}"/>
+                                                </DataTrigger>
+                                            </DataTemplate.Triggers>
                                             </DataTemplate>
                                         </ItemsControl.ItemTemplate>
                                     </ItemsControl>

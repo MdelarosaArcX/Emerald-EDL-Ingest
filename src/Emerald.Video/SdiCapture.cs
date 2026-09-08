@@ -85,6 +85,17 @@ public sealed class SdiCapture : IDisposable
     /// </summary>
     public event Action<CaptureFormat>? FormatDetected;
 
+    /// <summary>
+    /// Every slot's embedded audio, de-interleaved into channels, raised on the capture
+    /// thread — for meters and for the speaker monitor.
+    ///
+    /// The reader is handed over rather than a copy, because both of those want the channels
+    /// separately and this is the only point at which they exist that way. Its buffers are
+    /// reused on the next slot, so a handler reads what it needs and returns; like every other
+    /// event here, <b>it must not block</b>.
+    /// </summary>
+    public event Action<SdiAudioReader>? Audio;
+
     /// <summary>How many frames have been taken off the receiver so far, for a progress display.</summary>
     public long FramesRecorded => Interlocked.Read(ref _framesRecorded);
 
@@ -147,7 +158,7 @@ public sealed class SdiCapture : IDisposable
         IntPtr board = IntPtr.Zero, stream = IntPtr.Zero;
         Process? ffmpeg = null;
         NamedPipeServerStream? audioPipe = null;
-        IntPtr audioInfo = IntPtr.Zero, leftBuf = IntPtr.Zero, rightBuf = IntPtr.Zero;
+        SdiAudioReader? audio = null;
         RxLease? lease = null;
 
         // Reported to Finished once the encoder has closed its files.
@@ -232,26 +243,36 @@ public sealed class SdiCapture : IDisposable
                    $"segments to {folder} - {proxyWidth}x{proxyHeight} {RecordingProfile.LowRes.VideoLabel} proxy " +
                    $"and {RecordingProfile.HighRes.VideoLabel} master");
 
+            rc = VideoMasterHD.VHD_StartStream(stream);
+            if (rc != 0) { Fail($"Capture: StartStream failed (error {rc})."); return; }
+
+            audio = new SdiAudioReader(SdiAudioReader.MaxChannels, format.FrameRate);
+
+            // How many stereo pairs the feed is carrying has to be settled before the encoder
+            // starts, because the number of channels on the audio pipe is fixed for the life
+            // of the process. So the first slots are read for their audio alone, before a
+            // frame is recorded. A feed on channels 1-2 records exactly as it always did.
+            int pairs = request.AudioPairs ?? DetectPairs(stream, audio, ct);
+            pairs = Math.Clamp(pairs, 1, SdiAudioReader.MaxPairs);
+
+            Report(pairs == 1
+                ? "Capture: audio on channels 1-2."
+                : $"Capture: audio on {pairs} pairs (channels 1-{pairs * 2}), one track each.");
+
             string pipeName = $"edlcap_{Environment.ProcessId}_{Guid.NewGuid():N}";
             audioPipe = new NamedPipeServerStream(pipeName, PipeDirection.Out, 1,
                                                   PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
 
-            ffmpeg = StartEncoder(request, pipeName, format);
+            ffmpeg = StartEncoder(request, pipeName, format, pairs);
             _ffmpeg = ffmpeg;
             _audioPipe = audioPipe;
             Task connect = audioPipe.WaitForConnectionAsync(ct);
 
-            rc = VideoMasterHD.VHD_StartStream(stream);
-            if (rc != 0) { Fail($"Capture: StartStream failed (error {rc})."); return; }
-
-            audioInfo = Marshal.AllocHGlobal(AudioInfoBytes);
-            int audioCapacity = SampleRate / format.FrameRate * 2 * 4;   // generous headroom
-            leftBuf = Marshal.AllocHGlobal(audioCapacity);
-            rightBuf = Marshal.AllocHGlobal(audioCapacity);
+            int recordChannels = pairs * 2;
 
             var frame = new byte[format.FrameBytes];
-            int silenceBytes = SampleRate / format.FrameRate * 4;   // one frame, stereo, 16-bit
-            var interleaved = new byte[audioCapacity * 2];
+            int silenceBytes = SampleRate / format.FrameRate * recordChannels * 2;
+            var interleaved = new byte[silenceBytes * 4];
 
             // Preview tap. Two buffers used alternately, so the frame being handed to the UI
             // is never the one being written; converting every slot would cost a core for a
@@ -377,14 +398,26 @@ public sealed class SdiCapture : IDisposable
                     // when the encoder is ready — but a delay line needs the audio that came
                     // with frame zero, and the encoder attaches a few frames in.
                     Action<CapturedFrame>? tap = Frame;
+                    Action<SdiAudioReader>? listener = Audio;
                     byte[]? tapAudio = null;
                     int tapAudioBytes = 0;
                     bool audioReal = false;
 
-                    if (pipeReady || tap is not null)
+                    if (pipeReady || tap is not null || listener is not null)
                     {
-                        int bytes = ExtractAudio(slot, audioInfo, leftBuf, rightBuf, audioCapacity, interleaved);
+                        int samples = audio.Read(slot);
+                        int bytes = samples > 0 ? audio.Interleave(interleaved, recordChannels) : 0;
                         audioReal = bytes > 0;
+
+                        // Meters and the speaker monitor read the de-interleaved channels
+                        // directly, before anything is copied for the encoder — this is the
+                        // only place the audio exists as separate channels, and both of them
+                        // want it that way round.
+                        if (listener is not null)
+                        {
+                            try { listener.Invoke(audio); }
+                            catch { /* a meter that throws must not stop a recording */ }
+                        }
 
                         // A frame's worth of audio goes out even when the slot carried none —
                         // black during a cue has no embedded audio, and a muxer starved on one
@@ -469,9 +502,7 @@ public sealed class SdiCapture : IDisposable
 
             lease?.Dispose();
 
-            if (audioInfo != IntPtr.Zero) Marshal.FreeHGlobal(audioInfo);
-            if (leftBuf != IntPtr.Zero) Marshal.FreeHGlobal(leftBuf);
-            if (rightBuf != IntPtr.Zero) Marshal.FreeHGlobal(rightBuf);
+            audio?.Dispose();
 
             // Last, and only once the encoder has exited: by here the containers are closed,
             // so a caller may measure the files it was promised.
@@ -507,7 +538,7 @@ public sealed class SdiCapture : IDisposable
 
     private readonly List<string> _encoderErrors = new();
 
-    private Process StartEncoder(CaptureRequest request, string pipeName, CaptureFormat format)
+    private Process StartEncoder(CaptureRequest request, string pipeName, CaptureFormat format, int audioPairs)
     {
         var info = new ProcessStartInfo(request.FfmpegPath)
         {
@@ -521,7 +552,7 @@ public sealed class SdiCapture : IDisposable
         // the EDL records with whatever they were left on.
         foreach (string a in request.Profile.EncoderArguments(
                      format, pipeName, request.Folder, request.NamePrefix, SampleRate,
-                     request.SingleFile, request.StartTimecode, request.ExtraAudio))
+                     request.SingleFile, request.StartTimecode, request.ExtraAudio, audioPairs))
             info.ArgumentList.Add(a);
 
         Process ff = Process.Start(info) ?? throw new InvalidOperationException("Could not start ffmpeg for capture.");
@@ -537,49 +568,42 @@ public sealed class SdiCapture : IDisposable
         return ff;
     }
 
-    // VHD_AUDIOINFO layout, same hand-built offsets validated for the TX side.
-    private const int AudioInfoBytes = 1600;
-    private const int GroupChannelsOffset = 64;
-    private const int ChannelBytes = 80;
-    private const int ChannelMode = 0, ChannelFormat = 4, ChannelDataSize = 68, ChannelData = 72;
-
     /// <summary>
-    /// Pulls group 1 channels 1-2 out of the slot and interleaves them for ffmpeg.
-    /// DataSize is in/out: it goes in as the buffer size and comes back as bytes used.
+    /// Counts the stereo pairs on the wire, by reading the first slots for their audio alone.
+    ///
+    /// It has to be settled here because the encoder's channel count is fixed once ffmpeg
+    /// starts, and nothing else knows how many languages the feed is carrying. Two seconds of
+    /// looking is generous; a feed that has produced no audio by then is recorded as the
+    /// single pair it has always been, which is also the right answer for silence.
+    ///
+    /// The slots read here are discarded. At 25 fps that is well under a second of picture,
+    /// spent before the recording is considered to have started.
     /// </summary>
-    private static int ExtractAudio(IntPtr slot, IntPtr info, IntPtr left, IntPtr right, int capacity, byte[] interleaved)
+    private static int DetectPairs(IntPtr stream, SdiAudioReader reader, CancellationToken ct)
     {
-        for (int i = 0; i < AudioInfoBytes; i += 8) Marshal.WriteInt64(info, i, 0);
+        var looking = Stopwatch.StartNew();
+        int best = 0;
 
-        WriteChannel(info + GroupChannelsOffset, left, capacity);
-        WriteChannel(info + GroupChannelsOffset + ChannelBytes, right, capacity);
-
-        if (VideoMasterHD.VHD_SlotExtractAudio(slot, info) != 0) return 0;
-
-        int leftBytes = Marshal.ReadInt32(info, GroupChannelsOffset + ChannelDataSize);
-        int rightBytes = Marshal.ReadInt32(info, GroupChannelsOffset + ChannelBytes + ChannelDataSize);
-        int samples = Math.Min(leftBytes, rightBytes) / 2;
-
-        if (samples <= 0) return 0;
-
-        for (int s = 0; s < samples; s++)
+        while (looking.Elapsed < TimeSpan.FromSeconds(2) && !ct.IsCancellationRequested)
         {
-            short l = Marshal.ReadInt16(left, s * 2);
-            short r = Marshal.ReadInt16(right, s * 2);
-            int o = s * 4;
-            interleaved[o] = (byte)(l & 0xFF); interleaved[o + 1] = (byte)((l >> 8) & 0xFF);
-            interleaved[o + 2] = (byte)(r & 0xFF); interleaved[o + 3] = (byte)((r >> 8) & 0xFF);
+            IntPtr slot = IntPtr.Zero;
+            if (VideoMasterHD.VHD_LockSlotHandle(stream, ref slot) != 0) continue;
+
+            try
+            {
+                if (reader.Read(slot) > 0) best = Math.Max(best, reader.PairsPresent());
+            }
+            finally
+            {
+                VideoMasterHD.VHD_UnlockSlotHandle(slot);
+            }
+
+            // A pair can be momentarily quiet without being absent, so several slots are read
+            // rather than believing the first one that carries anything.
+            if (best > 0 && looking.Elapsed > TimeSpan.FromMilliseconds(300)) break;
         }
 
-        return samples * 4;
-    }
-
-    private static void WriteChannel(IntPtr channel, IntPtr data, int capacity)
-    {
-        Marshal.WriteInt32(channel, ChannelMode, (int)VideoMasterHD.VHD_AM_MONO);
-        Marshal.WriteInt32(channel, ChannelFormat, (int)VideoMasterHD.VHD_AF_16);
-        Marshal.WriteInt32(channel, ChannelDataSize, capacity);
-        Marshal.WriteIntPtr(channel, ChannelData, data);
+        return Math.Max(1, best);
     }
 
     private void Report(string text) => Message?.Invoke(text, false);

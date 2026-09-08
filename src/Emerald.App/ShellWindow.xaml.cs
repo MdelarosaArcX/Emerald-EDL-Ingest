@@ -71,6 +71,13 @@ public partial class ShellWindow : Window
     private readonly RxPreview _preview = new();
     private readonly SdiCapture _capture = new();
 
+    /// <summary>
+    /// The meters and the speaker monitor. Fed by whichever of the preview and the recorder
+    /// is holding the receiver, so the levels keep moving across the handover between them.
+    /// </summary>
+    private readonly AudioMonitor _audio = new();
+    private readonly ObservableCollection<AudioPairRow> _audioPairs = new();
+
     /// <summary>The application's one clock. This window joins it; it never owns it.</summary>
     private readonly TimecodeService _timecode = TimecodeLink.Service;
     private readonly ObservableCollection<ClipItem> _clips = new();
@@ -130,11 +137,15 @@ public partial class ShellWindow : Window
         _preview.Status += OnPreviewStatus;
         _preview.FrameReady += OnPreviewFrame;
         _preview.FormatChanged += OnPreviewFormat;
+        _preview.Audio += _audio.Push;
 
         _capture.Message += OnCaptureMessage;
         _capture.PreviewFrame += OnCapturePreviewFrame;
+        _capture.Audio += _audio.Push;
 
         ClipStrip.ItemsSource = _clips;
+        AudioTrackRows.ItemsSource = _audioPairs;
+        CaptureAudioList.ItemsSource = _captureAudio;
 
         FpsCombo.ItemsSource = new[]
         {
@@ -169,6 +180,7 @@ public partial class ShellWindow : Window
         LoadProfile();
         UpdateBreadcrumbs();
         UpdateRecordUi();
+        RenumberCaptureAudio();
 
         TimecodeLink.Connect(_settings);
         TimecodeLink.UrlChanged += OnTimecodeUrlChanged;
@@ -856,7 +868,8 @@ public partial class ShellWindow : Window
         _settings.CaptureFolder = folder;
 
         if (!RecordingSetup.TryBuild(_settings, board.Index, port.Index, folder, SelectedRate(),
-                                     RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem))
+                                     RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem,
+                                     extraAudio: CurrentCaptureAudio()))
         {
             SetStatus(problem!, true);
 
@@ -1067,9 +1080,204 @@ public partial class ShellWindow : Window
     /// <see cref="TimecodeService"/> free-wheels between server polls and slews the
     /// disagreement out, so this only has to ask it what the time is.
     /// </summary>
+    // ------------------------------------------------------------------ added audio tracks
+
+    /// <summary>
+    /// One audio file to record alongside the receiver. Notifies because the label is edited
+    /// in place and the track number moves when one above it is removed.
+    /// </summary>
+    private sealed class CaptureAudioRow : INotifyPropertyChanged
+    {
+        public required string Path { get; init; }
+
+        private string _label = "";
+
+        public string Label
+        {
+            get => _label;
+            set { _label = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Label))); }
+        }
+
+        private string _trackLabel = "";
+
+        /// <summary>Which track it will be in the file, which depends on how many pairs are on the wire.</summary>
+        public string TrackLabel
+        {
+            get => _trackLabel;
+            set { _trackLabel = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TrackLabel))); }
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+    }
+
+    private readonly ObservableCollection<CaptureAudioRow> _captureAudio = new();
+
+    /// <summary>As many as an ingest takes, for the same reason: the file has to stay sane.</summary>
+    private const int MaxCaptureAudioTracks = 8;
+
+    private void AddCaptureAudio_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "Select audio to record alongside the receiver",
+            Filter = "Audio files|*.wav;*.mp3;*.aac;*.m4a;*.flac;*.ogg;*.opus;*.ac3;*.eac3;*.mp2;*.aif;*.aiff" +
+                     "|Media files|*.mxf;*.mov;*.mp4;*.mkv;*.ts;*.avi|All files|*.*",
+            Multiselect = true,
+        };
+
+        if (dialog.ShowDialog(this) != true) return;
+
+        foreach (string path in dialog.FileNames)
+        {
+            if (_captureAudio.Count >= MaxCaptureAudioTracks)
+            {
+                SetStatus($"At most {MaxCaptureAudioTracks} added tracks; " +
+                          $"\"{Path.GetFileName(path)}\" was not added.", true);
+                break;
+            }
+
+            if (_captureAudio.Any(r => string.Equals(r.Path, path, StringComparison.OrdinalIgnoreCase))) continue;
+
+            _captureAudio.Add(new CaptureAudioRow
+            {
+                Path = path,
+                Label = Path.GetFileNameWithoutExtension(path),
+            });
+        }
+
+        RenumberCaptureAudio();
+    }
+
+    private void RemoveCaptureAudio_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not CaptureAudioRow row) return;
+
+        _captureAudio.Remove(row);
+        RenumberCaptureAudio();
+    }
+
+    private void RenumberCaptureAudio()
+    {
+        // Numbered after the embedded pairs, because that is where they land in the file. The
+        // pair count comes off the wire, so this is restamped as the feed changes too.
+        int pairs = Math.Max(1, Math.Min(_audio.PairsPresent, SdiAudioReader.MaxPairs));
+
+        for (int i = 0; i < _captureAudio.Count; i++)
+            _captureAudio[i].TrackLabel = $"Track {pairs + i + 1}";
+
+        CaptureAudioEmpty.Visibility = _captureAudio.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        AddCaptureAudioButton.IsEnabled = _captureAudio.Count < MaxCaptureAudioTracks;
+    }
+
+    /// <summary>The added tracks as the recorder wants them, in list order.</summary>
+    private IReadOnlyList<CaptureAudioTrack> CurrentCaptureAudio() =>
+        _captureAudio
+            .Select(r => new CaptureAudioTrack(
+                        string.IsNullOrWhiteSpace(r.Label) ? Path.GetFileName(r.Path) : r.Label.Trim(),
+                        r.Path))
+            .ToList();
+
+    // ------------------------------------------------------------------ audio meters
+
+    /// <summary>
+    /// Redraws the level meters. On the 25 ms clock rather than the half-second tick, because
+    /// a meter that updates twice a second is not a meter — it has to move with the sound for
+    /// an operator to read a level off it at all.
+    /// </summary>
+    private void DrawAudioMeters()
+    {
+        _audio.Tick(_clock.Interval);
+
+        // Rows follow what is on the wire. A feed with one pair shows one row rather than
+        // three dead ones, and a four-language message grows the panel when it starts.
+        int pairs = Math.Max(1, Math.Min(_audio.PairsPresent, SdiAudioReader.MaxPairs));
+
+        if (_audioPairs.Count != pairs)
+        {
+            while (_audioPairs.Count < pairs) _audioPairs.Add(new AudioPairRow { Pair = _audioPairs.Count });
+            while (_audioPairs.Count > pairs) _audioPairs.RemoveAt(_audioPairs.Count - 1);
+
+            // Added tracks are numbered after the embedded pairs, so they move when the feed
+            // starts or stops carrying a language.
+            RenumberCaptureAudio();
+        }
+
+        foreach (AudioPairRow row in _audioPairs) row.Update(_audio);
+
+        AudioPairsText.Text = _audio.PairsPresent switch
+        {
+            0 => "no audio",
+            1 => "1 pair",
+            var n => $"{n} pairs",
+        };
+    }
+
+    /// <summary>Selecting a pair is what routes it to the speakers, if listening is on.</summary>
+    private void AudioPair_Checked(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not AudioPairRow row) return;
+
+        foreach (AudioPairRow other in _audioPairs) other.Listening = ReferenceEquals(other, row);
+
+        if (ListenButton.IsChecked == true) StartListening(row.Pair);
+    }
+
+    private void Listen_Changed(object sender, RoutedEventArgs e)
+    {
+        bool on = ListenButton.IsChecked == true;
+
+        ListenVolumeRow.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+
+        if (!on)
+        {
+            _audio.Mute(true);
+            return;
+        }
+
+        AudioPairRow? chosen = _audioPairs.FirstOrDefault(r => r.Listening)
+                            ?? _audioPairs.FirstOrDefault(r => r.Present)
+                            ?? _audioPairs.FirstOrDefault();
+
+        if (chosen is null) { ListenButton.IsChecked = false; return; }
+
+        chosen.Listening = true;
+        StartListening(chosen.Pair);
+    }
+
+    private void StartListening(int pair)
+    {
+        int rate = SelectedRate();
+
+        _audio.Mute(false);
+        _audio.Volume = ListenVolume.Value;
+        _audio.Listen(pair, rate);
+
+        if (_audio.CanListen)
+        {
+            SetStatus($"Monitoring CH {pair * 2 + 1}-{pair * 2 + 2} on this PC - it changes " +
+                      "nothing that is recorded or transmitted.", false);
+            return;
+        }
+
+        // No sound device is a fact worth saying out loud rather than a silent button that
+        // appears to have worked.
+        SetStatus($"Cannot listen: {_audio.ListenProblem ?? "no sound device"}.", true);
+        ListenButton.IsChecked = false;
+    }
+
+    private void ListenVolume_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (ListenVolumeText is null) return;
+
+        ListenVolumeText.Text = $"{e.NewValue * 100:0}%";
+        _audio.Volume = e.NewValue;
+    }
+
     private void OnClockTick(object? sender, EventArgs e)
     {
         ClockText.Text = _timecode.TryGetCurrent(out Timecode now) ? now.ToString() : "--:--:--:--";
+
+        DrawAudioMeters();
 
         if (_playing)
         {
@@ -1255,6 +1463,7 @@ public partial class ShellWindow : Window
 
         _capture.Stop();
         _preview.Dispose();
+        _audio.Dispose();
 
         // The clock is the application's, not this window's. Only the subscription is ours.
         TimecodeLink.UrlChanged -= OnTimecodeUrlChanged;

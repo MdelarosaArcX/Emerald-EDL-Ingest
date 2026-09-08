@@ -203,6 +203,7 @@ public partial class EdlWindow : Window
                 IsDefault = t.IsDefault,
                 Stream = t.SourceStream,
                 StreamDetail = t.StreamDetail,
+                GainDb = t.GainDb,
             })
             .ToList();
         if (CaptureBoard is { } cb) _settings.CaptureBoardIndex = cb.Index;
@@ -366,9 +367,11 @@ public partial class EdlWindow : Window
     {
         TcDisplay.Text = _timecode.TryGetCurrent(out Timecode now) ? now.ToString() : "--:--:--:--";
 
-        // The queue's clocks move with this one; nothing in the queue itself changes while a
-        // message waits for its cue, so a queue event would never fire to move them.
+        // The queue and the meters both move with this one, and neither has an event that
+        // would fire to move them: nothing in the queue changes while a message waits for its
+        // cue, and levels change every frame.
         TickQueueCountdowns();
+        TickAudioMeters();
 
         int rate = _timecode.FrameRate;
         if (rate > 0 && rate != _frameRate)
@@ -1101,6 +1104,76 @@ public partial class EdlWindow : Window
         RenumberAudioTracks();
     }
 
+    // ------------------------------------------------------------------ level, mute, solo
+
+    private void AudioGainUp_Click(object sender, RoutedEventArgs e) =>
+        NudgeGain(sender, +AudioTrackRow.GainStepDb);
+
+    private void AudioGainDown_Click(object sender, RoutedEventArgs e) =>
+        NudgeGain(sender, -AudioTrackRow.GainStepDb);
+
+    private void AudioGainReset_Click(object sender, RoutedEventArgs e)
+    {
+        if (RowOf(sender) is not { } row) return;
+
+        row.GainDb = 0;
+        PushTrackGain(row);
+    }
+
+    private void NudgeGain(object sender, double deltaDb)
+    {
+        if (RowOf(sender) is not { } row) return;
+
+        row.GainDb += deltaDb;
+        PushTrackGain(row);
+    }
+
+    /// <summary>Straight at the engine, so a trim lands on the next frame whether on air or not.</summary>
+    private void PushTrackGain(AudioTrackRow row)
+    {
+        _playout?.SetTrackGainDb(row.Index, row.GainDb);
+        Log($"{row.Label}: level {row.GainText}", LogLevel.Info);
+    }
+
+    /// <summary>
+    /// Solo, which is mute-everything-else.
+    ///
+    /// Pressing it on the track already soloed clears the solo and brings every language back,
+    /// so one button gets an operator both into and out of listening to one at a time. It is a
+    /// change to what goes to air, not to what this PC hears - which is why it is logged.
+    /// </summary>
+    private void AudioSolo_Click(object sender, RoutedEventArgs e)
+    {
+        if (RowOf(sender) is not { } row) return;
+
+        bool alreadySoloed = !row.Muted && _audioTracks.Where(t => t != row).All(t => t.Muted)
+                                        && _audioTracks.Count > 1;
+
+        int solo = alreadySoloed ? -1 : row.Index;
+
+        _playout?.SoloTrack(solo, _audioTracks.Count);
+
+        foreach (AudioTrackRow track in _audioTracks)
+            track.Muted = solo >= 0 && track.Index != solo;
+
+        Log(solo < 0
+            ? "Solo cleared - every language is on air again."
+            : $"Solo: {row.Label} on air, every other language muted.", LogLevel.Warn);
+    }
+
+    /// <summary>
+    /// Moves every track's meter. On the 25 ms tick, because a meter that updates less often
+    /// than that is not something a level can be read off.
+    /// </summary>
+    private void TickAudioMeters()
+    {
+        if (_audioTracks.Count == 0) return;
+
+        bool playing = _playout?.Current is { State: EntryState.Playing };
+
+        foreach (AudioTrackRow row in _audioTracks) row.UpdateMeter(_playout, playing);
+    }
+
     private void AudioTrackMinus_Click(object sender, RoutedEventArgs e) => NudgeTrack(sender, -AudioTrackRow.StepMs);
     private void AudioTrackPlus_Click(object sender, RoutedEventArgs e) => NudgeTrack(sender, +AudioTrackRow.StepMs);
 
@@ -1135,6 +1208,8 @@ public partial class EdlWindow : Window
         {
             _audioTracks[i].Index = i;
             _playout?.SetTrackOffset(i, _audioTracks[i].OffsetMs);
+            _playout?.SetTrackGainDb(i, _audioTracks[i].GainDb);
+            _playout?.SetTrackMuted(i, _audioTracks[i].Muted);
         }
 
         AudioEmptyText.Visibility = _audioTracks.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -1165,6 +1240,7 @@ public partial class EdlWindow : Window
 
             if (!string.IsNullOrWhiteSpace(saved.Label)) live.Label = saved.Label;
             live.OffsetMs = saved.OffsetMs;
+            live.GainDb = saved.GainDb;
             return;
         }
 
@@ -1177,6 +1253,7 @@ public partial class EdlWindow : Window
             Label = saved.Label,
             OffsetMs = saved.OffsetMs,
             IsDefault = saved.IsDefault,
+            GainDb = saved.GainDb,
         });
     }
 

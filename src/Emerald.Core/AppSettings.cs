@@ -20,6 +20,9 @@ public sealed class AudioTrackSetting
     [JsonPropertyName("stream")] public int Stream { get; set; } = -1;
 
     [JsonPropertyName("streamDetail")] public string StreamDetail { get; set; } = "";
+
+    /// <summary>This language's trim in decibels, applied on the way to the card.</summary>
+    [JsonPropertyName("gainDb")] public double GainDb { get; set; }
 }
 
 /// <summary>User-visible configuration, persisted to %APPDATA%\Emerald\settings.json.</summary>

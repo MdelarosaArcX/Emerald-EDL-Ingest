@@ -215,6 +215,44 @@ Two separate processes could not negotiate this, which is why the modules are wi
 than executables of their own — and why launching Emerald twice opens a second window in the
 first process instead of a second copy of the application.
 
+## Audio meters and the monitor
+
+The deck's **Audio Tracks** panel shows the level of every stereo pair arriving on the
+receiver. One row per pair actually on the wire — a feed carrying one pair shows one row, and
+a four-language message grows the panel when it starts. A pair the feed is not carrying is
+dimmed and cannot be selected, which is a different thing from one that is present and silent.
+
+The bars are drawn on a **-60 to 0 dBFS** scale, not on raw amplitude: a linear bar spends all
+its travel in the last few dB and reads as either full or empty. They jump to a rise instantly
+and fall back gradually, the way a desk meter does — a bar that fell as fast as it rose would
+be a flicker, and one that rose as slowly as it falls would miss the transient entirely. Amber
+past -10 dBFS, red at full scale.
+
+The levels come from **whichever of the preview and the recorder is holding the receiver**, so
+they keep moving across the handover when a recording starts. That is why the confidence
+preview now opens the receiver `JOINED` rather than video-only: without ANC there is no
+embedded audio to read, and the meters had nothing to show unless a recording was running.
+
+**LISTEN** sends the selected pair to this PC's speakers, with its own volume. It is a
+confidence monitor and nothing more — it is not in the path to air, it is not what gets
+recorded, and its volume changes neither. The receiver and the sound card run off different
+clocks and drift apart over a long session, which is handled by dropping a frame when the
+queue runs long rather than letting the delay grow without bound. A machine with no sound
+device says so in the status line rather than leaving a button that appears to have worked.
+
+### Levels on the EDL's audio tracks
+
+Each language row in the EDL carries the same meter, showing what that track is **actually
+sending to air** — read after gain and mute, which is the whole point of watching it while
+trimming a level.
+
+| Control | What it does |
+|---|---|
+| **− / + / 0** | This language's level, a decibel at a time, from -40 dB to +12 dB. Applied to the samples on their way to the card, so it **changes what is transmitted** — unlike the deck's monitor volume. Clamped rather than wrapped, so a boosted track distorts like an overdriven desk instead of inverting into noise. |
+| **SOLO** | Mutes every other language on air, so one can be checked on its own. Pressing it again on the same track clears the solo and brings them all back. A muted track is still decoded and still advanced — stalling it would leave it at the wrong position the moment it came back — it is simply embedded as silence. |
+
+Solo is a change to what goes out, not to what this PC hears, which is why it is logged.
+
 ## The capture store
 
 `Emerald.Media/MediaLibrary.cs` owns where recordings live — `media\` beside the solution by
@@ -239,7 +277,7 @@ audio tracks carry across from the pre-Emerald app.
 | **EOM** (out-point, from the head) | Where to stop, on the same elapsed scale, so `EOM − SOM` is the duration. A 3-minute clip with SOM `00:01:00:00` and EOM `00:03:00:00` plays its last two minutes. Choosing a file **seeds SOM to `00:00:00:00` and EOM to the clip's length**, so it plays whole until you trim it. **Set EOM equal to SOM** for no fixed duration: the media loops until stopped. |
 | **Duration** | **Editable**, and tied to EOM both ways: type a duration and EOM follows (`SOM + duration`); type an EOM and the duration follows (`EOM − SOM`). There is no mode to choose — whichever you last typed into is the one you are driving, and the calculated one is tinted. Moving **SOM** then leaves the field you set alone and re-derives the other. |
 | **Stop Time** | **Read-only** — start timecode + duration, wrapped at 24 h. Start `20:57:26:00` with a two-minute duration stops at `20:59:26:00`, whatever SOM is. |
-| **Audio Tracks** | **Selecting media loads every language embedded in it**, one row per audio stream, named from the stream's own title or language tag. Beds in separate files can be added alongside with **Add track...** or by dropping them. **All of them are transmitted at once**, each on its own SDI channel pair — track 1 on CH 1-2, track 2 on CH 3-4, up to 8 tracks (16 channels). The pair is shown on each row. Each has its own **+ / −** trim at **10 ms per tick** (±500 ms) and a **0** reset, independent per language and adjustable while on air. |
+| **Audio Tracks** | **Selecting media loads every language embedded in it**, one row per audio stream, named from the stream's own title or language tag. Beds in separate files can be added alongside with **Add track...** or by dropping them. **All of them are transmitted at once**, each on its own SDI channel pair — track 1 on CH 1-2, track 2 on CH 3-4, up to 8 tracks (16 channels). The pair is shown on each row. Each has its own **+ / −** trim at **10 ms per tick** (±500 ms) with a **0** reset, a **level** in decibels, a live **meter**, and **SOLO** to mute every other language — all independent per language and adjustable while on air. |
 | **Media Source** | **Optional.** Drop a folder or file onto the panel, or browse. Folders are scanned one level deep for playable containers (`.mxf .mov .mp4 .avi .mkv .ts .m2t .mpg .dv .gxf .lxf .webm .yuv .wav` …) and sent as an ordered playlist. |
 | **Post Play** | What the TX carries once the message ends and until the next one cues: **Black Screen** or **Freeze on last frame**. |
 | **Recording folder** | Where RX recordings are written, in 2-minute segments, while a message is on air. Leave empty to record nothing. Validated as you type, with free space shown. |
@@ -561,8 +599,8 @@ in the recorded file, in list order, after the original:
 
 | Track | What it is |
 |---|---|
-| 1 | `Original` — embedded SDI audio off the receiver. Marked as the default track. |
-| 2… | The files you added, in the order shown, under whatever name you type next to each. |
+| 1… | `Original` — the embedded audio off the receiver, **one track per stereo pair on the wire**. A single-pair feed is one track named `Original`; a four-language feed is four, named for the channels each came off. The first is the default track. |
+| then | The files you added, in the order shown, under whatever name you type next to each. |
 
 A track shorter than the ingest repeats to fill it, and the recording still ends on the
 duration rather than on the audio — so a thirty-second bed under a fifteen-minute ingest is
@@ -756,6 +794,39 @@ measurably present (`mean_volume −24.1 dB`, against −91 dB for silence).
 **dCARE must be closed.** An RX channel can only be opened by one process, so if dCARE is
 watching that input the app cannot record it — you get a clear message in the log rather
 than a silent failure.
+
+### Every language on the wire is recorded
+
+SDI carries four groups of four channels — sixteen channels, eight stereo pairs — and the EDL
+puts a language on each. Recording took **channels 1-2 only**, so a return feed of a
+four-language message came back with three of them missing.
+
+It now records **one track per stereo pair**, in wire order, named for the channels it came
+off:
+
+```
+index=1  audio  DISPOSITION:default=1  TAG:name=Original 1 (CH 1-2)
+index=2  audio  DISPOSITION:default=0  TAG:name=Original 2 (CH 3-4)
+index=3  audio  DISPOSITION:default=0  TAG:name=Original 3 (CH 5-6)
+```
+
+How many pairs is worked out from the wire, by reading the first slots for their audio before
+a frame is recorded — the encoder's channel count is fixed once ffmpeg starts, so it has to be
+settled first. A feed on channels 1-2 is encoded **exactly as it always was**: straight through
+as stereo, no filter graph, no renaming. Anything more is split with `pan`, one stereo stream
+per pair, duplicated for the master and the proxy.
+
+Asking a card for groups it does not have could be refused outright rather than answered with
+what it does have, so a refusal steps the request down a group at a time and remembers what
+worked. Losing the audio on 1-2 because nothing was on 13-16 would be far worse than not
+seeing the extra pairs.
+
+### Adding audio to a recording
+
+The **Added tracks** list under the meters records audio files alongside the receiver's own
+sound — a language bed, a commentary, a clean mix. Each becomes a further track in the file,
+after every embedded pair, and a track shorter than the recording repeats to fill it. The same
+arrangement the Ingest Controller uses.
 
 Three things about the implementation are worth recording, because each one cost real time
 and would be easy to reintroduce:

@@ -35,7 +35,16 @@ public sealed record CaptureRequest(
     long? FrameLimit = null,
     bool SingleFile = false,
     string? StartTimecode = null,
-    IReadOnlyList<CaptureAudioTrack>? ExtraAudio = null)
+    IReadOnlyList<CaptureAudioTrack>? ExtraAudio = null,
+
+    /// <summary>
+    /// How many embedded stereo pairs to record, or null to take whatever is on the wire.
+    ///
+    /// Auto is right almost always: a feed carrying four languages should come back as four
+    /// tracks without anyone having to say so. Pinning it is for a feed whose pairs come and
+    /// go, where the track layout has to be the same in every segment.
+    /// </summary>
+    int? AudioPairs = null)
 {
     /// <summary>The files this request will write, proxy first — the order ffmpeg is given them in.</summary>
     public IReadOnlyList<string> OutputPaths => SingleFile
@@ -68,7 +77,8 @@ public static class RecordingSetup
         long? frameLimit = null,
         bool singleFile = false,
         string? startTimecode = null,
-        IReadOnlyList<CaptureAudioTrack>? extraAudio = null)
+        IReadOnlyList<CaptureAudioTrack>? extraAudio = null,
+        int? audioPairs = null)
     {
         request = null;
         folder = folder.Trim();
@@ -137,7 +147,8 @@ public static class RecordingSetup
             FrameLimit: frameLimit,
             SingleFile: singleFile,
             StartTimecode: startTimecode,
-            ExtraAudio: extraAudio);
+            ExtraAudio: extraAudio,
+            AudioPairs: audioPairs);
 
         problem = null;
         return true;

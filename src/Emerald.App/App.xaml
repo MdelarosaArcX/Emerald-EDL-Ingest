@@ -295,6 +295,65 @@
             <GradientStop Color="#3FE3B0" Offset="1"/>
         </LinearGradientBrush>
 
+        <!-- The EDL's own meter: the same idea as the deck's, in the EDL's palette. -->
+        <LinearGradientBrush x:Key="EdlMeterFill" StartPoint="0,0" EndPoint="1,0">
+            <GradientStop Color="#1B7F66" Offset="0"/>
+            <GradientStop Color="#3FE3B0" Offset="1"/>
+        </LinearGradientBrush>
+
+        <Style x:Key="EdlMeter" TargetType="ProgressBar">
+            <Setter Property="Minimum" Value="0"/>
+            <Setter Property="Maximum" Value="1"/>
+            <Setter Property="Height" Value="8"/>
+            <Setter Property="Foreground" Value="{StaticResource EdlMeterFill}"/>
+            <Setter Property="Background" Value="#151A21"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ProgressBar">
+                        <Grid>
+                            <Border Background="{TemplateBinding Background}" CornerRadius="3"
+                                    BorderBrush="{StaticResource Line}" BorderThickness="1"/>
+                            <Border x:Name="PART_Track" Background="Transparent"/>
+                            <Border x:Name="PART_Indicator" CornerRadius="3"
+                                    Background="{TemplateBinding Foreground}"
+                                    HorizontalAlignment="Left" Margin="1"/>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <SolidColorBrush x:Key="IpMeterHot"  Color="#E8A33D"/>
+        <SolidColorBrush x:Key="IpMeterOver" Color="#E5484D"/>
+        <SolidColorBrush x:Key="IpMeterTrack" Color="#16202C"/>
+
+        <!-- An audio level bar. A ProgressBar rather than a Border with a bound width:
+             the length is a fraction of whatever room the row was given, and letting the
+             layout do that arithmetic is the difference between a meter that fits any
+             panel width and one pinned to the size it was designed at. -->
+        <Style x:Key="IpMeter" TargetType="ProgressBar">
+            <Setter Property="Minimum" Value="0"/>
+            <Setter Property="Maximum" Value="1"/>
+            <Setter Property="Height" Value="7"/>
+            <Setter Property="Foreground" Value="{StaticResource IpMeterFill}"/>
+            <Setter Property="Background" Value="{StaticResource IpMeterTrack}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ProgressBar">
+                        <Grid>
+                            <Border Background="{TemplateBinding Background}" CornerRadius="2"/>
+                            <Border x:Name="PART_Track" Background="Transparent"/>
+                            <Border x:Name="PART_Indicator" CornerRadius="2"
+                                    Background="{TemplateBinding Foreground}"
+                                    HorizontalAlignment="Left"/>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- Icons, drawn in a nominal 16x16 box and stretched to fit, so one
              button template can serve every glyph in the deck. -->
         <PathGeometry x:Key="IconPlay"    Figures="M2,1 L14,8 L2,15 Z"/>
