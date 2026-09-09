@@ -102,6 +102,7 @@ public partial class ShellWindow : Window
     private LiveEditWindow? _liveEdit;
     private IngestControllerWindow? _ingest;
     private PlaybackWindow? _playback;
+    private MonitorWindow? _monitor;
 
     // Player
     private bool _playing;
@@ -142,6 +143,8 @@ public partial class ShellWindow : Window
         _capture.Message += OnCaptureMessage;
         _capture.PreviewFrame += OnCapturePreviewFrame;
         _capture.Audio += _audio.Push;
+        _capture.Finished += OnCaptureFinished;
+        _capture.FormatDetected += OnCaptureFormat;
 
         ClipStrip.ItemsSource = _clips;
         AudioTrackRows.ItemsSource = _audioPairs;
@@ -406,6 +409,11 @@ public partial class ShellWindow : Window
         _settings.CaptureFrameRate = SelectedRate();
 
         ShowProfile(profile);
+
+        // Worth writing down because it does not only change this deck: this is the settings
+        // object the EDL records with too, so a change here quietly changes what that writes.
+        ActivityLog.Shared.Info(LogSource.Capture,
+            $"Recording profile changed: {ProfileNote.Text}", "capture.profile");
 
         // The stage quotes clip lengths against the configured rate.
         if (ClipStrip.SelectedItem is ClipItem clip)
@@ -889,8 +897,23 @@ public partial class ShellWindow : Window
 
         _capture.Start(request!);
 
+        // After Start, because that is where the session is minted, and the whole point of the
+        // line is to name the recording everything after it will refer to.
+        ActivityLog.Shared.Ok(LogSource.Capture,
+            $"Recording {request!.NamePrefix} from board {board.Index} {port.Name} at " +
+            $"{SelectedRate()} fps into {folder}." +
+            (_captureAudio.Count > 0 ? $" {_captureAudio.Count} added audio track(s)." : ""),
+            @event: "capture.started",
+            correlation: _capture.SessionId,
+            detail: ProfileNote.Text);
+
         _recording = true;
         UpdateRecordUi();
+
+        PipelineState.Shared.Capture = new StageState(
+            "RECORDING",
+            $"{request.NamePrefix} - board {board.Index} {port.Name}",
+            LogLevel.Ok);
     }
 
     // ------------------------------------------------------------------ tidal lock
@@ -1012,6 +1035,49 @@ public partial class ShellWindow : Window
         Dispatcher.BeginInvoke(() => SetStatus(text, problem));
 
     /// <summary>
+    /// What the recording actually turned out to be.
+    ///
+    /// This is the richest thing the recorder says — how many frames it really got, whether it
+    /// ran the length it was asked for, the format it locked to, and why it stopped if it
+    /// stopped badly — and until now the deck had no subscriber for it at all. It went to the
+    /// ingest controller and nowhere else, so a recording made from this deck finished without
+    /// leaving any account of itself.
+    ///
+    /// Raised on the capture thread, after ffmpeg has closed its files.
+    /// </summary>
+    private void OnCaptureFinished(CaptureResult result)
+    {
+        string length = result.Format is { } format && format.FrameRate > 0
+            ? new Timecode(result.Frames, format.FrameRate).ToString()
+            : $"{result.Frames} frames";
+
+        string outcome = result.Error is { } error
+            ? $"failed: {error}"
+            : result.ReachedFrameLimit ? "ran its full length" : "stopped early";
+
+        ActivityLog.Shared.Write(
+            LogSource.Capture,
+            result.Error is null ? LogLevel.Ok : LogLevel.Error,
+            $"Recording {result.Request.NamePrefix} finished - {length} recorded, {outcome}.",
+            @event: "capture.finished",
+            correlation: result.SessionId,
+            file: result.Request.Folder,
+            detail: $"frames {result.Frames}\nformat {result.Format?.Name ?? "unknown"}\n" +
+                    $"folder {result.Request.Folder}\nreached limit {result.ReachedFrameLimit}");
+
+        // The strip stops claiming a recording the moment there is not one. Doing it here
+        // rather than in the Stop handler covers the recorder ending on its own, which is
+        // exactly the case where a stale "RECORDING" would be a lie.
+        PipelineState.Shared.ClearCapture();
+    }
+
+    /// <summary>The format the receiver locked to, which was previously only noticed by tidal lock.</summary>
+    private void OnCaptureFormat(CaptureFormat format) =>
+        ActivityLog.Shared.Info(LogSource.Capture,
+            $"Receiver locked to {format.Name} ({format.Width}x{format.Height} @ {format.FrameRate}).",
+            @event: "capture.format", correlation: _capture.SessionId);
+
+    /// <summary>
     /// The picture while recording. The card allows one open handle per input, so the shell's
     /// own preview steps aside when the recorder claims the receiver — and the recorder hands
     /// back the frames it is already reading, which is what keeps the monitor live across the
@@ -1080,6 +1146,21 @@ public partial class ShellWindow : Window
     /// <see cref="TimecodeService"/> free-wheels between server polls and slews the
     /// disagreement out, so this only has to ask it what the time is.
     /// </summary>
+    /// <summary>
+    /// Puts a change the operator made on this deck into the record.
+    ///
+    /// None of these were written down anywhere. `SetStatus` is one label that the next message
+    /// overwrites, and a change to what is being monitored — or worse, to the recording profile
+    /// that the EDL also records with — left no trace at all. "Why does this clip sound like
+    /// that" was an unanswerable question.
+    ///
+    /// Correlated to the recording when one is running, so the change and the file it affected
+    /// are the same thread on the monitoring page.
+    /// </summary>
+    private void LogAudio(string message, string @event, LogLevel level = LogLevel.Info) =>
+        ActivityLog.Shared.Write(LogSource.Capture, level, message, @event,
+                                 correlation: _capture.IsRunning ? _capture.SessionId : null);
+
     // ------------------------------------------------------------------ added audio tracks
 
     /// <summary>
@@ -1143,6 +1224,9 @@ public partial class ShellWindow : Window
                 Path = path,
                 Label = Path.GetFileNameWithoutExtension(path),
             });
+
+            LogAudio($"Added audio track \"{Path.GetFileNameWithoutExtension(path)}\": {path}",
+                     "capture.audio.added");
         }
 
         RenumberCaptureAudio();
@@ -1153,6 +1237,7 @@ public partial class ShellWindow : Window
         if ((sender as FrameworkElement)?.DataContext is not CaptureAudioRow row) return;
 
         _captureAudio.Remove(row);
+        LogAudio($"Removed audio track \"{row.Label}\".", "capture.audio.removed");
         RenumberCaptureAudio();
     }
 
@@ -1219,6 +1304,8 @@ public partial class ShellWindow : Window
 
         foreach (AudioPairRow other in _audioPairs) other.Listening = ReferenceEquals(other, row);
 
+        LogAudio($"Monitoring {row.Name} ({row.ChannelLabel}).", "capture.audio.pair");
+
         if (ListenButton.IsChecked == true) StartListening(row.Pair);
     }
 
@@ -1231,6 +1318,7 @@ public partial class ShellWindow : Window
         if (!on)
         {
             _audio.Mute(true);
+            LogAudio("Speaker monitoring off.", "capture.audio.listen");
             return;
         }
 
@@ -1240,8 +1328,13 @@ public partial class ShellWindow : Window
 
         if (chosen is null) { ListenButton.IsChecked = false; return; }
 
+        // Setting Listening ticks the radio button, which raises Checked, which starts
+        // listening on its own. Calling it again here would open the monitor twice — harmless
+        // on the speakers, but it said so twice in the record, which is how it was noticed.
+        bool alreadySelected = chosen.Listening;
         chosen.Listening = true;
-        StartListening(chosen.Pair);
+
+        if (alreadySelected) StartListening(chosen.Pair);
     }
 
     private void StartListening(int pair)
@@ -1256,12 +1349,16 @@ public partial class ShellWindow : Window
         {
             SetStatus($"Monitoring CH {pair * 2 + 1}-{pair * 2 + 2} on this PC - it changes " +
                       "nothing that is recorded or transmitted.", false);
+            LogAudio($"Listening to CH {pair * 2 + 1}-{pair * 2 + 2} on this PC (monitor only).",
+                     "capture.audio.listen");
             return;
         }
 
         // No sound device is a fact worth saying out loud rather than a silent button that
         // appears to have worked.
         SetStatus($"Cannot listen: {_audio.ListenProblem ?? "no sound device"}.", true);
+        LogAudio($"Cannot listen: {_audio.ListenProblem ?? "no sound device"}.",
+                 "capture.audio.listen", LogLevel.Warn);
         ListenButton.IsChecked = false;
     }
 
@@ -1400,6 +1497,9 @@ public partial class ShellWindow : Window
     private void Ingest_Click(object sender, RoutedEventArgs e) =>
         ShowModule(ref _ingest, () => new IngestControllerWindow(_settings));
 
+    private void Monitor_Click(object sender, RoutedEventArgs e) =>
+        ShowModule(ref _monitor, () => new MonitorWindow(_settings));
+
     /// <summary>
     /// Opens one of the deck's modules by name, for a second launch of Emerald that was
     /// handed to this instance rather than starting a process of its own. The window is the
@@ -1415,6 +1515,10 @@ public partial class ShellWindow : Window
 
             case "--ingest":
                 ShowModule(ref _ingest, () => new IngestControllerWindow(_settings));
+                break;
+
+            case "--monitor":
+                ShowModule(ref _monitor, () => new MonitorWindow(_settings));
                 break;
 
             default:
@@ -1439,6 +1543,7 @@ public partial class ShellWindow : Window
                 if (ReferenceEquals(_liveEdit, created)) _liveEdit = null;
                 if (ReferenceEquals(_ingest, created)) _ingest = null;
                 if (ReferenceEquals(_playback, created)) _playback = null;
+                if (ReferenceEquals(_monitor, created)) _monitor = null;
 
                 // The EDL edits the settings this deck is showing.
                 if (!_loading) LoadProfile();

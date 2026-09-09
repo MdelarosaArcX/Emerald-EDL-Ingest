@@ -28,6 +28,28 @@ public sealed class IngestLog : IIngestLog
 {
     public event Action<IngestLogEntry>? Entry;
 
-    public void Write(string message, IngestLogLevel level = IngestLogLevel.Info) =>
+    /// <summary>
+    /// Says it twice: to whoever built this log, as it always has, and to the application
+    /// record.
+    ///
+    /// The second one matters because this object does not outlive the window. Toggling
+    /// SIMULATE rebuilds the controller and with it this log, and the whole ingest history
+    /// went with it — even though the jobs themselves are in a database. Now the narration
+    /// survives the rebuild, the window closing, and the process exiting.
+    /// </summary>
+    public void Write(string message, IngestLogLevel level = IngestLogLevel.Info)
+    {
+        Emerald.Core.ActivityLog.Shared.Write(
+            Emerald.Core.LogSource.Ingest,
+            level switch
+            {
+                IngestLogLevel.Ok => Emerald.Core.LogLevel.Ok,
+                IngestLogLevel.Warn => Emerald.Core.LogLevel.Warn,
+                IngestLogLevel.Error => Emerald.Core.LogLevel.Error,
+                _ => Emerald.Core.LogLevel.Info,
+            },
+            message);
+
         Entry?.Invoke(new IngestLogEntry(DateTime.Now, message, level));
+    }
 }

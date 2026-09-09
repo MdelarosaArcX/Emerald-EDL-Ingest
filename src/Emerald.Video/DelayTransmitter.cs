@@ -1,3 +1,4 @@
+using Emerald.Core;
 using Emerald.Deltacast;
 
 namespace Emerald.Video;
@@ -305,8 +306,22 @@ public sealed class DelayTransmitter : IDisposable
         Report(now, message, buffered);
     }
 
-    private void Report(DelayPhase phase, string message, long buffered) =>
+    private void Report(DelayPhase phase, string message, long buffered)
+    {
+        ActivityLog.Shared.Write(
+            LogSource.TidalLock,
+            phase switch
+            {
+                DelayPhase.Failed => LogLevel.Error,
+                DelayPhase.Holding or DelayPhase.Draining => LogLevel.Warn,
+                DelayPhase.OnAir => LogLevel.Ok,
+                _ => LogLevel.Info,
+            },
+            message,
+            @event: $"delay.{phase.ToString().ToLowerInvariant()}");
+
         Status?.Invoke(new DelayStatus(phase, message, buffered, _line.TargetFrames, Counters.FramesOut));
+    }
 
     public void Dispose() => Stop();
 }

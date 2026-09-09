@@ -16,6 +16,7 @@ namespace Emerald.App;
 ///     Emerald.App.exe            the capture deck, with everything reachable from it
 ///     Emerald.App.exe --edl      the EDL Generator alone
 ///     Emerald.App.exe --ingest   the Ingest Controller alone
+///     Emerald.App.exe --monitor  the monitoring page alone
 ///
 /// <b>Emerald only ever runs once.</b> Launching it again while it is already up does not
 /// start a second copy: the new process hands its request to the one already running,
@@ -62,13 +63,14 @@ public partial class App : Application
         string? mode = e.Args.FirstOrDefault(a => a.StartsWith("--", StringComparison.Ordinal))
                              ?.ToLowerInvariant();
 
-        if (mode is not (null or "--edl" or "--ingest"))
+        if (mode is not (null or "--edl" or "--ingest" or "--monitor"))
         {
             MessageBox.Show(
                 $"Unknown option \"{mode}\".\n\n" +
                 "Emerald.App.exe            the capture deck\n" +
                 "Emerald.App.exe --edl      the EDL Generator\n" +
-                "Emerald.App.exe --ingest   the Ingest Controller",
+                "Emerald.App.exe --ingest   the Ingest Controller\n" +
+                "Emerald.App.exe --monitor  the monitoring page",
                 "Emerald", MessageBoxButton.OK, MessageBoxImage.Information);
 
             Shutdown(1);
@@ -92,8 +94,44 @@ public partial class App : Application
         // would be eighteen. Swept once, here, before anything can allocate another.
         DelayLine.SweepOrphans(TidalLockRingFolder(Settings));
 
+        StartActivityLog();
+
         StartListening();
         OpenModule(mode);
+    }
+
+    /// <summary>
+    /// Opens the activity record and prunes what has aged out of it.
+    ///
+    /// Done here rather than by whichever window happens to open first, because the record has
+    /// to be running before anything narrates into it — a capture that rolls before the log is
+    /// writing is exactly the run somebody will want to read back.
+    ///
+    /// Also the point at which a crash stops being invisible: WPF's default is to take the
+    /// process down with nothing but a Windows event-log entry, which is no use to an operator
+    /// standing in front of a dark transmitter.
+    /// </summary>
+    private void StartActivityLog()
+    {
+        ActivityLog log = ActivityLog.Shared;
+        string folder = Settings.LogFolderOrDefault;
+
+        int swept = log.Sweep(folder, Settings.LogRetentionDays);
+        log.StartWriting(folder, Settings.LogRetentionDays);
+
+        DispatcherUnhandledException += (_, e) =>
+        {
+            log.Error(LogSource.App, $"Emerald stopped: {e.Exception.Message}",
+                      @event: "app.crashed", detail: e.Exception.ToString());
+        };
+
+        log.Info(LogSource.App,
+                 $"Emerald started. Recording activity to {folder}, keeping " +
+                 (Settings.LogRetentionDays < 0
+                     ? "everything."
+                     : $"{Settings.LogRetentionDays} day(s).") +
+                 (swept > 0 ? $" {swept} older file(s) swept." : ""),
+                 @event: "app.started");
     }
 
     // ------------------------------------------------------------------ windows
@@ -118,6 +156,7 @@ public partial class App : Application
         {
             "--edl" => Existing<EdlWindow>() ?? new EdlWindow(Settings),
             "--ingest" => Existing<IngestControllerWindow>() ?? new IngestControllerWindow(Settings),
+            "--monitor" => Existing<MonitorWindow>() ?? new MonitorWindow(Settings),
             _ => new ShellWindow(),
         };
 

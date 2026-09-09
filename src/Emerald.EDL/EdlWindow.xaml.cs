@@ -152,11 +152,17 @@ public partial class EdlWindow : Window
         SetMedia(MediaScanner.Resolve(_settings.MediaSource), announce: false);
 
         _playout = new PlayoutService(_timecode, ffmpeg);
-        _capture.Message += (text, problem) =>
-            Dispatcher.BeginInvoke(() => Log(text, problem ? LogLevel.Error : LogLevel.Info));
+        // The recorder narrates into the record itself now, and this window shows Capture
+        // lines from there - subscribing here as well would print every one of them twice.
 
         _playout.Progress += OnPlayoutProgress;
         _playout.QueueChanged += OnQueueChanged;
+
+        // The panel opens showing what has already happened rather than blank, which is what
+        // it used to do even when the plant had been running for an hour.
+        foreach (LogLine line in ActivityLog.Shared.Snapshot()) OnLogLine(line);
+
+        ActivityLog.Shared.Line += OnLogLine;
 
         foreach (AudioTrackSetting saved in _settings.AudioTracks)
             RestoreAudioTrack(saved);
@@ -187,6 +193,14 @@ public partial class EdlWindow : Window
         // and the deck or an ingest may still be reading it. Unsubscribing matters though —
         // the event is static and would otherwise hold a closed window alive.
         TimecodeLink.UrlChanged -= OnTimecodeUrlChanged;
+
+        // Static, and this window is not: without the unsubscribe it is held for the life of
+        // the application. Same trap TimecodeLink documents, same fix.
+        ActivityLog.Shared.Line -= OnLogLine;
+
+        // The strip must not go on describing a queue that closed with this window.
+        PipelineState.Shared.ClearEdl();
+        PipelineState.Shared.ClearOnAir();
 
         _settings.StartTimecode = StartTcBox.Text.Trim();
         _settings.Som = SomBox.Text.Trim();
@@ -1257,6 +1271,39 @@ public partial class EdlWindow : Window
         });
     }
 
+    /// <summary>
+    /// Writes down which media this command is made of, one line per file.
+    ///
+    /// This is what makes "how many messages used this clip" a question with an answer. It was
+    /// not one before: the command's file list existed only in the JSON behind Copy JSON, which
+    /// goes to the clipboard and nowhere else, and the log said "3 file(s) from D:\promo" —
+    /// a count, not the files.
+    ///
+    /// The full 32-character command id travels in the detail, because the eight characters
+    /// used everywhere else are for reading, not for keying.
+    /// </summary>
+    private void RecordManifest(EdlCommand command, PlayoutEntry entry,
+                                IReadOnlyList<string>? files, List<AudioTrack> tracks)
+    {
+        ActivityLog log = ActivityLog.Shared;
+
+        log.Info(LogSource.Edl,
+                 $"EDL {entry.Id} queued - {DescribeSources(files, tracks)}, " +
+                 $"starts {entry.Request.Start}, {entry.DurationLabel}.",
+                 @event: "edl.queued",
+                 correlation: entry.Id,
+                 detail: command.Id);
+
+        foreach (string path in files ?? Array.Empty<string>())
+            log.Info(LogSource.Edl, $"EDL {entry.Id} video: {Path.GetFileName(path)}",
+                     @event: "edl.media", correlation: entry.Id, file: path);
+
+        foreach (AudioTrack track in tracks)
+            foreach (string path in track.Files)
+                log.Info(LogSource.Edl, $"EDL {entry.Id} audio \"{track.Label}\": {Path.GetFileName(path)}",
+                         @event: "edl.media", correlation: entry.Id, file: path);
+    }
+
     private PostPlay SelectedPostPlay =>
         PostPlayCombo.SelectedIndex == 1 ? PostPlay.FreezeLastFrame : PostPlay.BlackScreen;
 
@@ -1315,6 +1362,8 @@ public partial class EdlWindow : Window
 
         int position = _playout.PendingCount + 1;
         _playout.Enqueue(entry);
+
+        RecordManifest(command, entry, files, tracks);
 
         Log($"EDL {entry.Id} queued (position {position}) - starts {request.Start}, " +
             $"duration {entry.DurationLabel}, stops {entry.StopLabel}, " +
@@ -1446,6 +1495,36 @@ public partial class EdlWindow : Window
 
     private void OnQueueChanged() => Dispatcher.BeginInvoke(RenderQueue);
 
+    /// <summary>
+    /// Tells the monitoring page what this queue and this transmitter are doing.
+    ///
+    /// Written here because this already runs on every queue change, and because the truth
+    /// about what is on air lives in the entry list rather than anywhere it could be inferred
+    /// from. When the EDL is closed the strip is cleared rather than left showing the last
+    /// thing it saw — a status panel that is stale is worse than one that is empty.
+    /// </summary>
+    private void PublishPipelineState(IReadOnlyList<PlayoutEntry> entries, int pending)
+    {
+        PipelineState state = PipelineState.Shared;
+
+        PlayoutEntry? live = entries.FirstOrDefault(e => e.State is EntryState.Playing or EntryState.Cued);
+        PlayoutEntry? next = entries.FirstOrDefault(e => e.State == EntryState.Queued);
+
+        state.Edl = pending == 0 && live is null
+            ? StageState.Idle
+            : new StageState(
+                pending == 0 ? "queue empty" : $"{pending} waiting",
+                next is null ? "" : $"next {next.Id} at {next.Request.Start}",
+                LogLevel.Info);
+
+        state.OnAir = live is null
+            ? StageState.Idle
+            : new StageState(
+                live.State == EntryState.Playing ? "ON AIR" : "CUED",
+                $"{live.Id}  TX{live.Request.TxChannel}  {live.MediaLabel}",
+                live.State == EntryState.Playing ? LogLevel.Ok : LogLevel.Warn);
+    }
+
     private void RenderQueue()
     {
         if (_playout is null) return;
@@ -1460,6 +1539,8 @@ public partial class EdlWindow : Window
 
         int pending = entries.Count(e => e.State == EntryState.Queued);
         QueueHeader.Text = pending > 0 ? $"QUEUE  ({pending} waiting)" : "QUEUE";
+
+        PublishPipelineState(entries, pending);
 
         AnnounceQueue(entries);
     }
@@ -1637,7 +1718,9 @@ public partial class EdlWindow : Window
                 _ => LogLevel.Info,
             };
 
-            Log(status.Message, level);
+            // PlayoutService writes its own narration to the record, and OnLogLine brings it
+            // back to this panel. Logging it again here would double it.
+            _ = level;
         }
     }
 
@@ -1657,25 +1740,54 @@ public partial class EdlWindow : Window
 
     // ------------------------------------------------------------------ log
 
-    private enum LogLevel { Info, Ok, Warn, Error }
+    /// <summary>
+    /// Says something, into the application record.
+    ///
+    /// This panel used to be the record — five hundred lines that existed until the window
+    /// closed. Now it is a <i>view</i> of the record: this writes, and
+    /// <see cref="OnLogLine"/> puts back whatever comes out that belongs to this module.
+    /// Nothing is appended here, or every line would appear twice.
+    ///
+    /// The panel gains lines it never had, which is the point: what the playout engine says
+    /// now arrives here whether the EDL wrote it or the playback deck's queue did.
+    /// </summary>
+    private void Log(string message, LogLevel level) =>
+        ActivityLog.Shared.Write(LogSource.Edl, level, message);
 
-    private void Log(string message, LogLevel level)
+    /// <summary>
+    /// A line from anywhere in the application, filtered down to what this window is about.
+    ///
+    /// Raised on whichever thread wrote it — the playout thread, very often — so it is
+    /// marshalled before it touches a collection the UI is bound to.
+    /// </summary>
+    private void OnLogLine(LogLine line)
     {
-        Brush brush = level switch
-        {
-            LogLevel.Info => Brush("Info"),   // blue
-            LogLevel.Ok => Brush("Ok"),       // green
-            LogLevel.Warn => Brush("Warn"),   // amber
-            LogLevel.Error => Brush("Bad"),   // red
-            _ => Brush("Text"),
-        };
+        if (line.Source is not (LogSource.Edl or LogSource.Playout or LogSource.Capture)) return;
 
-        _log.Add(new LogEntry(DateTime.Now.ToString("HH:mm:ss"), message, brush));
+        Dispatcher.BeginInvoke(() => Append(line));
+    }
+
+    private void Append(LogLine line)
+    {
+        _log.Add(new LogEntry(line.Time, line.Message, Brush(line.Level switch
+        {
+            LogLevel.Ok => "Ok",
+            LogLevel.Warn => "Warn",
+            LogLevel.Error => "Bad",
+            _ => "Info",
+        })));
+
         while (_log.Count > 500) _log.RemoveAt(0);
 
         LogScroller.ScrollToEnd();
     }
 
+    /// <summary>
+    /// Clears this panel only.
+    ///
+    /// The record itself is not touched — an operator tidying their view must not be able to
+    /// destroy what happened. The Monitor still has all of it, and so does the file.
+    /// </summary>
     private void ClearLog_Click(object sender, RoutedEventArgs e) => _log.Clear();
 
     private void CopyPayload_Click(object sender, RoutedEventArgs e)

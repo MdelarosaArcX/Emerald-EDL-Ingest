@@ -324,6 +324,38 @@
             </Setter>
         </Style>
 
+        <!-- One segment of the monitoring page's status strip. -->
+        <Style x:Key="StageCard" TargetType="Border">
+            <Setter Property="Background" Value="{StaticResource PanelDeep}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="4"/>
+            <Setter Property="Padding" Value="10,8"/>
+            <Setter Property="Margin" Value="0,0,6,0"/>
+        </Style>
+
+        <Style x:Key="StageLabel" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="9"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+            <Setter Property="Margin" Value="0,0,0,3"/>
+        </Style>
+
+        <Style x:Key="StageHeadline" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="Consolas"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+            <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+        </Style>
+
+        <Style x:Key="StageDetail" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="10.5"/>
+            <Setter Property="Foreground" Value="#6B7382"/>
+            <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+            <Setter Property="Margin" Value="0,2,0,0"/>
+        </Style>
+
         <SolidColorBrush x:Key="IpMeterHot"  Color="#E8A33D"/>
         <SolidColorBrush x:Key="IpMeterOver" Color="#E5484D"/>
         <SolidColorBrush x:Key="IpMeterTrack" Color="#16202C"/>

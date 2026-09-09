@@ -4,7 +4,7 @@ A Windows desktop application (C# / WPF, .NET 8) for SDI playout, recording and 
 DELTACAST hardware. It is self-contained: no server, no network transport, nothing to
 connect to.
 
-Emerald opens on a **shell** with a live confidence monitor on an SDI receiver, and four
+Emerald opens on a **shell** with a live confidence monitor on an SDI receiver, and five
 ways in:
 
 - **Playback** — the capture deck's opposite number: a transmitter, a confidence monitor on
@@ -17,6 +17,8 @@ ways in:
   it with the media store. Several jobs can be queued across different boards and ports.
 - **Live Edit** — the editing workspace over what has been captured. Layout only for now;
   trimming and rendering are not built.
+- **Monitor** — everything from capture to on air in one ordered, filterable record, kept on
+  disk, with a live strip across the top showing what each stage of the chain is doing.
 
 They open as windows in the **same process**, which is what lets them share the hardware
 (see *One receiver, three claimants* below) and one station clock. Launching Emerald a second
@@ -34,7 +36,7 @@ Emerald.sln
 ├─ src\Emerald.Media          media management: scan, probe, and the capture store
 ├─ src\Emerald.Video          ffmpeg: decode, audio beds, and RX recording
 ├─ src\Emerald.Deltacast      VideoMaster interop, boards, TX output, RX arbitration
-├─ src\Emerald.Core           timecode, the shared station clock, settings
+├─ src\Emerald.Core           timecode, the station clock, settings, the activity record
 ├─ tests\Emerald.Core.Tests
 ├─ tests\Emerald.Edl.Tests
 ├─ tests\Emerald.Ingest.Tests
@@ -67,6 +69,7 @@ Double-click one of the three run scripts, or from a terminal:
 run.bat                 build (Release) and open the capture deck
 run-edl.bat             build (Release) and open the EDL Generator
 run-ingest.bat          build (Release) and open the Ingest Controller
+run-monitor.bat         build (Release) and open the Monitor
 
 run.bat Debug           build Debug and launch
 run.bat Release -n      skip the build, just launch what is already built
@@ -76,8 +79,8 @@ build.bat Debug         build Debug
 build.bat Release -r    force a package restore first
 ```
 
-All three launch the **same executable** with a different argument
-(`Emerald.App.exe`, `--edl`, `--ingest`). Emerald runs once: if an instance is already up,
+All of them launch the **same executable** with a different argument
+(`Emerald.App.exe`, `--edl`, `--ingest`, `--monitor`). Emerald runs once: if an instance is already up,
 the script hands its request over and that instance opens the window alongside whatever is
 already on screen — **nothing is closed**, and the build is skipped, because the running
 instance holds a lock on its own exe. To rebuild, close Emerald first.
@@ -664,7 +667,67 @@ The mask only enforces shape, and it **never corrects a number you typed**: `99:
 stays exactly that and is reported as invalid at 25 fps, rather than being quietly rounded
 into something you did not ask for. Range checking stays with the validator.
 
+## The Monitor
+
+**Monitor** in the nav bar is the whole plant on one page: what is happening now across the
+top, and everything that has happened underneath it.
+
+Before it, each module narrated into a list of its own that lasted until its window closed —
+the EDL kept 500 lines, the playback deck 400, the Ingest Controller 500 and rebuilt them
+whenever SIMULATE was toggled, and the capture deck kept **one**, in a label the next message
+overwrote. None of it was written down. "What happened at 21:30" had no answer.
+
+### The strip
+
+Five segments, in the order the pictures travel: **capture → tidal lock → EDL queue → on air
+→ ingest**. Each is fed by the module that owns it at the moment its state changes, not
+reconstructed from the log — a status panel built by replaying lines is one that lies the
+moment a line is missed, and a page that says a recording is running when it stopped ten
+minutes ago is worse than no page.
+
+### The record
+
+One merged, ordered stream: time to the millisecond, the **house timecode that was on air**,
+the source, the level, a correlation id, the media file, and the message.
+
+| | |
+|---|---|
+| **Ordering** | Every line carries a sequence number taken with its place in the record. A wall clock cannot order two threads inside one millisecond, and an NTP step would put them in the wrong order entirely. |
+| **Timecode** | Sampled ten times a second, not asked per line — `TimecodeService.TryGetCurrent` takes the clock's own lock and moves its anti-backstep mark, and calling it from the capture thread at log rate would contend with the deck's render timer. |
+| **Correlation** | A recording, an EDL command and an ingest job each have an eight-character id, and everything they cause carries it. Double-click any line to follow that id — one click from "queued" to the frame leaving the transmitter. |
+| **Filters** | Source, minimum level, free text over message/file/id/event, and an id box. **FOLLOW** keeps the newest line in view and turns itself off when you scroll back. |
+
+### Where it is kept
+
+`%APPDATA%\Emerald\logs\emerald-YYYYMMDD.jsonl`, one JSON object per line, rolled on the date
+and at 32 MB, kept **14 days** and swept at start-up. Override with `logFolder` and
+`logRetentionDays` in `settings.json`; a negative retention keeps everything.
+
+The file is opened `FileShare.ReadWrite`, so it can be tailed while Emerald still holds it.
+
+**Nothing writes to disk on a real-time thread.** The capture loop, the playout loop and the
+scheduler all call the same `Write`, and the playout loop is between two frames going to a
+transmitter — so `Write` stamps the line, appends it to a ring, hands it to a queue and
+returns. A background thread owns the file. The queue is bounded; if the disk wedges, lines
+are dropped and the drop is reported rather than the process being eaten.
+
+The once-a-second playout progress is marked transient: it reaches the page and never the
+file, or the record would be a heartbeat trace with the events buried in it.
+
+### Per file, how many EDL
+
+Queuing a command writes one line per media file it is made of, tagged `edl.media` and
+carrying the full path and the command id; the moment a file reaches the transmitter writes
+`playout.file` against the same id. Filter on a file name to see every message that used it.
+Before this the command's file list existed only in the JSON behind **Copy JSON**, and the log
+said "3 file(s) from D:\promo" — a count, not the files.
+
 ## The activity log
+
+Each module keeps its own panel, and they are now **views of the same record**, filtered to
+that module. Nothing is appended locally; the panel shows what came back out of the log. They
+gained lines they never had — the EDL's panel now sees what the recorder and the playout
+engine say, whichever window caused it. **Clear** empties the panel and never the record.
 
 Lines are colour-coded by level: **blue** for informational, **green** for success,
 **amber** for warnings, **red** for errors.
@@ -709,6 +772,8 @@ src/Emerald.Core/
   TimecodeLink.cs           the one station clock, shared by every module
   TimecodeCalculation.cs    the SOM/EOM/duration convention, stated once
   TimecodeMask.cs           fixed-width HH:MM:SS:FF input mask
+  ActivityLog.cs            the one record: capture to on air, ordered, on disk
+  PipelineState.cs          what each stage is doing now, for the Monitor strip
   AppSettings.cs            %APPDATA%\Emerald\settings.json, migrated from EdlGenerator
 
 src/Emerald.Deltacast/

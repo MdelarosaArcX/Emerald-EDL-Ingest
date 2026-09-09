@@ -114,6 +114,26 @@ public sealed class AppSettings
     /// </summary>
     [JsonPropertyName("ingestMockMode")] public bool IngestMockMode { get; set; }
 
+    /// <summary>
+    /// Where the activity record is written. Empty means %APPDATA%\Emerald\logs, beside
+    /// settings.json and the ingest database.
+    /// </summary>
+    [JsonPropertyName("logFolder")] public string LogFolder { get; set; } = "";
+
+    /// <summary>
+    /// How many days of the record to keep. Zero keeps today only; negative keeps everything
+    /// and leaves the pruning to whoever wants it done.
+    /// </summary>
+    [JsonPropertyName("logRetentionDays")] public int LogRetentionDays { get; set; } = 14;
+
+    /// <summary>The default home for the record, alongside everything else Emerald remembers.</summary>
+    public static string DefaultLogFolder { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Emerald", "logs");
+
+    /// <summary>Where the record actually goes, honouring the override when there is one.</summary>
+    public string LogFolderOrDefault =>
+        string.IsNullOrWhiteSpace(LogFolder) ? DefaultLogFolder : LogFolder;
+
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 
     private static string AppDataFile(string folder) => Path.Combine(

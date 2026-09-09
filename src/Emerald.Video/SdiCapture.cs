@@ -42,6 +42,16 @@ public sealed class SdiCapture : IDisposable
     public bool IsRunning => _worker is { IsAlive: true };
     public string? LastError { get; private set; }
 
+    /// <summary>
+    /// Names this recording, for the record.
+    ///
+    /// The capture chain had no identifier of any kind, so a line from the deck, a line from the
+    /// delay line and a line from the encoder could only be tied together by having happened at
+    /// about the same time. Eight hex, the same shape the ingest jobs use, minted when the
+    /// recording rolls and carried on everything it says and on its result.
+    /// </summary>
+    public string SessionId { get; private set; } = "";
+
     /// <summary>Raised for anything worth putting in the operator's log.</summary>
     public event Action<string, bool>? Message;   // (text, isProblem)
 
@@ -113,6 +123,7 @@ public sealed class SdiCapture : IDisposable
         CaptureRequest sanitised = request with { NamePrefix = SanitisePrefix(request.NamePrefix) };
 
         LastError = null;
+        SessionId = Guid.NewGuid().ToString("N")[..8];
         Interlocked.Exchange(ref _framesRecorded, 0);
 
         _cts = new CancellationTokenSource();
@@ -513,7 +524,8 @@ public sealed class SdiCapture : IDisposable
                     Frames: framesTaken,
                     ReachedFrameLimit: reachedLimit,
                     Format: recordedFormat,
-                    Error: LastError));
+                    Error: LastError,
+                    SessionId: SessionId));
             }
             catch
             {
@@ -607,11 +619,19 @@ public sealed class SdiCapture : IDisposable
         return Math.Max(1, best);
     }
 
-    private void Report(string text) => Message?.Invoke(text, false);
+    // Narration goes two places: to whoever owns this recorder, as it always has, and to the
+    // application record. The window still decides what to put on screen; the record keeps it
+    // whether a window is open or not, which is the half that was missing.
+    private void Report(string text)
+    {
+        ActivityLog.Shared.Info(LogSource.Capture, text, correlation: SessionId);
+        Message?.Invoke(text, false);
+    }
 
     private void Fail(string text)
     {
         LastError = text;
+        ActivityLog.Shared.Error(LogSource.Capture, text, correlation: SessionId);
         Message?.Invoke(text, true);
     }
 
@@ -632,7 +652,8 @@ public sealed record CaptureResult(
     long Frames,
     bool ReachedFrameLimit,
     CaptureFormat? Format,
-    string? Error)
+    string? Error,
+    string SessionId = "")
 {
     public bool Succeeded => Error is null && Frames > 0;
 }

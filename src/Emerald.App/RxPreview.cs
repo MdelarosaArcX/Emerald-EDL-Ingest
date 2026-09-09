@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using Emerald.Core;
 using Emerald.Deltacast;
 using Emerald.Video;
 
@@ -365,8 +366,15 @@ public sealed class RxPreview : IDisposable
         });
     }
 
-    private void Report(string text, bool problem) =>
+    private void Report(string text, bool problem)
+    {
+        // Straight to the record, on the thread that noticed. The window is told through the
+        // dispatcher as before, but a preview that lost its signal while nobody had the deck
+        // open is still worth knowing about afterwards.
+        ActivityLog.Shared.Write(LogSource.Preview, problem ? LogLevel.Warn : LogLevel.Info, text);
+
         Application.Current?.Dispatcher.BeginInvoke(() => Status?.Invoke(text, problem));
+    }
 
     private void ReportFormat(CaptureFormat? format) =>
         Application.Current?.Dispatcher.BeginInvoke(() => FormatChanged?.Invoke(format));

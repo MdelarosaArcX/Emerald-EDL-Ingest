@@ -13,12 +13,22 @@ public enum EntryState { Queued, Cued, Playing, Completed, Stopped, Failed }
 
 public enum PlayoutState { Idle, Opening, WaitingForCue, Playing, PostPlay, Finished, Stopped, Failed }
 
+/// <summary>
+/// What the engine is doing, as it happens.
+///
+/// <paramref name="EntryId"/> and <paramref name="CurrentFilePath"/> are stamped by the engine
+/// rather than passed in at every call site. The id is what ties a status back to the command
+/// that caused it; the full path matters because <paramref name="CurrentFile"/> is only the
+/// bare name, and two files called beds.wav in different folders are not the same media.
+/// </summary>
 public sealed record PlayoutStatus(
     PlayoutState State,
     string Message,
     long FramesOut = 0,
     long? FramesTotal = null,
-    string? CurrentFile = null);
+    string? CurrentFile = null,
+    string? EntryId = null,
+    string? CurrentFilePath = null);
 
 /// <summary>
 /// One selectable audio track — a language — and the files behind it.
@@ -296,6 +306,7 @@ public sealed class PlayoutService : IDisposable
             while (!ct.IsCancellationRequested)
             {
                 PlayoutEntry? entry = TakeNextQueued();
+                Volatile.Write(ref _currentEntryId, entry?.Id);
 
                 if (entry is null)
                 {
@@ -549,8 +560,11 @@ public sealed class PlayoutService : IDisposable
             {
                 using var source = FrameSource.Open(_ffmpegPath!, file, format, seek);
 
+                // The moment this file reaches the transmitter, and the one place where both
+                // the entry and the file are in scope. It is what makes "which messages used
+                // this clip" a question with an answer.
                 Report(new PlayoutStatus(PlayoutState.Playing, $"Playing {Path.GetFileName(file)}",
-                    framesOut, target, Path.GetFileName(file)));
+                    framesOut, target, Path.GetFileName(file), CurrentFilePath: file));
 
                 while (!ct.IsCancellationRequested && (target is null || framesOut < target))
                 {
@@ -752,7 +766,51 @@ public sealed class PlayoutService : IDisposable
         return delta > perDay / 2 ? 0 : delta;
     }
 
-    private void Report(PlayoutStatus status) => Progress?.Invoke(status);
+    /// <summary>
+    /// The one place everything this engine says goes through.
+    ///
+    /// Two things happen here rather than at forty call sites. The status is stamped with the
+    /// entry that is running, so a line on the monitoring page can be traced back to the
+    /// command that caused it — without that, the status stream and the queue are two
+    /// unrelated things. And it is written to the application record.
+    ///
+    /// The once-a-second progress goes to the screen and not to the file: it carries no
+    /// message, and a record made of heartbeats is a record with the events buried in it.
+    /// </summary>
+    private void Report(PlayoutStatus status)
+    {
+        string? entryId = Volatile.Read(ref _currentEntryId);
+
+        if (status.EntryId is null && entryId is not null) status = status with { EntryId = entryId };
+
+        if (status.Message.Length > 0)
+        {
+            ActivityLog.Shared.Write(
+                LogSource.Playout,
+                status.State switch
+                {
+                    PlayoutState.Failed => LogLevel.Error,
+                    PlayoutState.WaitingForCue or PlayoutState.PostPlay or PlayoutState.Stopped => LogLevel.Warn,
+                    PlayoutState.Playing or PlayoutState.Finished => LogLevel.Ok,
+                    _ => LogLevel.Info,
+                },
+                status.Message,
+                @event: $"playout.{status.State.ToString().ToLowerInvariant()}",
+                correlation: status.EntryId,
+                file: status.CurrentFilePath);
+        }
+
+        Progress?.Invoke(status);
+    }
+
+    /// <summary>
+    /// Which entry the worker is on, so <see cref="Report"/> can stamp it.
+    ///
+    /// A field rather than a parameter on forty <c>Report</c> calls — and it covers the catch
+    /// blocks too, which is where an id matters most and where threading one through by hand
+    /// would certainly have been forgotten.
+    /// </summary>
+    private string? _currentEntryId;
 
     public void Dispose() => StopAll();
 
