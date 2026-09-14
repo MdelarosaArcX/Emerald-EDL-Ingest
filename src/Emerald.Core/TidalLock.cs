@@ -87,11 +87,17 @@ public sealed class TidalLock
     public long FramesToAir =>
         Line is { } line ? Math.Max(0, line.TargetFrames - line.FramesWritten) : 0;
 
-    /// <summary>How full the delay is, 0 to 1, for a progress bar.</summary>
+    /// <summary>
+    /// How full the delay is, 0 to 1, for a progress bar.
+    ///
+    /// A line with no delay to fill is complete the moment it exists, so it reads full rather
+    /// than empty — a bar stuck at nothing while the feed is already on air would be saying
+    /// the opposite of what is happening.
+    /// </summary>
     public double FillFraction =>
-        Line is { TargetFrames: > 0 } line
-            ? Math.Clamp(line.FramesWritten / (double)line.TargetFrames, 0, 1)
-            : 0;
+        Line is not { } line ? 0
+        : line.TargetFrames <= 0 ? 1
+        : Math.Clamp(line.FramesWritten / (double)line.TargetFrames, 0, 1);
 
     /// <summary>How long until the feed reaches air, from the line's own frame rate.</summary>
     public TimeSpan TimeToAir =>
@@ -104,12 +110,17 @@ public sealed class TidalLock
     /// <summary>
     /// The playback deck asks for the lock. Nothing happens until the capture deck rolls —
     /// arming only says that when it does, its output should go to air a delay later.
+    ///
+    /// <b>Zero is a delay.</b> It means the transmitter takes the receiver's frames as they
+    /// arrive, which is what an operator wants when re-arming part-way through a recording
+    /// that is already running rather than waiting out another fill. Only a negative — which
+    /// nothing can mean — falls back to the default.
     /// </summary>
     public void Arm(TimeSpan delay)
     {
         lock (_gate)
         {
-            Delay = delay <= TimeSpan.Zero ? DefaultDelay : delay;
+            Delay = delay < TimeSpan.Zero ? DefaultDelay : delay;
             _state = TidalLockState.Armed;
             Line = null;
             RecordingStarted = null;
@@ -246,7 +257,8 @@ public sealed class TidalLock
         frameRate <= 0 ? 0 : (long)Math.Round(Delay.TotalSeconds * frameRate);
 
     public static string Describe(TimeSpan delay) =>
-        delay.TotalMinutes >= 1 && delay.TotalSeconds % 60 == 0
+        delay <= TimeSpan.Zero ? "no delay"
+        : delay.TotalMinutes >= 1 && delay.TotalSeconds % 60 == 0
             ? $"{delay.TotalMinutes:F0} min"
             : $"{delay.TotalSeconds:F0} s";
 }

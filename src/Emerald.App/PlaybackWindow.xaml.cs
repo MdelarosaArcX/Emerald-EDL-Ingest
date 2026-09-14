@@ -111,14 +111,26 @@ public partial class PlaybackWindow : Window
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
+        // "No delay" is the one that is not a delay: the transmitter is fed the frame the
+        // receiver has just produced, so the feed reaches air as soon as there is a frame
+        // rather than after a fill. It is what you want when re-arming part-way through a
+        // recording that is already running and you do not want to wait out another minute
+        // of black.
+        //
+        // It cannot make up a delay from a recording that already exists — the ring holds raw
+        // frames and is allocated empty, and reaching back into the written files would be
+        // playing a recording late, which is the design this feature deliberately is not.
         DelayBox.ItemsSource = new[]
         {
+            new DelayOption("No delay", TimeSpan.Zero),
             new DelayOption("30 seconds", TimeSpan.FromSeconds(30)),
             new DelayOption("1 minute", TimeSpan.FromMinutes(1)),
             new DelayOption("2 minutes", TimeSpan.FromMinutes(2)),
             new DelayOption("5 minutes", TimeSpan.FromMinutes(5)),
         };
-        DelayBox.SelectedIndex = 1;
+
+        // A minute still, which is what tidal lock is for. No delay is a choice, not a default.
+        DelayBox.SelectedIndex = 2;
 
         Log("Playback deck started.");
 
@@ -827,14 +839,28 @@ public partial class PlaybackWindow : Window
                 // stays honest through a timecode outage and cannot reach zero before the
                 // frames to fill the delay have really arrived.
                 TimeSpan left = lockState.TimeToAir;
+                long target = lockState.Line?.TargetFrames ?? 0;
 
                 LockPanel.Visibility = Visibility.Visible;
-                LockHeadline.Text = "TIDAL LOCK - ON AIR IN";
-                CountdownText.Text = $"{(int)left.TotalMinutes:00}:{left.Seconds:00}";
                 CountdownText.Foreground = Brush("IpMint");
 
+                // Nothing to count down when there is no delay to fill: this state lasts the
+                // frame or two before the first one arrives, and "ON AIR IN 00:00" for that
+                // moment would read as a stalled countdown rather than as an imminent cut.
+                if (target <= 0)
+                {
+                    LockHeadline.Text = "TIDAL LOCK - GOING TO AIR";
+                    CountdownText.Text = "now";
+                    CountdownDetail.Text =
+                        "No delay - the transmitter takes the receiver's frames as they arrive.";
+                    break;
+                }
+
+                LockHeadline.Text = "TIDAL LOCK - ON AIR IN";
+                CountdownText.Text = $"{(int)left.TotalMinutes:00}:{left.Seconds:00}";
+
                 CountdownDetail.Text =
-                    $"{lockState.FramesBuffered:N0} of {lockState.Line?.TargetFrames ?? 0:N0} frames buffered" +
+                    $"{lockState.FramesBuffered:N0} of {target:N0} frames buffered" +
                     (lockState.CueAt is { } cue ? $"  |  on air at {cue}" : "") +
                     "  |  holding black on the transmitter until then";
                 break;

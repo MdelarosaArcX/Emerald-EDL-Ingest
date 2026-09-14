@@ -308,17 +308,24 @@ public sealed class DelayTransmitter : IDisposable
 
     private void Report(DelayPhase phase, string message, long buffered)
     {
-        ActivityLog.Shared.Write(
-            LogSource.TidalLock,
-            phase switch
-            {
-                DelayPhase.Failed => LogLevel.Error,
-                DelayPhase.Holding or DelayPhase.Draining => LogLevel.Warn,
-                DelayPhase.OnAir => LogLevel.Ok,
-                _ => LogLevel.Info,
-            },
-            message,
-            @event: $"delay.{phase.ToString().ToLowerInvariant()}");
+        // The empty-message call is the once-a-second nudge that keeps the countdown and the
+        // frame count on screen moving. It carries nothing to say, and writing it down put
+        // over a thousand blank lines an hour into the record — exactly what the comment at
+        // the call site was trying to avoid. The screen still gets it; the record does not.
+        if (message.Length > 0)
+        {
+            ActivityLog.Shared.Write(
+                LogSource.TidalLock,
+                phase switch
+                {
+                    DelayPhase.Failed => LogLevel.Error,
+                    DelayPhase.Holding or DelayPhase.Draining => LogLevel.Warn,
+                    DelayPhase.OnAir => LogLevel.Ok,
+                    _ => LogLevel.Info,
+                },
+                message,
+                @event: $"delay.{phase.ToString().ToLowerInvariant()}");
+        }
 
         Status?.Invoke(new DelayStatus(phase, message, buffered, _line.TargetFrames, Counters.FramesOut));
     }

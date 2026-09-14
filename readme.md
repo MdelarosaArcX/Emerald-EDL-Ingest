@@ -499,7 +499,19 @@ the capture deck's does, and everything reaching the transmitter goes through th
 ### Tidal lock
 
 Tidal lock puts the capture deck.s receiver to air a fixed time later — a minute by default,
-selectable from thirty seconds to five.
+selectable from thirty seconds to five, or **No delay**.
+
+**No delay** is the one that is not a delay: the transmitter takes the frame the receiver has
+just produced, so the feed reaches air as soon as there is a frame rather than after a fill.
+It is what you want when re-arming part-way through a recording that is already running and
+you do not want to wait out another minute of black — stop the lock, start it again on *No
+delay*, and it is back on air immediately.
+
+It cannot make up a delay from a recording that already exists. The ring holds raw frames and
+is allocated empty, so a fresh one has nothing in it however long the recording has been
+running; reaching back into the written files would be playing a recording late, which is
+precisely the design this feature is not (see *Where the delay lives*). The ring is also much
+smaller with no delay to hold — about 200 MB rather than six gigabytes.
 
 1. On the playback deck, choose the transmitter and press **ARM TIDAL LOCK**.
 2. The delay begins filling, and the countdown over the picture shows how much is buffered.

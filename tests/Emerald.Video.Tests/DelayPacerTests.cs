@@ -135,3 +135,77 @@ public class DelayPacerTests
             Decide(written: 10_000, read: 10_000, isSealed: true, sealedAt: 10_000));
     }
 }
+
+/// <summary>
+/// The same policy with no delay to fill at all.
+///
+/// "No delay" is a target of zero frames: the transmitter takes the frame the receiver has
+/// just produced. Nothing in the pacer needed changing for it, which is the point of the
+/// policy being arithmetic over a target rather than a special case per mode — but it is
+/// worth pinning down, because the difference between holding black forever and going to air
+/// immediately is one comparison.
+/// </summary>
+public class DelayPacerNoDelayTests
+{
+    private const int Rate = 25;
+    private const long Target = 0;
+    private const long Slots = 50;
+
+    private static PaceAction Decide(long written, long read, bool isSealed = false,
+                                     long sealedAt = 0, long stalledMs = 0) =>
+        DelayPacer.Decide(written, read, Target, Slots, isSealed, sealedAt, stalledMs, Rate);
+
+    [Fact]
+    public void There_is_never_a_fill_because_there_is_nothing_to_fill()
+    {
+        // With any real delay this would be Fill - hold black until the buffer is deep enough.
+        Assert.NotEqual(PaceAction.Fill, Decide(written: 0, read: 0));
+        Assert.NotEqual(PaceAction.Fill, Decide(written: 10, read: 10));
+    }
+
+    [Fact]
+    public void The_first_frame_the_receiver_produces_goes_straight_out()
+    {
+        Assert.Equal(PaceAction.Advance, Decide(written: 1, read: 0));
+    }
+
+    [Fact]
+    public void Waiting_on_the_receiver_holds_the_last_frame_rather_than_black()
+    {
+        // Caught up. There is nothing new, so the picture is held - which is an underrun, not
+        // a countdown, because with no delay there was never anything to count.
+        Assert.Equal(PaceAction.Repeat, Decide(written: 100, read: 100));
+    }
+
+    [Fact]
+    public void The_reader_is_kept_hard_up_against_the_writer()
+    {
+        long deadband = DelayPacer.Deadband(Rate);
+
+        // Inside the deadband it simply advances; beyond it, frames are shed to close the gap
+        // back up. With a minute of delay the same arithmetic is what holds the minute.
+        Assert.Equal(PaceAction.Advance, Decide(written: 100 + deadband, read: 100));
+        Assert.Equal(PaceAction.Skip, Decide(written: 100 + deadband + 1, read: 100));
+    }
+
+    [Fact]
+    public void Being_lapped_still_resyncs_rather_than_airing_a_torn_frame()
+    {
+        // The ring is much smaller with no delay - fifty slots rather than a minute's worth -
+        // so this matters more here, not less.
+        Assert.Equal(PaceAction.Resync, Decide(written: Slots + 2, read: 0));
+    }
+
+    [Fact]
+    public void A_receiver_that_goes_quiet_still_gives_up_eventually()
+    {
+        Assert.Equal(PaceAction.Fail,
+                     Decide(written: 100, read: 100, stalledMs: DelayPacer.GiveUpAfterMs));
+    }
+
+    [Fact]
+    public void A_sealed_line_that_has_been_read_out_still_finishes()
+    {
+        Assert.Equal(PaceAction.Finish, Decide(written: 50, read: 50, isSealed: true, sealedAt: 50));
+    }
+}

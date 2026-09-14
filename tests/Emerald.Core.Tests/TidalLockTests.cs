@@ -280,3 +280,112 @@ public class TidalLockTests
         Assert.Equal(6, changes);
     }
 }
+
+/// <summary>
+/// Tidal lock with no delay at all.
+///
+/// Chosen when a recording is already running and the operator does not want to wait out
+/// another fill before the feed is back on air — re-arming half an hour in should not cost a
+/// minute of black. It is the same state machine with a target of zero, so what is worth
+/// pinning is the arithmetic that divides by, or counts down to, that target.
+/// </summary>
+public class TidalLockNoDelayTests
+{
+    private sealed class FakeDelayLine : IDelayLine
+    {
+        public int Width => 1920;
+        public int Height => 1080;
+        public int FrameRate => 25;
+        public long FramesWritten { get; set; }
+        public long TargetFrames { get; init; }
+        public bool IsSealed { get; set; }
+        public long SealedAt { get; set; }
+        public string Path => @"C:\delay\fake.ring";
+    }
+
+    private static TidalLock Armed()
+    {
+        var tidal = new TidalLock();
+        tidal.Arm(TimeSpan.Zero);
+        return tidal;
+    }
+
+    [Fact]
+    public void Zero_is_described_as_no_delay_rather_than_as_zero_seconds()
+    {
+        // It appears in the armed line, in the drain readout and on the monitoring strip, and
+        // "0 s behind" reads as a broken number rather than as a deliberate choice.
+        Assert.Equal("no delay", TidalLock.Describe(TimeSpan.Zero));
+        Assert.Equal("1 min", TidalLock.Describe(TimeSpan.FromMinutes(1)));
+        Assert.Equal("30 s", TidalLock.Describe(TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void Arming_with_no_delay_arms_like_any_other()
+    {
+        TidalLock tidal = Armed();
+
+        Assert.Equal(TidalLockState.Armed, tidal.State);
+        Assert.Equal(TimeSpan.Zero, tidal.Delay);
+    }
+
+    [Fact]
+    public void There_is_nothing_left_to_buffer_before_air()
+    {
+        TidalLock tidal = Armed();
+        tidal.RecordingRolled(new FakeDelayLine { TargetFrames = 0 }, startedAt: null);
+
+        Assert.Equal(0, tidal.FramesToAir);
+        Assert.Equal(TimeSpan.Zero, tidal.TimeToAir);
+    }
+
+    [Fact]
+    public void A_line_with_nothing_to_fill_reads_as_full_and_not_as_empty()
+    {
+        TidalLock tidal = Armed();
+        tidal.RecordingRolled(new FakeDelayLine { TargetFrames = 0 }, startedAt: null);
+
+        // A progress bar sitting at nothing while the feed is already going out would be
+        // saying the opposite of what is happening.
+        Assert.Equal(1, tidal.FillFraction);
+    }
+
+    [Fact]
+    public void The_cue_is_the_moment_the_recording_rolled()
+    {
+        var tidal = new TidalLock();
+        tidal.Arm(TimeSpan.Zero);
+
+        Assert.True(Timecode.TryParse("10:00:00:00", 25, out Timecode rolled, out _));
+        tidal.RecordingRolled(new FakeDelayLine { TargetFrames = 0 }, rolled);
+
+        Assert.Equal(rolled, tidal.CueAt);
+    }
+
+    [Fact]
+    public void It_still_goes_through_counting_down_on_its_way_to_air()
+    {
+        // Briefly - the frame or two before the first one arrives. The state machine is not
+        // special-cased, which is why the display is the thing that has to read sensibly.
+        TidalLock tidal = Armed();
+        tidal.RecordingRolled(new FakeDelayLine { TargetFrames = 0 }, startedAt: null);
+
+        Assert.Equal(TidalLockState.CountingDown, tidal.State);
+
+        tidal.WentToAir();
+        Assert.Equal(TidalLockState.OnAir, tidal.State);
+    }
+
+    [Fact]
+    public void Stopping_the_recording_still_drains_what_is_in_the_line()
+    {
+        TidalLock tidal = Armed();
+        tidal.RecordingRolled(new FakeDelayLine { TargetFrames = 0 }, startedAt: null);
+        tidal.WentToAir();
+        tidal.RecordingStopped();
+
+        // Even with no delay there is a frame or two in flight, and the drain is what lets
+        // them out rather than cutting mid-frame.
+        Assert.Equal(TidalLockState.Draining, tidal.State);
+    }
+}
