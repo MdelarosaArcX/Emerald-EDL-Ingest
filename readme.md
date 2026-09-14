@@ -622,7 +622,7 @@ with its name against it.
 
 ### What it writes
 
-Each ingest produces the pair Emerald records everywhere: a DNxHR HQ master under
+Each ingest produces the pair Emerald records everywhere: a DNxHD 145 master under
 `<directory>\high\` and an H.264 proxy under `<directory>\low\`, both named after the clip
 and both stamped with the SOM timecode, so the EDL and any NLE read the marks back correctly.
 Both carry the same audio tracks.
@@ -896,32 +896,35 @@ is as deliberate as what it will:
 The store size is shown under the field, and it is checked every ten seconds while recording
 rather than on a timer of its own — the store only grows while something is writing to it.
 
-### The master is DNxHR, and how to tell
+### The master is DNxHD 145, and how to tell
 
 Every recording is written twice from one pass over the receiver: a half-size H.264 proxy
-under `low\`, and a full-raster **DNxHR HQ** master under `high\`. The master used to be
+under `low\`, and a full-raster **DNxHD 145** master under `high\`. The master used to be
 ProRes 422.
 
-**DNxHR rather than DNxHD.** They are the same Avid family and an editor takes either, but
-DNxHD is a fixed table of raster, rate and bitrate combinations and refuses anything outside
-it — measured on this ffmpeg, 1080p30 rejects 220, 240 and 290 Mbps and accepts only 175, 185
-and 365. A receiver locking to a format outside that table would fail the recording where
-ProRes simply worked. DNxHR has no table; it encoded cleanly at all five rates the deck
-offers.
+**The number is the codec.** DNxHD is defined as a table of frame size, rate and bitrate
+combinations rather than as a quality setting, so 145 Mbps at 8-bit 4:2:2 *is* the tier — and
+anything not in the table is refused outright. Tested against this ffmpeg at 1920×1080p, 145
+is accepted at 24, 25, 30, 50 and 60. No `-profile:v` is given: naming one would put the
+encoder into DNxHR, which is a different codec with a different four-character code.
 
-**It costs about twice the disk.** On this plant's own feed, DNxHR HQ measured **174 Mbps
-against ProRes 422's 89**. A day of continuous recording is roughly 1.9 TB rather than 1 TB.
-`dnxhr_sq` is the next tier down at 115 Mbps if that matters more than the last of the
-quality.
+**It does not take every raster.** 1920×1080, 1440×1080 and 1280×720 are in the table;
+standard definition is not, and a receiver on 720×576 has its recording refused. That would
+take the proxy with it, since one ffmpeg writes both — so the raster is checked before the
+encoder starts, and the refusal arrives as a sentence naming what is supported and what
+arrived rather than as a process that dies a few frames in.
+
+**About one and a half times the disk**: 145 Mbps against ProRes 422's measured 89 on this
+plant's feed.
 
 #### Checking whether a clip is converted
 
 Every clip in the capture deck and in Live Edit names its **master's codec**, read from the
-file itself — `ProRes 422` for anything recorded before the change, `DNxHR` for anything
+file itself — `ProRes 422` for anything recorded before the change, `DNxHD` for anything
 after. A clip whose master is missing says so rather than guessing.
 
 The codec is read by walking the container to the video sample description and taking the
-four-character code (`apcn` for ProRes 422, `AVdh` for DNxHR), not by probing:
+four-character code (`apcn` for ProRes 422, `AVdn` for DNxHD), not by probing:
 
 ```
 ffprobe          195 ms per file   →  over three minutes for a store of a thousand
@@ -933,7 +936,7 @@ duration, raster or stream layout still goes through `ffprobe`, which is worth i
 and not a thousand times.
 
 The Monitor also writes a tally of the whole store whenever the split changes —
-`Store: 412 DNxHR, 1661 ProRes 422.` — so progress through a library is one line in the
+`Store: 412 DNxHD, 1661 ProRes 422.` — so progress through a library is one line in the
 record rather than a count done by eye.
 
 ### Every language on the wire is recorded

@@ -234,6 +234,18 @@ public sealed class SdiCapture : IDisposable
             CaptureFormat format = CaptureFormat.FromStandard(std, request.FrameRate);
             recordedFormat = format;
 
+            // Before the encoder is built, because a codec that cannot take this raster fails
+            // several frames in and takes both files with it — one ffmpeg writes the pair. A
+            // refusal here is a sentence the operator can act on; a refusal there is a process
+            // that dies and a recording that was never made.
+            foreach (RecordingOutput output in RecordingProfile.Outputs)
+            {
+                if (output.Supports(format.Width, format.Height)) continue;
+
+                Fail($"Capture: {output.Refuses(format.Width, format.Height)}");
+                return;
+            }
+
             // Announced before any frame, so anything that has to match the receiver exactly
             // - a delay line sizing its ring - can be built from what is really on the wire
             // rather than from the rate the operator picked.

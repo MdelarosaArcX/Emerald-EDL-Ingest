@@ -488,7 +488,7 @@ public partial class ShellWindow : Window
                 Display = c.Name,
                 Stamp = $"{c.Recorded:HH:mm:ss}  |  {c.DurationText}",
                 // The master's actual codec, read from the file rather than assumed — this is
-                // how you tell a clip recorded before the move to DNxHR from one recorded
+                // how you tell a clip recorded before the move to DNxHD from one recorded
                 // after it, without opening either.
                 Details = $"{c.FormatText}, {c.SizeText}  ·  {c.MasterText}",
                 Duration = c.Info?.Duration ?? TimeSpan.Zero,

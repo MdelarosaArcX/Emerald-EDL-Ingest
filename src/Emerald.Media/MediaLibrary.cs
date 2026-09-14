@@ -14,7 +14,7 @@ public sealed record CapturedClip(
     string? MasterPath = null,
 
     /// <summary>
-    /// What the master was encoded with - "ProRes 422", "DNxHR" - read from the container
+    /// What the master was encoded with - "ProRes 422", "DNxHD" - read from the container
     /// rather than probed, because a thousand ffprobe calls is three minutes and this is
     /// eight milliseconds a file.
     /// </summary>
@@ -27,7 +27,7 @@ public sealed record CapturedClip(
     /// What the master is, for a column: the codec when one was found, or why not.
     ///
     /// This is the answer to "has this one been converted yet" - a clip recorded before the
-    /// change reads ProRes 422, one recorded after it reads DNxHR.
+    /// change reads ProRes 422, one recorded after it reads DNxHD.
     /// </summary>
     public string MasterText => MasterPath is null ? "no master" : MasterCodec ?? "master, codec unread";
 

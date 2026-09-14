@@ -13,7 +13,7 @@ public sealed record RecordingOption<T>(T Value, string Label)
 /// One of the two files a recording produces.
 ///
 /// Every recording is written twice from the same receiver: a small H.264 proxy that opens
-/// and scrubs instantly, and a DNxHR master that is worth editing from. They are separate
+/// and scrubs instantly, and a DNxHD master that is worth editing from. They are separate
 /// outputs of one ffmpeg, not two passes, so the pair is frame-for-frame the same picture and
 /// the receiver is only read once.
 /// </summary>
@@ -35,9 +35,37 @@ public sealed record RecordingOutput(
     string? Profile = null,
 
     /// <summary>The four-character code this output writes, for recognising it on disk later.</summary>
-    string FourCc = "")
+    string FourCc = "",
+
+    /// <summary>
+    /// A fixed video bitrate, when the codec is defined by one. DNxHD is: the number in
+    /// "DNxHD 145" <i>is</i> the setting, and the encoder refuses anything that is not one of
+    /// the values in its table.
+    /// </summary>
+    string? VideoBitrate = null)
 {
     public string ContainerLabel => Extension.ToUpperInvariant();
+
+    /// <summary>
+    /// Whether this output can encode a given raster.
+    ///
+    /// Only DNxHD answers no to anything. It is defined as a table of frame sizes rather than
+    /// as a general-purpose codec, and a receiver that locked to standard definition would
+    /// have its recording refused by the encoder several frames in — taking the proxy with it,
+    /// since both files come out of one ffmpeg. Checked before the encoder starts so the
+    /// refusal is a sentence rather than a dead process.
+    /// </summary>
+    public bool Supports(int width, int height)
+    {
+        if (VideoCodec != "dnxhd" || Profile is { Length: > 0 }) return true;
+
+        return (width, height) is (1920, 1080) or (1440, 1080) or (1280, 720);
+    }
+
+    /// <summary>Why a raster was refused, in words the operator can act on.</summary>
+    public string Refuses(int width, int height) =>
+        $"{VideoLabel} records 1920x1080, 1440x1080 and 1280x720 only - the receiver is on " +
+        $"{width}x{height}. Choose a different master format, or a receiver that is not.";
 }
 
 /// <summary>
@@ -67,18 +95,21 @@ public sealed record RecordingProfile(
         FourCc: "avc1");
 
     /// <summary>
-    /// The master, kept at full raster.
+    /// The master, kept at full raster: <b>DNxHD 145</b>.
     ///
-    /// <b>DNxHR rather than DNxHD.</b> They are the same Avid family and an editor takes
-    /// either, but DNxHD is defined as a fixed table of raster, rate and bitrate combinations
-    /// and refuses anything not in it — measured here, 1080p30 rejects 220, 240 and 290 Mbps
-    /// and accepts only 175, 185 and 365. A receiver that locked to a format outside that
-    /// table would fail the recording where ProRes simply worked. DNxHR has no table: it
-    /// encoded cleanly at every rate the deck offers.
+    /// The number is the codec. DNxHD is defined as a table of frame size, rate and bitrate
+    /// combinations rather than as a quality setting, so 145 Mbps at 8-bit 4:2:2 <i>is</i> the
+    /// tier — and anything that is not one of the table's values is refused outright. Tested
+    /// against this ffmpeg at 1920x1080p: 145 is accepted at 24, 25, 30, 50 and 60.
     ///
-    /// HQ is the tier that stands where ProRes 422 stood. On this plant's own feed it measured
-    /// 174 Mbps against ProRes's 89, so a day of recording now costs about twice the disk it
-    /// used to — which is the price of the format and worth knowing before the drive fills.
+    /// <b>What it will not take is a raster outside the table.</b> 1920x1080, 1440x1080 and
+    /// 1280x720 are in; standard definition is not, and a receiver on 720x576 has its
+    /// recording refused — which would take the proxy with it, since both files come out of
+    /// one ffmpeg. <see cref="RecordingOutput.Supports"/> is checked before the encoder starts
+    /// so that arrives as a sentence rather than as a process that dies a few frames in.
+    ///
+    /// Against ProRes 422's measured 89 Mbps on this plant's feed, 145 is a little over one
+    /// and a half times the disk.
     /// </summary>
     public static RecordingOutput HighRes { get; } = new(
         Key: "high",
@@ -86,12 +117,14 @@ public sealed record RecordingProfile(
         Extension: "mov",
         Muxer: "mov",
         VideoCodec: "dnxhd",
-        VideoLabel: "DNxHR HQ",
-        // 8-bit 4:2:2, which is what the HQ tier is. The 10-bit tier is dnxhr_hqx.
+        VideoLabel: "DNxHD 145",
+        // 8-bit 4:2:2, which is what this tier is defined as.
         PixelFormat: "yuv422p",
         HalfSize: false,
-        Profile: "dnxhr_hq",
-        FourCc: "AVdh");
+        // No -profile:v. DNxHD is selected by its bitrate; naming a profile would put the
+        // encoder into DNxHR instead, which is a different codec with a different fourcc.
+        FourCc: "AVdn",
+        VideoBitrate: "145M");
 
     /// <summary>Both outputs, proxy first, which is the order ffmpeg is given them in.</summary>
     public static IReadOnlyList<RecordingOutput> Outputs { get; } = new[] { LowRes, HighRes };
@@ -279,6 +312,11 @@ public sealed record RecordingProfile(
             if (output.Profile is { Length: > 0 } videoProfile)
             {
                 args.Add("-profile:v"); args.Add(videoProfile);
+            }
+
+            if (output.VideoBitrate is { Length: > 0 } videoBitrate)
+            {
+                args.Add("-b:v"); args.Add(videoBitrate);
             }
 
             if (output.VideoCodec == "libx264")
