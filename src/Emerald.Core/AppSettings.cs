@@ -59,6 +59,15 @@ public sealed class AppSettings
     /// <summary>HH:MM:SS:FF to stop a recording after, or empty to record until stopped.</summary>
     [JsonPropertyName("recordingDuration")] public string RecordingDuration { get; set; } = "";
 
+    /// <summary>
+    /// The most the capture store may grow to, in gigabytes. Zero is no limit.
+    ///
+    /// Past it, the oldest recordings are deleted to make room for the newest — a rolling
+    /// window rather than a recording that stops when the disk fills. Off by default, because
+    /// deleting an operator's recordings is not something to start doing on their behalf.
+    /// </summary>
+    [JsonPropertyName("recordingStorageLimitGb")] public int RecordingStorageLimitGb { get; set; }
+
     // How recordings are encoded. Read through RecordingProfile, which is what both the
     // capture deck and the EDL record with, so a value here is never handed to ffmpeg
     // without first being checked against the list the deck offers.

@@ -324,6 +324,68 @@
             </Setter>
         </Style>
 
+        <!--
+            The monitoring page's grid, dressed for a dark window.
+
+            A ListView left alone brings the stock Windows theme with it: near-black column
+            text on a near-black page, light-grey headers and a bright blue selection bar.
+            Restyling the rows alone is not enough, because the chrome around them is what
+            reads as wrong.
+        -->
+        <Style x:Key="LogGridHeader" TargetType="GridViewColumnHeader">
+            <Setter Property="Background" Value="{StaticResource PanelDeep}"/>
+            <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+            <Setter Property="FontSize" Value="10.5"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="Padding" Value="8,0"/>
+            <Setter Property="Height" Value="24"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="GridViewColumnHeader">
+                        <Border x:Name="b" Background="{TemplateBinding Background}"
+                                BorderBrush="{StaticResource Line}" BorderThickness="0,0,1,1"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Left"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="b" Property="Background" Value="#1B2634"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="LogGridRow" TargetType="ListViewItem">
+            <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+            <Setter Property="FontFamily" Value="Consolas"/>
+            <Setter Property="FontSize" Value="11.5"/>
+            <Setter Property="Padding" Value="0,1"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListViewItem">
+                        <Border x:Name="b" Background="Transparent" Padding="{TemplateBinding Padding}">
+                            <GridViewRowPresenter Content="{TemplateBinding Content}"
+                                                  Columns="{TemplateBinding GridView.ColumnCollection}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="b" Property="Background" Value="#151C25"/>
+                            </Trigger>
+                            <!-- A quiet band rather than the system's blue: the level colour
+                                 in the message column is the thing worth noticing on a row. -->
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="b" Property="Background" Value="#12303A"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- One segment of the monitoring page's status strip. -->
         <Style x:Key="StageCard" TargetType="Border">
             <Setter Property="Background" Value="{StaticResource PanelDeep}"/>

@@ -501,11 +501,20 @@ the capture deck's does, and everything reaching the transmitter goes through th
 Tidal lock puts the capture deck.s receiver to air a fixed time later — a minute by default,
 selectable from thirty seconds to five.
 
-1. On the playback deck, choose the transmitter and press **ARM TIDAL LOCK**. Nothing goes
-   to air yet; arming only says that when the capture deck rolls, its output should follow.
-2. Press **Record** on the capture deck. The delay begins filling, and the countdown over the
-   picture shows how much of it is buffered.
+1. On the playback deck, choose the transmitter and press **ARM TIDAL LOCK**.
+2. The delay begins filling, and the countdown over the picture shows how much is buffered.
 3. A minute later the delayed feed cuts to the transmitter and stays exactly that far behind.
+
+**The order does not matter.** Arming before the recording rolls and arming half an hour into
+one both work: the deck remembers the format the receiver locked to, so there is always
+something to size a ring from. Arming mid-recording used to do nothing at all — the delay line
+was built from a one-shot event raised at the start of a recording, so the lock sat armed and
+waited for the *next* one.
+
+**Disarming and arming again starts a fresh minute.** The old ring is let go and a new one
+built, so the countdown runs from now rather than rejoining a part-filled buffer. An operator
+who disarms and re-arms is asking for a minute from this moment, not for whatever was left
+over.
 
 **Where the delay lives.** In a ring of **raw frames**, memory-mapped from a file that is
 allocated once and reused: `RX → recorder → ring → transmitter`. Nothing is encoded, nothing
@@ -797,6 +806,7 @@ src/Emerald.Video/
 src/Emerald.Media/
   MediaScanner.cs           folder/file -> ordered playlist
   MediaCodec.cs             the codec, read from the container rather than probed
+  StorageWarden.cs          keeps the store under a size, oldest out first
   MediaProbe.cs             ffprobe: duration, start timecode, stream layout
   MediaLibrary.cs           the capture store and what is in it
 
@@ -860,6 +870,31 @@ measurably present (`mean_volume −24.1 dB`, against −91 dB for silence).
 **dCARE must be closed.** An RX channel can only be opened by one process, so if dCARE is
 watching that input the app cannot record it — you get a clear message in the log rather
 than a silent failure.
+
+### Keeping the store to a size
+
+**Storage limit** on the capture deck caps how large the store may grow — 100 GB, 200 GB,
+500 GB, 1 TB, 2 TB, or **No limit**, which is the default. Past the limit, the oldest
+recordings are deleted to make room for the newest: a rolling window rather than a recording
+that stops when the disk fills.
+
+That matters because the alternative is worse. A recording that runs out of disk does not stop
+— the encoder dies and the capture loop carries on counting frames it is not writing, which is
+exactly what happened here for 38 hours before anyone noticed.
+
+This is the only thing in Emerald that deletes an operator's recordings, so what it will not do
+is as deliberate as what it will:
+
+| | |
+|---|---|
+| **Never without a limit** | Off by default. Nothing is deleted until a limit is chosen. |
+| **Oldest first** | Always, and both halves of a recording go together — a proxy without its master cannot be edited, and a master without its proxy is not listed. |
+| **Never the open segment** | Anything written in the last two minutes is left alone, so the file the recorder has open is never the one that goes. |
+| **Never down to nothing** | At least three recordings survive whatever the limit says. A limit below one segment would otherwise delete each file as it was finished and leave the store permanently empty. |
+| **Never quietly** | Every sweep writes what it deleted and what the store now holds to the activity record. |
+
+The store size is shown under the field, and it is checked every ten seconds while recording
+rather than on a timer of its own — the store only grows while something is writing to it.
 
 ### The master is DNxHR, and how to tell
 

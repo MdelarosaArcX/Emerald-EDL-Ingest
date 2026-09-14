@@ -111,7 +111,7 @@
 
                 <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
                     <ToggleButton x:Name="FollowToggle" Content="FOLLOW" IsChecked="True"
-                                  Style="{StaticResource IpDeckTab}" Height="26" Padding="12,0"
+                                  Style="{StaticResource IpSmallToggle}" Height="26" Padding="12,0"
                                   FontSize="11"
                                   ToolTip="Keep the newest line in view. Turns itself off when you scroll back."/>
                     <Button Content="Export" Style="{StaticResource GhostButton}" Margin="6,0,0,0"
@@ -144,27 +144,68 @@
                 <ListView x:Name="LogList" Grid.Row="1" Margin="6,0,6,6"
                           Background="Transparent" BorderThickness="0"
                           SelectionMode="Single"
+                          ItemContainerStyle="{StaticResource LogGridRow}"
+                          Foreground="{StaticResource Muted}"
                           MouseDoubleClick="LogList_DoubleClick"
                           ScrollViewer.IsDeferredScrollingEnabled="False"
                           VirtualizingPanel.IsVirtualizing="True"
                           VirtualizingPanel.VirtualizationMode="Recycling">
+                    <!-- Every column is templated rather than bound with
+                         DisplayMemberBinding, because that renders with the control's
+                         inherited foreground - which on this page is the default near-black,
+                         invisible against the panel behind it. -->
                     <ListView.View>
-                        <GridView AllowsColumnReorder="False">
-                            <GridViewColumn Header="Time" Width="86"
-                                            DisplayMemberBinding="{Binding Time}"/>
-                            <GridViewColumn Header="Timecode" Width="96"
-                                            DisplayMemberBinding="{Binding Timecode}"/>
-                            <GridViewColumn Header="Source" Width="82"
-                                            DisplayMemberBinding="{Binding Source}"/>
-                            <GridViewColumn Header="Id" Width="80"
-                                            DisplayMemberBinding="{Binding Id}"/>
-                            <GridViewColumn Header="File" Width="170"
-                                            DisplayMemberBinding="{Binding File}"/>
-                            <GridViewColumn Header="Message" Width="560">
+                        <GridView AllowsColumnReorder="False"
+                                  ColumnHeaderContainerStyle="{StaticResource LogGridHeader}">
+                            <GridViewColumn Header="Time" Width="88">
                                 <GridViewColumn.CellTemplate>
                                     <DataTemplate>
-                                        <TextBlock Text="{Binding Message}" FontFamily="Consolas"
-                                                   FontSize="11.5" Foreground="{Binding Accent}"
+                                        <TextBlock Text="{Binding Time}" Foreground="#6B7382"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="Timecode" Width="96">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Timecode}"
+                                                   Foreground="{StaticResource Tc}"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="Source" Width="82">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Source}" FontSize="10"
+                                                   Foreground="{StaticResource Muted}"
+                                                   VerticalAlignment="Center"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="Id" Width="80">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Id}" Foreground="#7C8AA0"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="File" Width="170">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding File}" Foreground="#6B7382"
+                                                   TextTrimming="CharacterEllipsis"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="Message" Width="540">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Message}"
+                                                   Foreground="{Binding Accent}"
                                                    TextTrimming="CharacterEllipsis"/>
                                     </DataTemplate>
                                 </GridViewColumn.CellTemplate>

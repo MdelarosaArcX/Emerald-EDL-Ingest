@@ -146,6 +146,10 @@ public partial class ShellWindow : Window
         _capture.Finished += OnCaptureFinished;
         _capture.FormatDetected += OnCaptureFormat;
 
+        // Armed and disarmed on the playback deck, acted on here - this is the side that
+        // holds the receiver and therefore the only side that can open a delay line.
+        TidalLock.Shared.Changed += OnTidalLockChanged;
+
         ClipStrip.ItemsSource = _clips;
         AudioTrackRows.ItemsSource = _audioPairs;
         CaptureAudioList.ItemsSource = _captureAudio;
@@ -162,6 +166,7 @@ public partial class ShellWindow : Window
         VideoBitrateCombo.ItemsSource = RecordingProfile.ProxyBitrates;
         AudioBitrateCombo.ItemsSource = RecordingProfile.AudioBitrates;
         SampleRateCombo.ItemsSource = RecordingProfile.SampleRates;
+        StorageLimitCombo.ItemsSource = StorageLimits;
 
         _clock.Tick += OnClockTick;
         _tick.Tick += OnTick;
@@ -180,10 +185,14 @@ public partial class ShellWindow : Window
         RecordDescriptionBox.Text = _settings.RecordingDescription;
         SetDurationBox.Text = _settings.RecordingDuration;
 
+        StorageLimitCombo.SelectedItem =
+            StorageLimits.FirstOrDefault(o => o.Value == _settings.RecordingStorageLimitGb) ?? StorageLimits[0];
+
         LoadProfile();
         UpdateBreadcrumbs();
         UpdateRecordUi();
         RenumberCaptureAudio();
+        ShowStorage();
 
         TimecodeLink.Connect(_settings);
         TimecodeLink.UrlChanged += OnTimecodeUrlChanged;
@@ -878,6 +887,7 @@ public partial class ShellWindow : Window
         CurrentProfile().ApplyTo(_settings);
         _settings.CaptureFrameRate = SelectedRate();
         _settings.CaptureFolder = folder;
+        _settings.RecordingStorageLimitGb = StorageLimitGb;
 
         if (!RecordingSetup.TryBuild(_settings, board.Index, port.Index, folder, SelectedRate(),
                                      RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem,
@@ -894,10 +904,9 @@ public partial class ShellWindow : Window
         _recordLimit = ParseSetDuration(SelectedRate());
         _recordStartedUtc = DateTime.UtcNow;
 
-        // Armed from the playback deck, and only ever from the next recording: the delay line
-        // is sized from the format the receiver locks to, which is not known until it does.
-        if (TidalLock.Shared.State == TidalLockState.Armed)
-            _capture.FormatDetected += OnTidalLockFormat;
+        // Nothing to arrange here any more. OnCaptureFormat is always subscribed and opens
+        // the line itself once the receiver reports what it locked to, whether tidal lock was
+        // armed before this recording or part-way through it.
 
         _capture.Start(request!);
 
@@ -923,17 +932,6 @@ public partial class ShellWindow : Window
     // ------------------------------------------------------------------ tidal lock
 
     private DelayLine? _delayLine;
-
-    /// <summary>
-    /// The receiver has locked and said what it is carrying, which is the first moment a
-    /// delay line can be sized. Raised on the capture thread, so everything here hops to the
-    /// dispatcher before touching the lock or the log.
-    /// </summary>
-    private void OnTidalLockFormat(CaptureFormat format)
-    {
-        _capture.FormatDetected -= OnTidalLockFormat;
-        Dispatcher.BeginInvoke(() => OpenDelayLine(format));
-    }
 
     private void OpenDelayLine(CaptureFormat format)
     {
@@ -974,8 +972,6 @@ public partial class ShellWindow : Window
     /// </summary>
     private void ReleaseDelayLine()
     {
-        _capture.FormatDetected -= OnTidalLockFormat;
-
         if (_delayLine is null) return;
 
         _capture.Frame -= _delayLine.Offer;
@@ -1069,17 +1065,83 @@ public partial class ShellWindow : Window
             detail: $"frames {result.Frames}\nformat {result.Format?.Name ?? "unknown"}\n" +
                     $"folder {result.Request.Folder}\nreached limit {result.ReachedFrameLimit}");
 
+        _captureFormat = null;
+
         // The strip stops claiming a recording the moment there is not one. Doing it here
         // rather than in the Stop handler covers the recorder ending on its own, which is
         // exactly the case where a stale "RECORDING" would be a lie.
         PipelineState.Shared.ClearCapture();
     }
 
+    /// <summary>
+    /// The format the receiver locked to on the current recording, or null when nothing is
+    /// recording.
+    ///
+    /// Kept because tidal lock can now be armed part-way through a recording, and a delay line
+    /// has to be sized from the format that is actually on the wire. The recorder announces it
+    /// once, at the start; without remembering it, arming later has nothing to build from.
+    /// </summary>
+    private CaptureFormat? _captureFormat;
+
     /// <summary>The format the receiver locked to, which was previously only noticed by tidal lock.</summary>
-    private void OnCaptureFormat(CaptureFormat format) =>
+    private void OnCaptureFormat(CaptureFormat format)
+    {
+        _captureFormat = format;
+
         ActivityLog.Shared.Info(LogSource.Capture,
             $"Receiver locked to {format.Name} ({format.Width}x{format.Height} @ {format.FrameRate}).",
             @event: "capture.format", correlation: _capture.SessionId);
+
+        // Armed before the recording rolled: this is the moment there is finally a format to
+        // size a ring from.
+        Dispatcher.BeginInvoke(TryOpenDelayLine);
+    }
+
+    /// <summary>
+    /// Starts the delay line if tidal lock wants one and everything it needs is here.
+    ///
+    /// Called from both directions, because either can happen first: arming and then
+    /// recording, or — the case that did not work before — recording and then arming. The
+    /// recorder only announces its format once, at the start, so arming half an hour into a
+    /// recording used to find nothing listening and silently wait for the next one.
+    ///
+    /// Idempotent: it is safe to call whenever anything changes, which is what lets both
+    /// paths simply call it rather than each knowing what the other has already done.
+    /// </summary>
+    private void TryOpenDelayLine()
+    {
+        if (TidalLock.Shared.State != TidalLockState.Armed) return;
+        if (_delayLine is not null) return;
+        if (!_capture.IsRunning || _captureFormat is not { } format) return;
+
+        OpenDelayLine(format);
+    }
+
+    /// <summary>
+    /// Tidal lock changed somewhere — most likely on the playback deck, which is where it is
+    /// armed and disarmed.
+    ///
+    /// Arming while a recording is already running opens a line immediately. Disarming lets
+    /// this one go, so arming again starts a fresh delay rather than rejoining the old one
+    /// part-filled: an operator who disarms and re-arms is asking for a minute from now, not
+    /// for whatever was left in the ring.
+    /// </summary>
+    private void OnTidalLockChanged(TidalLock lockState)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            switch (lockState.State)
+            {
+                case TidalLockState.Armed when _delayLine is null:
+                    TryOpenDelayLine();
+                    break;
+
+                case TidalLockState.Off or TidalLockState.Failed:
+                    ReleaseDelayLine();
+                    break;
+            }
+        });
+    }
 
     /// <summary>
     /// The picture while recording. The card allows one open handle per input, so the shell's
@@ -1194,6 +1256,97 @@ public partial class ShellWindow : Window
     }
 
     private string _lastCodecSummary = "";
+
+    // ------------------------------------------------------------------ storage limit
+
+    /// <summary>
+    /// What the store may grow to. Zero is the default and means no limit at all.
+    ///
+    /// Round numbers rather than a free-text box: the value decides when recordings start
+    /// being deleted, and a typo in a field like that is a typo that throws away footage.
+    /// </summary>
+    private static readonly IReadOnlyList<RecordingOption<int>> StorageLimits = new[]
+    {
+        new RecordingOption<int>(0, "No limit"),
+        new RecordingOption<int>(100, "100 GB"),
+        new RecordingOption<int>(200, "200 GB"),
+        new RecordingOption<int>(500, "500 GB"),
+        new RecordingOption<int>(1000, "1 TB"),
+        new RecordingOption<int>(2000, "2 TB"),
+    };
+
+    private int StorageLimitGb =>
+        (StorageLimitCombo.SelectedItem as RecordingOption<int>)?.Value ?? 0;
+
+    private long StorageLimitBytes => StorageLimitGb * (1L << 30);
+
+    /// <summary>The slow tick is twice a second; a sweep every ten seconds is often enough.</summary>
+    private const int StorageTicksApart = 20;
+
+    private int _storageTicks;
+
+    private void StorageLimit_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (_loading) return;
+
+        _settings.RecordingStorageLimitGb = StorageLimitGb;
+        ShowStorage();
+
+        ActivityLog.Shared.Info(LogSource.Media,
+            StorageLimitGb == 0
+                ? "Storage limit removed - recordings are kept until the disk fills."
+                : $"Storage limit set to {StorageLimitGb} GB - the oldest recordings will be " +
+                  "deleted to make room for the newest.",
+            @event: "media.limit");
+
+        // Applied straight away rather than at the next recording: a limit lowered below what
+        // is already on disk should take effect when it is set, not hours later.
+        EnforceStorageLimit();
+    }
+
+    /// <summary>Shows what the store is using against the limit, whether recording or not.</summary>
+    private void ShowStorage()
+    {
+        if (StorageNote is null) return;
+
+        long used = StorageWarden.Size(StoreFolder);
+
+        StorageNote.Text = StorageLimitGb == 0
+            ? $"{StorageSweep.Size(used)} in the store"
+            : $"{StorageSweep.Size(used)} of {StorageLimitGb} GB";
+
+        StorageNote.Foreground = (Brush)FindResource(
+            StorageLimitGb > 0 && used > StorageLimitBytes ? "Warn" : "IpDim");
+    }
+
+    /// <summary>
+    /// Makes room by deleting the oldest recordings, and says what it deleted.
+    ///
+    /// Run on the slow tick while recording, because the store only grows while something is
+    /// writing to it, and a directory scan is not something to do forty times a second. The
+    /// warden itself will not touch a file written in the last couple of minutes, so the
+    /// segment currently open is never the one that goes.
+    /// </summary>
+    private void EnforceStorageLimit()
+    {
+        long limit = StorageLimitBytes;
+        if (limit <= 0) return;
+
+        string folder = StoreFolder;
+
+        Task.Run(() => StorageWarden.Enforce(folder, limit, DateTime.UtcNow))
+            .ContinueWith(t =>
+            {
+                if (t.IsFaulted || !t.Result.DidAnything) return;
+
+                StorageSweep sweep = t.Result;
+
+                ActivityLog.Shared.Warn(LogSource.Media,
+                    $"Storage limit reached - {sweep}.", @event: "media.pruned", file: folder);
+
+                Dispatcher.BeginInvoke(() => { ShowStorage(); RefreshClips(); });
+            }, TaskScheduler.Default);
+    }
 
     // ------------------------------------------------------------------ added audio tracks
 
@@ -1437,6 +1590,15 @@ public partial class ShellWindow : Window
                                (_timecode.FrameRate > 0 ? $" at {_timecode.FrameRate} fps" : "") +
                                (_timecode.LastError is { Length: > 0 } error ? $" - {error}" : "");
 
+        // The store only grows while something is writing to it, and a sweep walks two
+        // folders — so it runs while recording and no more often than every few seconds.
+        if (_recording && ++_storageTicks >= StorageTicksApart)
+        {
+            _storageTicks = 0;
+            EnforceStorageLimit();
+            ShowStorage();
+        }
+
         // The recorder can also stop on its own - a failed start, or a signal that never
         // arrived - so the button follows the thread rather than only the last click.
         if (_recording && !_capture.IsRunning)
@@ -1562,13 +1724,24 @@ public partial class ShellWindow : Window
         }
     }
 
-    /// <summary>Opens a module window, or brings the existing one forward.</summary>
+    /// <summary>
+    /// Opens a module window, or brings the existing one forward.
+    ///
+    /// <b>Deliberately not owned.</b> An owned window in WPF is permanently above its owner
+    /// and cannot be put behind it — so with the playback deck owned by this one, clicking the
+    /// capture deck raised it among every other application's windows and still left it
+    /// underneath playback. There was no way to bring it to the front.
+    ///
+    /// The cost of dropping the ownership is that these no longer close with the shell on
+    /// their own, so <see cref="ShellWindow_Closing"/> closes each of them by name. It did
+    /// that for two of them already, to give the EDL its chance to stop playout first; now it
+    /// does it for all of them because nothing else will.
+    /// </summary>
     private void ShowModule<T>(ref T? window, Func<T> create) where T : Window
     {
         if (window is null)
         {
             window = create();
-            window.Owner = this;
 
             T created = window;
             created.Closed += (_, _) =>
@@ -1606,13 +1779,18 @@ public partial class ShellWindow : Window
 
         // The clock is the application's, not this window's. Only the subscription is ours.
         TimecodeLink.UrlChanged -= OnTimecodeUrlChanged;
+        TidalLock.Shared.Changed -= OnTidalLockChanged;
 
         SaveDeckSettings();
 
-        // Module windows are owned, so they would close with the shell anyway; closing them
-        // explicitly gives the EDL its chance to stop playout and save settings first.
+        // Every module, by name. They are not owned windows — see ShowModule — so nothing
+        // else closes them, and the EDL and the playback deck each need the chance to stop
+        // playout and save their settings before the process goes.
         _edl?.Close();
         _liveEdit?.Close();
+        _ingest?.Close();
+        _playback?.Close();
+        _monitor?.Close();
     }
 
     private void SaveDeckSettings()

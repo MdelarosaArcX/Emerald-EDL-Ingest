@@ -18,7 +18,10 @@ for f in src/*/*.xaml; do
 
     awk -v F="$f" '
         /<[A-Z][A-Za-z]*/ { if (match($0, /<([A-Z][A-Za-z]*)/, e)) elem = e[1] }
-        match($0, /Style="\{StaticResource ([A-Za-z]+)\}"/, s) { print F"|"NR"|"elem"|"s[1] }
+        # A standalone Style attribute only. ItemContainerStyle and ColumnHeaderContainerStyle
+        # end in "Style" too, and those correctly target the child type rather than the
+        # element carrying them - matching them would report every one as a mismatch.
+        match($0, /[ \t]Style="\{StaticResource ([A-Za-z]+)\}"/, s) { print F"|"NR"|"elem"|"s[1] }
     ' "$f"
 done > "$usage"
 

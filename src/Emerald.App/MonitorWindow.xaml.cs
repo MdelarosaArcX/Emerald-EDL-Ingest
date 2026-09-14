@@ -168,6 +168,9 @@ public partial class MonitorWindow : Window
             LogLevel.Ok => "Ok",
             LogLevel.Warn => "Warn",
             LogLevel.Error => "Bad",
+            // Deliberately not the blue the module panels use for Info. Most lines are Info,
+            // and a page where most of the text is blue reads as decoration rather than as
+            // levels - the ones that matter are the three above.
             _ => "Text",
         }),
         Line: line);

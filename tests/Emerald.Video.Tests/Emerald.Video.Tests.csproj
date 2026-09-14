@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Emerald.Video\Emerald.Video.csproj" />
+    <ProjectReference Include="..\..\src\Emerald.Media\Emerald.Media.csproj" />
   </ItemGroup>
 
 </Project>
