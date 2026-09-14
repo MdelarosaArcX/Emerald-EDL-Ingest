@@ -11,10 +11,25 @@ public sealed record CapturedClip(
     DateTime Recorded,
     long Bytes,
     MediaInfo? Info,
-    string? MasterPath = null)
+    string? MasterPath = null,
+
+    /// <summary>
+    /// What the master was encoded with - "ProRes 422", "DNxHR" - read from the container
+    /// rather than probed, because a thousand ffprobe calls is three minutes and this is
+    /// eight milliseconds a file.
+    /// </summary>
+    string? MasterCodec = null)
 {
-    /// <summary>True when this is the proxy of a pair and the ProRes master is on disk beside it.</summary>
+    /// <summary>True when this is the proxy of a pair and its master is on disk beside it.</summary>
     public bool HasMaster => MasterPath is not null;
+
+    /// <summary>
+    /// What the master is, for a column: the codec when one was found, or why not.
+    ///
+    /// This is the answer to "has this one been converted yet" - a clip recorded before the
+    /// change reads ProRes 422, one recorded after it reads DNxHR.
+    /// </summary>
+    public string MasterText => MasterPath is null ? "no master" : MasterCodec ?? "master, codec unread";
 
 
     public string SizeText => Bytes >= 1L << 30
@@ -55,11 +70,12 @@ public static class MediaLibrary
     public static IReadOnlyList<CapturedClip> List(string folder, string? ffprobePath, int frameRate = 25)
     {
         var clips = new List<CapturedClip>();
+        var masters = new MasterIndex(folder);
 
         // The proxies first, then anything sitting loose in the store — recordings made
-        // before the store grew its two halves. The ProRes masters are deliberately not
-        // listed: they are the same pictures, at a size that would make the strip crawl,
-        // and each one is reachable from the proxy that stands for it.
+        // before the store grew its two halves. The masters are deliberately not listed:
+        // they are the same pictures, at a size that would make the strip crawl, and each
+        // one is reachable from the proxy that stands for it.
         Collect(RecordingProfile.FolderFor(RecordingProfile.LowRes, folder), isProxy: true);
         Collect(folder, isProxy: false);
 
@@ -82,8 +98,11 @@ public static class MediaLibrary
                     // harmless but pointless, so it is listed bare until the recorder moves on.
                     MediaInfo? info = ffprobePath is null ? null : MediaProbe.Probe(ffprobePath, path, frameRate);
 
+                    string? master = isProxy ? masters.For(path) : null;
+
                     clips.Add(new CapturedClip(path, file.Name, file.LastWriteTime, file.Length, info,
-                                               isProxy ? FindMaster(folder, path) : null));
+                                               master,
+                                               master is null ? null : MediaCodec.Read(master)));
                 }
             }
             catch (IOException)
@@ -96,14 +115,98 @@ public static class MediaLibrary
         }
     }
 
-    /// <summary>The master written alongside a proxy: same name, the master's own extension.</summary>
-    private static string? FindMaster(string root, string proxyPath)
+    /// <summary>
+    /// The masters in a store, indexed so a proxy can find its own.
+    ///
+    /// Built once per listing rather than searched per proxy: a thousand proxies each scanning
+    /// a thousand masters is a million comparisons for an answer that is the same every time.
+    /// </summary>
+    private sealed class MasterIndex
     {
-        string master = Path.Combine(
-            RecordingProfile.FolderFor(RecordingProfile.HighRes, root),
-            $"{Path.GetFileNameWithoutExtension(proxyPath)}.{RecordingProfile.HighRes.Extension}");
+        private readonly Dictionary<string, string> _byName = new(StringComparer.OrdinalIgnoreCase);
+        private readonly List<(DateTime Stamp, string Path)> _byTime = new();
 
-        return File.Exists(master) ? master : null;
+        public MasterIndex(string root)
+        {
+            string folder = RecordingProfile.FolderFor(RecordingProfile.HighRes, root);
+
+            try
+            {
+                if (!Directory.Exists(folder)) return;
+
+                foreach (string path in Directory.EnumerateFiles(
+                             folder, $"*.{RecordingProfile.HighRes.Extension}"))
+                {
+                    _byName[Path.GetFileNameWithoutExtension(path)] = path;
+
+                    if (StampIn(path) is { } stamp) _byTime.Add((stamp, path));
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+
+            _byTime.Sort((a, b) => a.Stamp.CompareTo(b.Stamp));
+        }
+
+        /// <summary>
+        /// The master belonging to a proxy.
+        ///
+        /// By name first, which is right whenever the two outputs opened their segment inside
+        /// the same second. They often do not: ffmpeg stamps each output's filename when that
+        /// muxer opens it, so a segment that straddles a second boundary is written as
+        /// <c>high\..._17-26-33.mov</c> beside <c>low\..._17-26-32.mp4</c>. On this plant's own
+        /// store that was 259 of 954 proxies reporting no master with the master sitting right
+        /// there. So a near miss in time is accepted too — the pair are still frame-for-frame
+        /// the same picture, they were simply named a moment apart.
+        /// </summary>
+        public string? For(string proxyPath)
+        {
+            string stem = Path.GetFileNameWithoutExtension(proxyPath);
+
+            if (_byName.TryGetValue(stem, out string? exact)) return exact;
+            if (StampIn(proxyPath) is not { } want || _byTime.Count == 0) return null;
+
+            // Segments are minutes apart, so anything inside a couple of seconds is the pair
+            // and anything outside it is a different segment. There is no ambiguous middle.
+            var tolerance = TimeSpan.FromSeconds(2);
+
+            string? best = null;
+            TimeSpan closest = TimeSpan.MaxValue;
+
+            foreach ((DateTime stamp, string path) in _byTime)
+            {
+                TimeSpan gap = (stamp - want).Duration();
+
+                if (gap > tolerance) continue;
+                if (gap >= closest) continue;
+
+                closest = gap;
+                best = path;
+            }
+
+            return best;
+        }
+
+        /// <summary>
+        /// The time in a segment's name — <c>capture_2026-09-09_13-02-41.mov</c>.
+        ///
+        /// From the name rather than the file's own timestamp: a copy or a restore rewrites
+        /// the timestamp, and the pair would then no longer find each other.
+        /// </summary>
+        private static DateTime? StampIn(string path)
+        {
+            string name = Path.GetFileNameWithoutExtension(path);
+            int underscore = name.LastIndexOf('_');
+
+            if (underscore <= 0 || underscore < 11) return null;
+
+            string stamp = name[(underscore - 10)..];
+
+            return DateTime.TryParseExact(stamp, "yyyy-MM-dd_HH-mm-ss", null,
+                                          System.Globalization.DateTimeStyles.None, out DateTime when)
+                ? when
+                : null;
+        }
     }
 
     /// <summary>

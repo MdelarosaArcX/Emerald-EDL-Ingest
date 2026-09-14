@@ -88,6 +88,12 @@
                                     <Run Text=" - "/>
                                     <Run Text="{Binding FormatText, Mode=OneWay}"/>
                                 </TextBlock>
+
+                                <!-- What the master is. An edit conforms to that file, not to
+                                     the proxy above, so its codec is the one that matters here. -->
+                                <TextBlock Text="{Binding MasterText, Mode=OneWay}"
+                                           Foreground="{StaticResource Tc}" FontSize="10"
+                                           Margin="0,2,0,0"/>
                             </StackPanel>
                         </DataTemplate>
                     </ListBox.ItemTemplate>

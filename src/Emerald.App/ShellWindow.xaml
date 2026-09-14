@@ -700,7 +700,7 @@
                                                        Foreground="{StaticResource IpDim}"/>
                                         </Border>
                                         <Border Grid.Column="2" Style="{StaticResource IpReadOnlyField}">
-                                            <TextBlock Text="ProRes 422" FontSize="10" VerticalAlignment="Center"
+                                            <TextBlock Text="DNxHR HQ" FontSize="10" VerticalAlignment="Center"
                                                        Foreground="{StaticResource IpDim}"/>
                                         </Border>
                                         <Border Grid.Column="4" Style="{StaticResource IpReadOnlyField}">
@@ -715,7 +715,7 @@
                                               Style="{StaticResource IpMiniCombo}" Margin="0,3,0,0"
                                               Width="126" HorizontalAlignment="Left"
                                               SelectionChanged="Profile_Changed"
-                                              ToolTip="The low res proxy. Auto detect leaves rate control to the encoder; the ProRes master is quality-driven."/>
+                                              ToolTip="The low res proxy. Auto detect leaves rate control to the encoder; the DNxHR master runs at the tier's own rate."/>
 
                                     <TextBlock Grid.Row="10" Grid.Column="0" Text="Audio Bitrate"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>

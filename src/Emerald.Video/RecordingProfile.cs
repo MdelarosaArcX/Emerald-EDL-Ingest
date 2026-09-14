@@ -13,7 +13,7 @@ public sealed record RecordingOption<T>(T Value, string Label)
 /// One of the two files a recording produces.
 ///
 /// Every recording is written twice from the same receiver: a small H.264 proxy that opens
-/// and scrubs instantly, and a ProRes master that is worth editing from. They are separate
+/// and scrubs instantly, and a DNxHR master that is worth editing from. They are separate
 /// outputs of one ffmpeg, not two passes, so the pair is frame-for-frame the same picture and
 /// the receiver is only read once.
 /// </summary>
@@ -25,7 +25,17 @@ public sealed record RecordingOutput(
     string VideoCodec,
     string VideoLabel,
     string PixelFormat,
-    bool HalfSize)
+    bool HalfSize,
+
+    /// <summary>
+    /// The encoder's <c>-profile:v</c>, when it needs one. ProRes picks a variant with it and
+    /// DNxHR picks its whole quality tier with it, so it is a property of the output rather
+    /// than a special case in the argument builder.
+    /// </summary>
+    string? Profile = null,
+
+    /// <summary>The four-character code this output writes, for recognising it on disk later.</summary>
+    string FourCc = "")
 {
     public string ContainerLabel => Extension.ToUpperInvariant();
 }
@@ -53,23 +63,40 @@ public sealed record RecordingProfile(
         VideoCodec: "libx264",
         VideoLabel: "H.264",
         PixelFormat: "yuv420p",
-        HalfSize: true);
+        HalfSize: true,
+        FourCc: "avc1");
 
-    /// <summary>The master, kept at full raster.</summary>
+    /// <summary>
+    /// The master, kept at full raster.
+    ///
+    /// <b>DNxHR rather than DNxHD.</b> They are the same Avid family and an editor takes
+    /// either, but DNxHD is defined as a fixed table of raster, rate and bitrate combinations
+    /// and refuses anything not in it — measured here, 1080p30 rejects 220, 240 and 290 Mbps
+    /// and accepts only 175, 185 and 365. A receiver that locked to a format outside that
+    /// table would fail the recording where ProRes simply worked. DNxHR has no table: it
+    /// encoded cleanly at every rate the deck offers.
+    ///
+    /// HQ is the tier that stands where ProRes 422 stood. On this plant's own feed it measured
+    /// 174 Mbps against ProRes's 89, so a day of recording now costs about twice the disk it
+    /// used to — which is the price of the format and worth knowing before the drive fills.
+    /// </summary>
     public static RecordingOutput HighRes { get; } = new(
         Key: "high",
         Folder: "high",
         Extension: "mov",
         Muxer: "mov",
-        VideoCodec: "prores_ks",
-        VideoLabel: "ProRes 422",
-        PixelFormat: "yuv422p10le",
-        HalfSize: false);
+        VideoCodec: "dnxhd",
+        VideoLabel: "DNxHR HQ",
+        // 8-bit 4:2:2, which is what the HQ tier is. The 10-bit tier is dnxhr_hqx.
+        PixelFormat: "yuv422p",
+        HalfSize: false,
+        Profile: "dnxhr_hq",
+        FourCc: "AVdh");
 
     /// <summary>Both outputs, proxy first, which is the order ffmpeg is given them in.</summary>
     public static IReadOnlyList<RecordingOutput> Outputs { get; } = new[] { LowRes, HighRes };
 
-    /// <summary>AAC on both files: ProRes carries it perfectly well inside a MOV.</summary>
+    /// <summary>AAC on both files: a MOV carries it perfectly well alongside either codec.</summary>
     public const string AudioCodec = "aac";
     public const string AudioLabel = "AAC";
 
@@ -249,12 +276,12 @@ public sealed record RecordingProfile(
 
             args.Add("-c:v"); args.Add(output.VideoCodec);
 
-            if (output.VideoCodec == "prores_ks")
+            if (output.Profile is { Length: > 0 } videoProfile)
             {
-                // Profile 2 is ProRes 422 proper - not LT below it, not HQ above.
-                args.Add("-profile:v"); args.Add("2");
+                args.Add("-profile:v"); args.Add(videoProfile);
             }
-            else
+
+            if (output.VideoCodec == "libx264")
             {
                 args.Add("-preset"); args.Add("ultrafast");
                 args.Add("-tune"); args.Add("zerolatency");

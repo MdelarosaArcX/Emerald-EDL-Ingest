@@ -478,8 +478,10 @@ public partial class ShellWindow : Window
                 Path = c.Path,
                 Display = c.Name,
                 Stamp = $"{c.Recorded:HH:mm:ss}  |  {c.DurationText}",
-                Details = $"{c.FormatText}, {c.SizeText}" +
-                          (c.HasMaster ? $"  ·  {RecordingProfile.HighRes.VideoLabel} master on disk" : ""),
+                // The master's actual codec, read from the file rather than assumed — this is
+                // how you tell a clip recorded before the move to DNxHR from one recorded
+                // after it, without opening either.
+                Details = $"{c.FormatText}, {c.SizeText}  ·  {c.MasterText}",
                 Duration = c.Info?.Duration ?? TimeSpan.Zero,
             }).ToList();
 
@@ -493,6 +495,8 @@ public partial class ShellWindow : Window
                 StripEmpty.Visibility = _clips.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
                 ClipStrip.SelectedItem = _clips.FirstOrDefault(c => c.Path == selected);
             });
+
+            ReportCodecs(clips);
 
             if (ffmpeg is null) return;
 
@@ -1160,6 +1164,36 @@ public partial class ShellWindow : Window
     private void LogAudio(string message, string @event, LogLevel level = LogLevel.Info) =>
         ActivityLog.Shared.Write(LogSource.Capture, level, message, @event,
                                  correlation: _capture.IsRunning ? _capture.SessionId : null);
+
+    /// <summary>
+    /// Counts what the store's masters are encoded with, and says so once per listing.
+    ///
+    /// The per-clip label answers "is this one converted"; this answers "how far through is
+    /// the store", which is the question an operator actually has after a format change. It
+    /// goes to the record rather than a label so the answer is still there tomorrow, and only
+    /// when the split changes — a line saying the same thing every refresh is noise.
+    /// </summary>
+    private void ReportCodecs(IReadOnlyList<CapturedClip> clips)
+    {
+        string summary = string.Join(", ",
+            clips.Where(c => c.HasMaster)
+                 .GroupBy(c => c.MasterCodec ?? "unread")
+                 .OrderByDescending(g => g.Count())
+                 .Select(g => $"{g.Count()} {g.Key}"));
+
+        int orphans = clips.Count(c => !c.HasMaster);
+
+        if (summary.Length == 0 && orphans == 0) return;
+
+        string line = $"Store: {summary}" + (orphans > 0 ? $", {orphans} with no master" : "") + ".";
+
+        if (line == _lastCodecSummary) return;
+        _lastCodecSummary = line;
+
+        ActivityLog.Shared.Info(LogSource.Media, line, "media.codecs");
+    }
+
+    private string _lastCodecSummary = "";
 
     // ------------------------------------------------------------------ added audio tracks
 

@@ -613,7 +613,7 @@ with its name against it.
 
 ### What it writes
 
-Each ingest produces the pair Emerald records everywhere: a ProRes 422 master under
+Each ingest produces the pair Emerald records everywhere: a DNxHR HQ master under
 `<directory>\high\` and an H.264 proxy under `<directory>\low\`, both named after the clip
 and both stamped with the SOM timecode, so the EDL and any NLE read the marks back correctly.
 Both carry the same audio tracks.
@@ -796,6 +796,7 @@ src/Emerald.Video/
 
 src/Emerald.Media/
   MediaScanner.cs           folder/file -> ordered playlist
+  MediaCodec.cs             the codec, read from the container rather than probed
   MediaProbe.cs             ffprobe: duration, start timecode, stream layout
   MediaLibrary.cs           the capture store and what is in it
 
@@ -859,6 +860,46 @@ measurably present (`mean_volume −24.1 dB`, against −91 dB for silence).
 **dCARE must be closed.** An RX channel can only be opened by one process, so if dCARE is
 watching that input the app cannot record it — you get a clear message in the log rather
 than a silent failure.
+
+### The master is DNxHR, and how to tell
+
+Every recording is written twice from one pass over the receiver: a half-size H.264 proxy
+under `low\`, and a full-raster **DNxHR HQ** master under `high\`. The master used to be
+ProRes 422.
+
+**DNxHR rather than DNxHD.** They are the same Avid family and an editor takes either, but
+DNxHD is a fixed table of raster, rate and bitrate combinations and refuses anything outside
+it — measured on this ffmpeg, 1080p30 rejects 220, 240 and 290 Mbps and accepts only 175, 185
+and 365. A receiver locking to a format outside that table would fail the recording where
+ProRes simply worked. DNxHR has no table; it encoded cleanly at all five rates the deck
+offers.
+
+**It costs about twice the disk.** On this plant's own feed, DNxHR HQ measured **174 Mbps
+against ProRes 422's 89**. A day of continuous recording is roughly 1.9 TB rather than 1 TB.
+`dnxhr_sq` is the next tier down at 115 Mbps if that matters more than the last of the
+quality.
+
+#### Checking whether a clip is converted
+
+Every clip in the capture deck and in Live Edit names its **master's codec**, read from the
+file itself — `ProRes 422` for anything recorded before the change, `DNxHR` for anything
+after. A clip whose master is missing says so rather than guessing.
+
+The codec is read by walking the container to the video sample description and taking the
+four-character code (`apcn` for ProRes 422, `AVdh` for DNxHR), not by probing:
+
+```
+ffprobe          195 ms per file   →  over three minutes for a store of a thousand
+reading the atom   8 ms per file   →  under ten seconds, and cached after the first pass
+```
+
+That difference is why the label can be on every row rather than on request. Anything needing
+duration, raster or stream layout still goes through `ffprobe`, which is worth its cost once
+and not a thousand times.
+
+The Monitor also writes a tally of the whole store whenever the split changes —
+`Store: 412 DNxHR, 1661 ProRes 422.` — so progress through a library is one line in the
+record rather than a count done by eye.
 
 ### Every language on the wire is recorded
 
