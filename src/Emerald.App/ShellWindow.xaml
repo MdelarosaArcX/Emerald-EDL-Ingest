@@ -482,30 +482,119 @@
                                 <ItemsControl x:Name="CaptureAudioList">
                                     <ItemsControl.ItemTemplate>
                                         <DataTemplate>
-                                            <Grid Margin="0,0,0,3" ToolTip="{Binding Path}">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="82"/>
-                                                    <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="Auto"/>
-                                                </Grid.ColumnDefinitions>
+                                            <Border Margin="0,0,0,4" Padding="5,4" CornerRadius="2"
+                                                    Background="{StaticResource IpPanel}"
+                                                    ToolTip="{Binding Path}">
+                                                <StackPanel>
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="82"/>
+                                                            <ColumnDefinition Width="*"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                        </Grid.ColumnDefinitions>
 
-                                                <TextBlock Grid.Column="0" Text="{Binding TrackLabel}"
-                                                           FontSize="9.5" FontFamily="Consolas"
-                                                           Foreground="{StaticResource IpMuted}"
-                                                           VerticalAlignment="Center"/>
+                                                        <TextBlock Grid.Column="0" Text="{Binding TrackLabel}"
+                                                                   FontSize="9.5" FontFamily="Consolas"
+                                                                   Foreground="{StaticResource IpMuted}"
+                                                                   VerticalAlignment="Center"/>
 
-                                                <TextBox Grid.Column="1"
-                                                         Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}"
-                                                         Style="{StaticResource IpMiniTextBox}"
-                                                         FontSize="9.5"
-                                                         ToolTip="What this track is called in the file"/>
+                                                        <TextBox Grid.Column="1"
+                                                                 Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}"
+                                                                 Style="{StaticResource IpMiniTextBox}"
+                                                                 FontSize="9.5"
+                                                                 ToolTip="What this track is called in the file"/>
 
-                                                <Button Grid.Column="2" Content="&#215;"
-                                                        Style="{StaticResource IpSmallButton}"
-                                                        Width="20" Padding="0" Margin="4,0,0,0"
-                                                        Click="RemoveCaptureAudio_Click"
-                                                        ToolTip="Remove this track"/>
-                                            </Grid>
+                                                        <Button Grid.Column="2" Content="&#215;"
+                                                                Style="{StaticResource IpSmallButton}"
+                                                                Width="20" Padding="0" Margin="4,0,0,0"
+                                                                Click="RemoveCaptureAudio_Click"
+                                                                ToolTip="Remove this track"/>
+                                                    </Grid>
+
+                                                    <!-- Level and sync. Both are applied by the encoder, so both
+                                                         take effect when the next recording starts. -->
+                                                    <Grid Margin="0,4,0,0">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="54"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="14"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="58"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="*"/>
+                                                        </Grid.ColumnDefinitions>
+
+                                                        <Button Grid.Column="0" Content="&#8722;"
+                                                                Style="{StaticResource IpSmallButton}"
+                                                                Width="18" Padding="0"
+                                                                Click="CaptureGainDown_Click"
+                                                                ToolTip="Quieter by 1 dB"/>
+
+                                                        <TextBlock Grid.Column="1" Text="dB" Margin="5,0,3,0"
+                                                                   FontSize="9" VerticalAlignment="Center"
+                                                                   Foreground="{StaticResource IpMuted}"/>
+
+                                                        <TextBlock Grid.Column="2" Text="{Binding GainText}"
+                                                                   FontSize="9.5" FontFamily="Consolas"
+                                                                   TextAlignment="Right" VerticalAlignment="Center"
+                                                                   Foreground="{StaticResource IpText}"/>
+
+                                                        <Button Grid.Column="3" Content="+"
+                                                                Style="{StaticResource IpSmallButton}"
+                                                                Width="18" Padding="0" Margin="4,0,0,0"
+                                                                Click="CaptureGainUp_Click"
+                                                                ToolTip="Louder by 1 dB"/>
+
+                                                        <Button Grid.Column="5" Content="&#8722;"
+                                                                Style="{StaticResource IpSmallButton}"
+                                                                Width="18" Padding="0"
+                                                                Click="CaptureDelayDown_Click"
+                                                                ToolTip="Pull the sound 10 ms earlier against the picture"/>
+
+                                                        <TextBlock Grid.Column="6" Text="sync" Margin="5,0,3,0"
+                                                                   FontSize="9" VerticalAlignment="Center"
+                                                                   Foreground="{StaticResource IpMuted}"/>
+
+                                                        <TextBlock Grid.Column="7" Text="{Binding OffsetText}"
+                                                                   FontSize="9.5" FontFamily="Consolas"
+                                                                   TextAlignment="Right" VerticalAlignment="Center"
+                                                                   Foreground="{StaticResource IpText}"/>
+
+                                                        <Button Grid.Column="8" Content="+"
+                                                                Style="{StaticResource IpSmallButton}"
+                                                                Width="18" Padding="0" Margin="4,0,0,0"
+                                                                Click="CaptureDelayUp_Click"
+                                                                ToolTip="Hold the sound 10 ms later against the picture"/>
+
+                                                        <!-- Whether this track is actually in what is being
+                                                             written. Blank when nothing is recording. -->
+                                                        <TextBlock Grid.Column="9" Text="{Binding StateText}"
+                                                                   FontSize="8.5" FontFamily="Consolas"
+                                                                   TextAlignment="Right" VerticalAlignment="Center"
+                                                                   Margin="6,0,0,0">
+                                                            <TextBlock.Style>
+                                                                <Style TargetType="TextBlock">
+                                                                    <Setter Property="Foreground"
+                                                                            Value="{StaticResource IpMuted}"/>
+                                                                    <Style.Triggers>
+                                                                        <DataTrigger Binding="{Binding Airing}" Value="True">
+                                                                            <Setter Property="Foreground"
+                                                                                    Value="{StaticResource IpMint}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding Pending}" Value="True">
+                                                                            <Setter Property="Foreground"
+                                                                                    Value="{StaticResource Warn}"/>
+                                                                        </DataTrigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </TextBlock.Style>
+                                                        </TextBlock>
+                                                    </Grid>
+                                                </StackPanel>
+                                            </Border>
                                         </DataTemplate>
                                     </ItemsControl.ItemTemplate>
                                 </ItemsControl>

@@ -10,7 +10,22 @@ namespace Emerald.Video;
 /// It becomes a further audio stream in the recorded file rather than replacing anything, so
 /// what comes off the wire is always still there as the first track.
 /// </summary>
-public sealed record CaptureAudioTrack(string Label, string Path);
+public sealed record CaptureAudioTrack(string Label, string Path, double GainDb = 0, int OffsetMs = 0)
+{
+    /// <summary>The widest useful trim either way, matching the EDL's own track offset.</summary>
+    public const int MaxOffsetMs = 500;
+
+    /// <summary>Loud enough to rescue a quiet bed, quiet enough to duck one under commentary.</summary>
+    public const double MinGainDb = -40;
+    public const double MaxGainDb = 12;
+
+    /// <summary>
+    /// Whether this track has to go through the filtergraph at all. A track left alone is
+    /// mapped straight from its input, which is what every recording did before there were
+    /// controls, and is one less thing between the file and the encoder.
+    /// </summary>
+    public bool IsAdjusted => GainDb != 0 || OffsetMs != 0;
+}
 
 /// <summary>Everything <see cref="SdiCapture"/> needs to record one receiver.</summary>
 /// <param name="FrameLimit">

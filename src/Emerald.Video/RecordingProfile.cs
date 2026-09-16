@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO;
 using Emerald.Core;
 
@@ -237,7 +238,12 @@ public sealed record RecordingProfile(
     /// Each is looped, and the outputs are cut to the shortest input. The receiver's own
     /// audio and the video both end together when the recording stops, so that makes the
     /// picture the thing that decides the length: a bed shorter than the recording repeats
-    /// instead of falling silent, and one longer than it does not run past the end.
+    /// instead of falling silent, and one longer than it does not run past the end. That
+    /// holds segment by segment, so every segment of a continuous recording carries every
+    /// track rather than only the first one.
+    ///
+    /// A track carrying a gain or an offset goes through the filtergraph instead of straight
+    /// from its input; one left alone is mapped exactly as it always was.
     /// </param>
     public IEnumerable<string> EncoderArguments(CaptureFormat format, string pipeName,
                                                 string folder, string namePrefix, int inputSampleRate,
@@ -271,9 +277,9 @@ public sealed record RecordingProfile(
             args.Add("-i"); args.Add(track.Path);
         }
 
-        if (pairs > 1)
+        if (AudioGraph(pairs, Outputs.Count, beds) is { Length: > 0 } graph)
         {
-            args.Add("-filter_complex"); args.Add(PairSplitGraph(pairs, Outputs.Count));
+            args.Add("-filter_complex"); args.Add(graph);
         }
 
         int outputIndex = 0;
@@ -298,7 +304,11 @@ public sealed record RecordingProfile(
 
             for (int i = 0; i < beds.Count; i++)
             {
-                args.Add("-map"); args.Add($"{i + 2}:a:0");
+                // An adjusted track comes out of the graph, one copy per output file; an
+                // untouched one is mapped straight from its input, which an input stream may
+                // be as many times as there are outputs.
+                args.Add("-map");
+                args.Add(beds[i].IsAdjusted ? $"[{BedLabel(i, outputIndex)}]" : $"{i + 2}:a:0");
             }
 
             if (output.HalfSize)
@@ -399,28 +409,91 @@ public sealed record RecordingProfile(
     /// <summary>The filter label carrying pair <paramref name="pair"/> for one output file.</summary>
     private static string PairLabel(int pair, int output) => $"p{pair}o{output}";
 
+    private static string BedLabel(int bed, int output) => $"b{bed}o{output}";
+
     /// <summary>
-    /// Splits the receiver's multi-channel pipe into one stereo stream per pair, duplicated
-    /// once for each output file.
+    /// The one filtergraph both halves of the audio share: the receiver's pipe split into
+    /// stereo pairs, and any added track the operator has adjusted.
+    ///
+    /// It has to be one graph because ffmpeg takes a single <c>-filter_complex</c>, and the
+    /// two would otherwise overwrite each other — which is why the pair splitting moved in
+    /// here rather than the beds getting a graph of their own.
     ///
     /// <c>pan</c> rather than <c>channelsplit</c> because pan names the source channels
     /// explicitly and does not care what channel layout ffmpeg guessed for eight raw channels;
-    /// <c>asplit</c> because a filter output may be mapped only once, and both the ProRes
-    /// master and the H.264 proxy want every pair.
+    /// <c>asplit</c> because a filter output may be mapped only once, and both the master and
+    /// the proxy want every pair and every bed.
+    ///
+    /// Returns an empty string when there is nothing to filter, and the caller then passes no
+    /// graph at all — a single-pair recording with no adjusted track is exactly the command it
+    /// always was.
     /// </summary>
-    private static string PairSplitGraph(int pairs, int outputs)
+    private static string AudioGraph(int pairs, int outputs, IReadOnlyList<CaptureAudioTrack> beds)
     {
         var chains = new List<string>();
 
-        for (int p = 0; p < pairs; p++)
+        if (pairs > 1)
         {
-            var labels = new System.Text.StringBuilder();
-            for (int o = 0; o < outputs; o++) labels.Append($"[{PairLabel(p, o)}]");
+            for (int p = 0; p < pairs; p++)
+            {
+                var labels = new System.Text.StringBuilder();
+                for (int o = 0; o < outputs; o++) labels.Append($"[{PairLabel(p, o)}]");
 
-            chains.Add($"[1:a]pan=stereo|c0=c{p * 2}|c1=c{p * 2 + 1},asplit={outputs}{labels}");
+                chains.Add($"[1:a]pan=stereo|c0=c{p * 2}|c1=c{p * 2 + 1},asplit={outputs}{labels}");
+            }
+        }
+
+        for (int i = 0; i < beds.Count; i++)
+        {
+            if (!beds[i].IsAdjusted) continue;
+
+            var labels = new System.Text.StringBuilder();
+            for (int o = 0; o < outputs; o++) labels.Append($"[{BedLabel(i, o)}]");
+
+            chains.Add($"[{i + 2}:a]{BedFilters(beds[i])},asplit={outputs}{labels}");
         }
 
         return string.Join(";", chains);
+    }
+
+    /// <summary>
+    /// What an added track's gain and offset come to in filters.
+    ///
+    /// A positive offset delays the sound, for a bed that arrives ahead of the picture; a
+    /// negative one trims that much off the front, which is the only way to pull sound earlier
+    /// against a picture that cannot itself be delayed — the receiver's frames are already
+    /// going to air through the delay line, and nothing here may touch them.
+    ///
+    /// Formatted invariantly. A machine with a comma for a decimal point would otherwise write
+    /// <c>volume=-3,5dB</c>, and the comma is the filter separator: ffmpeg would read it as a
+    /// second filter and refuse the graph.
+    /// </summary>
+    private static string BedFilters(CaptureAudioTrack track)
+    {
+        var parts = new List<string>();
+
+        int offset = Math.Clamp(track.OffsetMs,
+                                -CaptureAudioTrack.MaxOffsetMs, CaptureAudioTrack.MaxOffsetMs);
+
+        if (offset > 0)
+        {
+            parts.Add($"adelay={offset}:all=1");
+        }
+        else if (offset < 0)
+        {
+            string seconds = (-offset / 1000.0).ToString("0.###", CultureInfo.InvariantCulture);
+            parts.Add($"atrim=start={seconds}");
+            parts.Add("asetpts=N/SR/TB");
+        }
+
+        double gain = Math.Clamp(track.GainDb,
+                                 CaptureAudioTrack.MinGainDb, CaptureAudioTrack.MaxGainDb);
+
+        if (gain != 0) parts.Add($"volume={gain.ToString("0.##", CultureInfo.InvariantCulture)}dB");
+
+        // Something has to be in the chain: the caller only builds one for an adjusted track,
+        // but a track adjusted to exactly nothing by rounding would otherwise emit "[2:a],asplit".
+        return parts.Count == 0 ? "anull" : string.Join(",", parts);
     }
 
     /// <summary>

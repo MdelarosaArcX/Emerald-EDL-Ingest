@@ -889,9 +889,11 @@ public partial class ShellWindow : Window
         _settings.CaptureFolder = folder;
         _settings.RecordingStorageLimitGb = StorageLimitGb;
 
+        IReadOnlyList<CaptureAudioTrack> addedAudio = CurrentCaptureAudio();
+
         if (!RecordingSetup.TryBuild(_settings, board.Index, port.Index, folder, SelectedRate(),
                                      RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem,
-                                     extraAudio: CurrentCaptureAudio()))
+                                     extraAudio: addedAudio))
         {
             SetStatus(problem!, true);
 
@@ -921,6 +923,12 @@ public partial class ShellWindow : Window
             detail: ProfileNote.Text);
 
         _recording = true;
+
+        // What ffmpeg was actually handed. From here the rows can say which of them are in
+        // the segments being written, and which have been changed since.
+        _airborneAudio = addedAudio;
+        RefreshCaptureAudioState();
+
         UpdateRecordUi();
 
         PipelineState.Shared.Capture = new StageState(
@@ -996,6 +1004,9 @@ public partial class ShellWindow : Window
         _recording = false;
         _recordLimit = null;
         RecordText.Text = "Stopping...";
+
+        _airborneAudio = null;
+        RefreshCaptureAudioState();
 
         // Stop joins the capture thread so the encoder can finalise the file, which takes
         // long enough to be worth keeping off the UI thread.
@@ -1350,34 +1361,6 @@ public partial class ShellWindow : Window
 
     // ------------------------------------------------------------------ added audio tracks
 
-    /// <summary>
-    /// One audio file to record alongside the receiver. Notifies because the label is edited
-    /// in place and the track number moves when one above it is removed.
-    /// </summary>
-    private sealed class CaptureAudioRow : INotifyPropertyChanged
-    {
-        public required string Path { get; init; }
-
-        private string _label = "";
-
-        public string Label
-        {
-            get => _label;
-            set { _label = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Label))); }
-        }
-
-        private string _trackLabel = "";
-
-        /// <summary>Which track it will be in the file, which depends on how many pairs are on the wire.</summary>
-        public string TrackLabel
-        {
-            get => _trackLabel;
-            set { _trackLabel = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TrackLabel))); }
-        }
-
-        public event PropertyChangedEventHandler? PropertyChanged;
-    }
-
     private readonly ObservableCollection<CaptureAudioRow> _captureAudio = new();
 
     /// <summary>As many as an ingest takes, for the same reason: the file has to stay sane.</summary>
@@ -1439,15 +1422,74 @@ public partial class ShellWindow : Window
 
         CaptureAudioEmpty.Visibility = _captureAudio.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         AddCaptureAudioButton.IsEnabled = _captureAudio.Count < MaxCaptureAudioTracks;
+
+        RefreshCaptureAudioState();
     }
+
+    /// <summary>
+    /// What the running recording was actually handed, or null when nothing is recording.
+    ///
+    /// The beds become ffmpeg inputs when the encoder starts and cannot be added to, taken
+    /// from or re-levelled while it runs, so this is the only honest answer to which tracks
+    /// are in the segments being written now.
+    /// </summary>
+    private IReadOnlyList<CaptureAudioTrack>? _airborneAudio;
 
     /// <summary>The added tracks as the recorder wants them, in list order.</summary>
     private IReadOnlyList<CaptureAudioTrack> CurrentCaptureAudio() =>
-        _captureAudio
-            .Select(r => new CaptureAudioTrack(
-                        string.IsNullOrWhiteSpace(r.Label) ? Path.GetFileName(r.Path) : r.Label.Trim(),
-                        r.Path))
-            .ToList();
+        _captureAudio.Select(r => r.ToTrack()).ToList();
+
+    /// <summary>
+    /// Marks each row against the running recording, so a track that is in the file says so
+    /// and one that has been changed since the encoder started says that instead of pretending.
+    /// </summary>
+    private void RefreshCaptureAudioState()
+    {
+        foreach (CaptureAudioRow row in _captureAudio) row.ShowState(_recording ? _airborneAudio : null);
+    }
+
+    private void CaptureGainUp_Click(object sender, RoutedEventArgs e) =>
+        NudgeCaptureAudio(sender, gainDb: CaptureAudioRow.GainStepDb, offsetMs: 0);
+
+    private void CaptureGainDown_Click(object sender, RoutedEventArgs e) =>
+        NudgeCaptureAudio(sender, gainDb: -CaptureAudioRow.GainStepDb, offsetMs: 0);
+
+    private void CaptureDelayUp_Click(object sender, RoutedEventArgs e) =>
+        NudgeCaptureAudio(sender, gainDb: 0, offsetMs: CaptureAudioRow.OffsetStepMs);
+
+    private void CaptureDelayDown_Click(object sender, RoutedEventArgs e) =>
+        NudgeCaptureAudio(sender, gainDb: 0, offsetMs: -CaptureAudioRow.OffsetStepMs);
+
+    /// <summary>
+    /// Moves one track's gain or offset, and says so out loud.
+    ///
+    /// Adjusting a bed while the deck is recording changes the next recording rather than
+    /// this one — the encoder was given the filters at the moment it started — so the row
+    /// goes to NEXT RECORDING and the operator is told why rather than being left to wonder
+    /// whether the change took.
+    /// </summary>
+    private void NudgeCaptureAudio(object sender, double gainDb, int offsetMs)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not CaptureAudioRow row) return;
+
+        double wasGain = row.GainDb;
+        int wasOffset = row.OffsetMs;
+
+        if (gainDb != 0) row.GainDb += gainDb;
+        if (offsetMs != 0) row.OffsetMs += offsetMs;
+
+        if (row.GainDb == wasGain && row.OffsetMs == wasOffset) return;
+
+        RefreshCaptureAudioState();
+
+        LogAudio($"\"{row.Label}\" set to {row.GainText} at {row.OffsetText}" +
+                 (_recording ? " - this takes effect on the next recording." : "."),
+                 "capture.audio.level");
+
+        if (_recording)
+            SetStatus($"\"{row.Label}\" is now {row.GainText} at {row.OffsetText} - " +
+                      "the recording that is running keeps the levels it started with.", false);
+    }
 
     // ------------------------------------------------------------------ audio meters
 
@@ -1604,6 +1646,8 @@ public partial class ShellWindow : Window
         if (_recording && !_capture.IsRunning)
         {
             _recording = false;
+            _airborneAudio = null;
+            RefreshCaptureAudioState();
             _recordLimit = null;
             UpdateRecordUi();
             RefreshClips();
