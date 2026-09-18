@@ -560,33 +560,26 @@
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
                                                 <Ellipse Grid.Column="0" Width="8" Height="8" Margin="0,0,9,0"
                                                          VerticalAlignment="Top" Fill="{Binding Accent}"/>
                                                 <StackPanel Grid.Column="1">
-                                                    <TextBlock FontFamily="Consolas" FontSize="11.5"
-                                                               Foreground="{Binding Accent}" Text="{Binding Headline}"/>
+                                                    <!-- The state, and beside it the countdown. One clock:
+                                                         it was written twice, and the copy in the headline
+                                                         never moved after the wait began. -->
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <TextBlock FontFamily="Consolas" FontSize="11.5"
+                                                                   Foreground="{Binding Accent}" Text="{Binding Headline}"/>
+                                                        <TextBlock FontFamily="Consolas" FontSize="11.5"
+                                                                   FontWeight="Bold" Margin="8,0,0,0"
+                                                                   Foreground="{Binding CueBrush}" Text="{Binding Cue}"/>
+                                                    </StackPanel>
                                                     <TextBlock FontFamily="Consolas" FontSize="11"
                                                                Foreground="#8A93A3" Text="{Binding Timing}"
                                                                Margin="0,2,0,0"/>
                                                     <TextBlock FontFamily="Consolas" FontSize="11"
                                                                Foreground="#6B7382" Text="{Binding Media}"
                                                                TextTrimming="CharacterEllipsis"/>
-                                                </StackPanel>
-
-                                                <!-- The countdown to air. Driven by the UI tick rather
-                                                     than by queue events, since the queue does not
-                                                     change while a message waits for its cue. -->
-                                                <StackPanel Grid.Column="2" Margin="10,0,0,0"
-                                                            VerticalAlignment="Center" HorizontalAlignment="Right">
-                                                    <TextBlock Text="{Binding Countdown}" FontFamily="Consolas"
-                                                               FontSize="17" FontWeight="Bold"
-                                                               HorizontalAlignment="Right"
-                                                               Foreground="{Binding CountdownBrush}"/>
-                                                    <TextBlock Text="{Binding CountdownCaption}" FontSize="9.5"
-                                                               FontWeight="SemiBold" Foreground="#6B7382"
-                                                               HorizontalAlignment="Right" Margin="0,-1,1,0"/>
                                                 </StackPanel>
                                             </Grid>
                                         </Border>

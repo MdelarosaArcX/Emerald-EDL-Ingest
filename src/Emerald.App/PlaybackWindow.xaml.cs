@@ -120,17 +120,7 @@ public partial class PlaybackWindow : Window
         // It cannot make up a delay from a recording that already exists — the ring holds raw
         // frames and is allocated empty, and reaching back into the written files would be
         // playing a recording late, which is the design this feature deliberately is not.
-        DelayBox.ItemsSource = new[]
-        {
-            new DelayOption("No delay", TimeSpan.Zero),
-            new DelayOption("30 seconds", TimeSpan.FromSeconds(30)),
-            new DelayOption("1 minute", TimeSpan.FromMinutes(1)),
-            new DelayOption("2 minutes", TimeSpan.FromMinutes(2)),
-            new DelayOption("5 minutes", TimeSpan.FromMinutes(5)),
-        };
-
-        // A minute still, which is what tidal lock is for. No delay is a choice, not a default.
-        DelayBox.SelectedIndex = 2;
+        RenderDelayOptions();
 
         Log("Playback deck started.");
 
@@ -144,6 +134,7 @@ public partial class PlaybackWindow : Window
             Log("ffmpeg was not found - nothing can be decoded for the transmitter.", Level.Warn);
 
         TidalLock.Shared.Changed += OnTidalLockChanged;
+        PipelineState.Shared.Changed += OnPipelineChanged;
 
         _clock.Start();
         _loading = false;
@@ -336,11 +327,15 @@ public partial class PlaybackWindow : Window
 
         _clock.Stop();
         TidalLock.Shared.Changed -= OnTidalLockChanged;
+        PipelineState.Shared.Changed -= OnPipelineChanged;
 
         if (TidalLock.Shared.State != TidalLockState.Off)
             TidalLock.Shared.Disarm("Playback deck closed - tidal lock released.");
 
-        StopDelayedFeed();
+        // Not waited on. The card is let go of on a background thread, and a deck that hangs
+        // for five seconds on the way out is the same freeze this moved off the UI thread.
+        _ = StopDelayedFeed();
+
         _preview.Dispose();
         _playout?.Dispose();
 
@@ -522,6 +517,62 @@ public partial class PlaybackWindow : Window
         public override string ToString() => Label;
     }
 
+    private static readonly DelayOption NoDelay = new("No delay", TimeSpan.Zero);
+
+    private static readonly DelayOption[] RealDelays =
+    {
+        new("30 seconds", TimeSpan.FromSeconds(30)),
+        new("1 minute", TimeSpan.FromMinutes(1)),
+        new("2 minutes", TimeSpan.FromMinutes(2)),
+        new("5 minutes", TimeSpan.FromMinutes(5)),
+    };
+
+    /// <summary>
+    /// Fills the delay list, with "no delay" on it only while the capture deck is recording.
+    ///
+    /// No delay means the transmitter takes the receiver's frames as they arrive. That is the
+    /// right thing when re-arming part-way through a recording that is already running — the
+    /// programme is already a delay's worth old, and waiting out another fill would put black
+    /// to air for a minute over a feed that is there. With nothing recording it is not a
+    /// choice at all: there is no delay to inherit, so it would simply be a way to arm with no
+    /// safety on a feed that does not exist yet, which is not what anyone opens this for.
+    ///
+    /// It cannot make up a delay from a recording that already exists on disk either — the
+    /// ring holds raw frames and is allocated empty, and reaching back into the written files
+    /// would be playing a recording late, which is the design this feature deliberately is not.
+    /// </summary>
+    private void RenderDelayOptions()
+    {
+        bool recording = PipelineState.Shared.Recording;
+
+        DelayOption? chosen = DelayBox.SelectedItem as DelayOption;
+
+        var options = new List<DelayOption>(RealDelays.Length + 1);
+        if (recording) options.Add(NoDelay);
+        options.AddRange(RealDelays);
+
+        DelayBox.ItemsSource = options;
+
+        // A minute, which is what tidal lock is for. No delay is a choice, not a default — and
+        // a choice that has just stopped being offered falls back to one rather than to
+        // nothing selected at all.
+        DelayBox.SelectedItem = chosen is not null && options.Contains(chosen)
+            ? chosen
+            : options.First(o => o.Delay == TidalLock.DefaultDelay);
+    }
+
+    /// <summary>
+    /// The capture deck started or stopped recording, which decides whether "no delay" is on
+    /// offer. Arrives on whichever thread changed it.
+    /// </summary>
+    private void OnPipelineChanged() => Dispatcher.BeginInvoke(() =>
+    {
+        // Not while it is armed: the list is disabled then, and rewriting the selection under
+        // an operator who has already committed to a delay would change what they armed.
+        if (TidalLock.Shared.State == TidalLockState.Off) RenderDelayOptions();
+    });
+
+
     private TimeSpan SelectedDelay =>
         DelayBox.SelectedItem is DelayOption option ? option.Delay : TidalLock.DefaultDelay;
 
@@ -547,13 +598,19 @@ public partial class PlaybackWindow : Window
         return true;
     }
 
-    private void Arm_Click(object sender, RoutedEventArgs e)
+    private async void Arm_Click(object sender, RoutedEventArgs e)
     {
         if (TidalLock.Shared.State != TidalLockState.Off)
         {
+            // Said and drawn before the card is let go of, not after: the release can take as
+            // long as the card takes, and a button that appears to have done nothing until it
+            // finishes is a button an operator presses again.
             TidalLock.Shared.Disarm();
-            StopDelayedFeed();
             Log("Tidal lock disarmed.", Level.Warn);
+
+            ArmButton.IsEnabled = false;
+            await StopDelayedFeed();
+            ArmButton.IsEnabled = true;
             return;
         }
 
@@ -680,24 +737,15 @@ public partial class PlaybackWindow : Window
 
             case DelayPhase.Finished:
                 TidalLock.Shared.DrainComplete();
-                ClearDelayTransmitter();
+                StopDelayedFeed();
                 break;
 
             case DelayPhase.Failed:
                 TidalLock.Shared.Fail(status.Message.Length > 0 ? status.Message : "The delayed feed stopped.");
-                ClearDelayTransmitter();
+                StopDelayedFeed();
                 break;
         }
     });
-
-    private void ClearDelayTransmitter()
-    {
-        if (_delayTx is null) return;
-
-        _delayTx.Status -= OnDelayStatus;
-        _delayTx.Dispose();
-        _delayTx = null;
-    }
 
     private void RenderTidalLock()
     {
@@ -720,6 +768,10 @@ public partial class PlaybackWindow : Window
         ArmButton.Content = lockState.State == TidalLockState.Off ? "ARM TIDAL LOCK" : "DISARM TIDAL LOCK";
         DelayBox.IsEnabled = lockState.State == TidalLockState.Off;
 
+        // Coming back to off is the moment "no delay" can start or stop being on offer: the
+        // capture deck may have rolled while this was armed.
+        if (lockState.State == TidalLockState.Off) RenderDelayOptions();
+
         // Which of the three steps is live. The one still to be done by the operator is lit;
         // arming and then waiting for a window that is not this one is the mistake worth
         // designing against.
@@ -735,25 +787,57 @@ public partial class PlaybackWindow : Window
     /// does not come through here, because a whole delay's worth of programme is still in the
     /// line and has not been transmitted yet.
     /// </summary>
-    private void StopDelayedFeed()
+    /// <summary>
+    /// Lets go of the delayed feed without freezing the deck.
+    ///
+    /// Stopping means joining the transmitter's thread, and that thread spends nearly all of
+    /// its life inside the card's blocking slot call — it only comes back when the card is
+    /// ready for another frame, and a card that has stopped taking them does not come back at
+    /// all. Doing that on the UI thread stopped the whole application dead for the five-second
+    /// join, twice over once <see cref="DelayTransmitter.Dispose"/> joined it again, which is
+    /// what "not responding" on DISARM was.
+    ///
+    /// The field is cleared first, so the deck is already disarmed as far as anything else is
+    /// concerned while the card is still being let go of in the background.
+    /// </summary>
+    private Task StopDelayedFeed()
     {
-        if (_delayTx is null) return;
+        if (_delayTx is not { } transmitter) return Task.CompletedTask;
 
-        _delayTx.Stop();
-        ClearDelayTransmitter();
+        _delayTx = null;
+        transmitter.Status -= OnDelayStatus;
+
+        return Task.Run(() =>
+        {
+            try
+            {
+                transmitter.Dispose();
+            }
+            catch (Exception ex)
+            {
+                // Nothing here is worth taking the application down for: the operator has
+                // already been told the feed is off, and this is the card being let go of.
+                ActivityLog.Shared.Warn(LogSource.Playback,
+                    $"The delayed feed did not shut down cleanly: {ex.Message}",
+                    @event: "delay.stopfailed");
+            }
+        });
     }
 
     // ------------------------------------------------------------------ output
 
-    private void StopOutput_Click(object sender, RoutedEventArgs e)
+    private async void StopOutput_Click(object sender, RoutedEventArgs e)
     {
         Log("Stop requested - releasing the transmitter.", Level.Warn);
 
-        StopDelayedFeed();
-        _playout?.StopAll();
-
         if (TidalLock.Shared.State != TidalLockState.Off)
             TidalLock.Shared.Disarm("Output stopped by the operator.");
+
+        Task released = StopDelayedFeed();
+
+        _playout?.StopAll();
+
+        await released;
     }
 
     private void OnPlayoutProgress(PlayoutStatus status) => Dispatcher.BeginInvoke(() =>

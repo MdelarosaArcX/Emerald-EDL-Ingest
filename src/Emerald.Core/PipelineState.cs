@@ -36,6 +36,8 @@ public sealed class PipelineState
     private StageState _air = StageState.Idle;
     private StageState _ingest = StageState.Idle;
 
+    private bool _recording;
+
     /// <summary>Raised whenever any stage changes, on the caller's thread. Subscribers marshal.</summary>
     public event Action? Changed;
 
@@ -44,6 +46,29 @@ public sealed class PipelineState
     {
         get { lock (_gate) return _capture; }
         set { Set(ref _capture, value); }
+    }
+
+    /// <summary>
+    /// Whether the receiver is recording right now.
+    ///
+    /// <see cref="Capture"/> says the same thing in words, but words are for drawing and this
+    /// is asked as a question: the playback deck offers "no delay" only when there is already
+    /// a recording to take the delay against, because with nothing rolling it is an option to
+    /// put a feed to air that does not exist yet.
+    /// </summary>
+    public bool Recording
+    {
+        get { lock (_gate) return _recording; }
+        set
+        {
+            lock (_gate)
+            {
+                if (_recording == value) return;
+                _recording = value;
+            }
+
+            Changed?.Invoke();
+        }
     }
 
     /// <summary>The EDL queue: how many are waiting and what is cued.</summary>
@@ -84,7 +109,12 @@ public sealed class PipelineState
     /// Puts a stage back to idle. Called when a module closes, because a strip that kept
     /// showing a dead window's last state would be exactly the lie this design avoids.
     /// </summary>
-    public void ClearCapture() => Capture = StageState.Idle;
+    public void ClearCapture()
+    {
+        Recording = false;
+        Capture = StageState.Idle;
+    }
+
     public void ClearEdl() => Edl = StageState.Idle;
     public void ClearOnAir() => OnAir = StageState.Idle;
     public void ClearIngest() => Ingest = StageState.Idle;

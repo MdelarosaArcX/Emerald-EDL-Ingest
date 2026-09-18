@@ -931,6 +931,7 @@ public partial class ShellWindow : Window
 
         UpdateRecordUi();
 
+        PipelineState.Shared.Recording = true;
         PipelineState.Shared.Capture = new StageState(
             "RECORDING",
             $"{request.NamePrefix} - board {board.Index} {port.Name}",
@@ -978,23 +979,49 @@ public partial class ShellWindow : Window
     /// Lets go of the delay line. The transmitter keeps its own reference and goes on
     /// draining, so the last minute of the recording still reaches air.
     /// </summary>
+    /// <summary>
+    /// Hands back the delay ring.
+    ///
+    /// Everything here up to the notification is cheap and has to happen in order on the UI
+    /// thread. Letting go of the ring itself is neither: it joins the ring's own writer
+    /// thread and then deletes a file that is gigabytes long, and both decks share one
+    /// dispatcher — so doing it here froze the entire application, capture deck included,
+    /// for as long as the disk took. That is what DISARM did.
+    ///
+    /// The field is cleared first, so nothing can reach a line that is on its way out, and
+    /// the ring is reference counted: if the transmitter still holds it, this release only
+    /// drops the deck's claim and the last one out does the disposing.
+    /// </summary>
     private void ReleaseDelayLine()
     {
-        if (_delayLine is null) return;
+        if (_delayLine is not { } line) return;
 
-        _capture.Frame -= _delayLine.Offer;
-        _delayLine.Seal();
+        _delayLine = null;
+
+        _capture.Frame -= line.Offer;
+        line.Seal();
 
         // Said out loud rather than left in a counter. A ring that could not keep up has put
         // gaps in what went to air, and an operator who does not know that cannot act on it.
-        if (_delayLine.Fault is { } fault)
+        if (line.Fault is { } fault)
             SetStatus($"the delay line stopped: {fault}", true);
-        else if (_delayLine.Dropped > 0)
-            SetStatus($"the delay line dropped {_delayLine.Dropped} frame(s) - the disk could not keep up.", true);
+        else if (line.Dropped > 0)
+            SetStatus($"the delay line dropped {line.Dropped} frame(s) - the disk could not keep up.", true);
 
         TidalLock.Shared.RecordingStopped();
-        _delayLine.Release();
-        _delayLine = null;
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                line.Release();
+            }
+            catch (Exception ex)
+            {
+                ActivityLog.Shared.Warn(LogSource.Capture,
+                    $"The delay line did not close cleanly: {ex.Message}", @event: "delay.releasefailed");
+            }
+        });
     }
 
     private async void StopRecording()
@@ -1007,6 +1034,10 @@ public partial class ShellWindow : Window
 
         _airborneAudio = null;
         RefreshCaptureAudioState();
+
+        // The strip and the delay options both read this. A panel still saying RECORDING ten
+        // minutes after the deck stopped is the lie PipelineState exists to avoid.
+        PipelineState.Shared.ClearCapture();
 
         // Stop joins the capture thread so the encoder can finalise the file, which takes
         // long enough to be worth keeping off the UI thread.
@@ -1648,6 +1679,7 @@ public partial class ShellWindow : Window
             _recording = false;
             _airborneAudio = null;
             RefreshCaptureAudioState();
+            PipelineState.Shared.ClearCapture();
             _recordLimit = null;
             UpdateRecordUi();
             RefreshClips();

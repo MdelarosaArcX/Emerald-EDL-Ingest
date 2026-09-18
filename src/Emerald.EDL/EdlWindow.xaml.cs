@@ -39,28 +39,27 @@ public sealed class QueueRow : INotifyPropertyChanged
     public required bool OpenEnded { get; init; }
     public required int FrameRate { get; init; }
 
-    private string _countdown = "";
-    private string _caption = "";
-    private Brush _countdownBrush = Brushes.Transparent;
+    private string _cue = "";
+    private Brush _cueBrush = Brushes.Transparent;
 
-    /// <summary>The clock itself, as "T- 00:00:12:05". Empty on a row with nothing to count to.</summary>
-    public string Countdown
+    /// <summary>
+    /// The live half of the row: "cues in 00:00:12:05" while it waits, how much is left once
+    /// it is on air, and nothing at all on a row with nothing to count to.
+    ///
+    /// This is the countdown. It used to be a second clock in its own column while the words
+    /// beside the state said "cues in" and never moved — two numbers for one fact, one of them
+    /// wrong. The words are the clock now.
+    /// </summary>
+    public string Cue
     {
-        get => _countdown;
-        set { if (_countdown == value) { return; } _countdown = value; Notify(); }
+        get => _cue;
+        set { if (_cue == value) { return; } _cue = value; Notify(); }
     }
 
-    /// <summary>What it is counting to, under the clock — "to air", "on air until", "left".</summary>
-    public string CountdownCaption
+    public Brush CueBrush
     {
-        get => _caption;
-        set { if (_caption == value) { return; } _caption = value; Notify(); }
-    }
-
-    public Brush CountdownBrush
-    {
-        get => _countdownBrush;
-        set { if (ReferenceEquals(_countdownBrush, value)) { return; } _countdownBrush = value; Notify(); }
+        get => _cueBrush;
+        set { if (ReferenceEquals(_cueBrush, value)) { return; } _cueBrush = value; Notify(); }
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -1557,8 +1556,12 @@ public partial class EdlWindow : Window
             _ => ("FAILED", "Bad"),
         };
 
+        // A row that is waiting has its own live countdown beside the headline, so the
+        // engine's "cues in ..." — written once when the wait began and never moved after —
+        // is deliberately not shown. Anything else it has to say still is.
         string progress = e.State == EntryState.Playing
             ? $"  {new Timecode(e.FramesOut, e.Request.FrameRate)}"
+            : e.State is EntryState.Queued or EntryState.Cued ? ""
             : e.Detail.Length > 0 ? $"  ({e.Detail})" : "";
 
         return new QueueRow
@@ -1593,8 +1596,7 @@ public partial class EdlWindow : Window
         {
             if (!haveClock || row.FrameRate <= 0)
             {
-                row.Countdown = "";
-                row.CountdownCaption = "";
+                row.Cue = "";
                 continue;
             }
 
@@ -1607,9 +1609,8 @@ public partial class EdlWindow : Window
                 {
                     long frames = PlayoutService.FramesUntil(row.Start, now, row.FrameRate);
 
-                    row.Countdown = frames == 0 ? "ON AIR" : $"T- {new Timecode(frames, row.FrameRate)}";
-                    row.CountdownCaption = frames == 0 ? "starting" : "to air";
-                    row.CountdownBrush = Urgency(frames, row.FrameRate);
+                    row.Cue = frames == 0 ? "starting" : $"cues in {new Timecode(frames, row.FrameRate)}";
+                    row.CueBrush = Urgency(frames, row.FrameRate);
                     break;
                 }
 
@@ -1619,21 +1620,18 @@ public partial class EdlWindow : Window
                 {
                     long frames = PlayoutService.FramesUntil(row.Stop, now, row.FrameRate);
 
-                    row.Countdown = $"T- {new Timecode(frames, row.FrameRate)}";
-                    row.CountdownCaption = "left";
-                    row.CountdownBrush = Urgency(frames, row.FrameRate);
+                    row.Cue = $"{new Timecode(frames, row.FrameRate)} left";
+                    row.CueBrush = Urgency(frames, row.FrameRate);
                     break;
                 }
 
                 case EntryState.Playing:
-                    row.Countdown = "ON AIR";
-                    row.CountdownCaption = "open-ended";
-                    row.CountdownBrush = Brush("Ok");
+                    row.Cue = "open-ended";
+                    row.CueBrush = Brush("Ok");
                     break;
 
                 default:
-                    row.Countdown = "";
-                    row.CountdownCaption = "";
+                    row.Cue = "";
                     break;
             }
         }

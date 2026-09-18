@@ -437,9 +437,11 @@ public sealed class ActivityLog : IDisposable
 
                 bool wrote = false;
 
+                int taken = 0;
+
                 while (_pending.TryDequeue(out LogLine? line))
                 {
-                    Interlocked.Decrement(ref _pendingCount);
+                    taken++;
 
                     DateTime day = line.At.Date;
 
@@ -477,6 +479,12 @@ public sealed class ActivityLog : IDisposable
                 {
                     try { file?.Flush(); } catch (IOException) { }
                 }
+
+                // Counted down only now, after the batch is on the disk rather than as each
+                // line leaves the queue. Flush watches this number, and decrementing it first
+                // let it report a drain while the lines were still in the writer's hand — an
+                // export, or a test, would then read a file that did not have them yet.
+                if (taken > 0) Interlocked.Add(ref _pendingCount, -taken);
 
                 ReportDrops();
             }
