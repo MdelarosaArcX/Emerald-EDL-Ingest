@@ -25,6 +25,22 @@ public sealed record MonitorRow(
     Brush Accent,
     LogLine Line);
 
+/// <summary>One file under one message, flattened for the grid.</summary>
+public sealed record TransmittedRow(
+    string Group,
+    string Kind,
+    string Label,
+    string Channels,
+    string FileName,
+    string Path,
+    string State,
+    string Times,
+    string Last,
+    string Queued,
+    Brush KindBrush,
+    Brush StateBrush,
+    TransmittedFile File);
+
 /// <summary>
 /// Everything Emerald did, from the receiver to the transmitter, on one page.
 ///
@@ -80,6 +96,12 @@ public partial class MonitorWindow : Window
 
         LogList.ItemsSource = _rows;
 
+        // Grouped by the message. A CollectionView does the grouping, so the rows stay one
+        // flat virtualized list rather than a nest of ItemsControls.
+        var grouped = new System.Windows.Data.CollectionViewSource { Source = _transmitted };
+        grouped.GroupDescriptions.Add(new System.Windows.Data.PropertyGroupDescription(nameof(TransmittedRow.Group)));
+        TransmittedList.ItemsSource = grouped.View;
+
         SourceCombo.ItemsSource = new object[] { "All" }
             .Concat(Enum.GetValues<LogSource>().Cast<object>()).ToList();
         SourceCombo.SelectedIndex = 0;
@@ -87,7 +109,7 @@ public partial class MonitorWindow : Window
         LevelCombo.ItemsSource = Enum.GetValues<LogLevel>();
         LevelCombo.SelectedIndex = 0;
 
-        _drain.Tick += (_, _) => Drain();
+        _drain.Tick += (_, _) => DrainAndDraw();
         _strip.Tick += (_, _) => DrawStrip();
 
         Loaded += Window_Loaded;
@@ -102,15 +124,18 @@ public partial class MonitorWindow : Window
             ? $"writing to {folder}"
             : "not being written to disk";
 
-        // Everything that already happened, before the first new line arrives. Opening this
-        // half an hour into a session must not show a blank page.
+        // The whole of today off the disk, then everything still in memory. Opening this half
+        // an hour into a session must not show a blank page, and opening it at four must not
+        // claim nothing aired this morning.
+        LoadToday();
+
         foreach (LogLine line in ActivityLog.Shared.Snapshot()) _incoming.Enqueue(line);
 
         ActivityLog.Shared.Line += OnLine;
         PipelineState.Shared.Changed += OnPipelineChanged;
         TidalLock.Shared.Changed += OnTidalLockChanged;
 
-        Drain();
+        DrainAndDraw();
         DrawStrip();
 
         _drain.Start();
@@ -141,6 +166,11 @@ public partial class MonitorWindow : Window
 
         while (_incoming.TryDequeue(out LogLine? line))
         {
+            // Folded first, and regardless of the filters: the filters are a view of the log,
+            // and what went to air is not a matter of what is being looked at.
+            _tally.Add(line);
+            _tallyDirty = true;
+
             if (!Matches(line)) continue;
 
             _rows.Add(ToRow(line));
@@ -154,6 +184,12 @@ public partial class MonitorWindow : Window
         CountText.Text = $"ACTIVITY  ({_rows.Count} line{(_rows.Count == 1 ? "" : "s")} shown)";
 
         if (_following && _rows.Count > 0) LogList.ScrollIntoView(_rows[^1]);
+    }
+
+    private void DrainAndDraw()
+    {
+        Drain();
+        DrawTransmitted();
     }
 
     private MonitorRow ToRow(LogLine line) => new(
@@ -174,6 +210,124 @@ public partial class MonitorWindow : Window
             _ => "Text",
         }),
         Line: line);
+
+
+    // ------------------------------------------------------------------ what went to air
+
+    /// <summary>
+    /// The tally, folded from the record as lines arrive. It is never rebuilt from scratch on
+    /// a new line — the fold is cumulative and the same line twice changes nothing.
+    /// </summary>
+    private readonly TransmissionTally _tally = new();
+
+    private readonly ObservableCollection<TransmittedRow> _transmitted = new();
+
+    /// <summary>Set when the fold saw something the grid has not been told about yet.</summary>
+    private bool _tallyDirty;
+
+    private bool ShowingTransmitted => TransmittedTab.IsChecked == true;
+
+    /// <summary>
+    /// Loads the whole of today off the disk before the ring is replayed.
+    ///
+    /// The ring holds five thousand lines, which on a busy plant is an hour or two — opening
+    /// this at four in the afternoon and being told nothing went to air before three would be
+    /// a worse answer than none. The same lines then arrive again from the ring, and the fold
+    /// counts each transmission once regardless.
+    /// </summary>
+    private void LoadToday()
+    {
+        if (ActivityLog.Shared.Folder is not { } folder) return;
+
+        try
+        {
+            foreach (LogLine line in ActivityLog.ReadDay(folder, DateTime.Today)) _tally.Add(line);
+        }
+        catch (Exception ex)
+        {
+            // A day that will not load is worth saying, and is not worth refusing to open the
+            // page over: everything from this session is still in the ring.
+            ActivityLog.Shared.Warn(LogSource.App,
+                $"Today's record could not be read back for the transmitted view: {ex.Message}",
+                @event: "monitor.readfailed");
+        }
+
+        _tallyDirty = true;
+    }
+
+    /// <summary>
+    /// Rewrites the grid from the tally.
+    ///
+    /// Only when the transmitted view is the one being looked at, and only when the fold has
+    /// actually seen something — a page left open on the log while a message plays should not
+    /// be rebuilding a grid nobody can see forty times a second.
+    /// </summary>
+    private void DrawTransmitted()
+    {
+        if (!_tallyDirty || !ShowingTransmitted) return;
+
+        _tallyDirty = false;
+        _transmitted.Clear();
+
+        foreach ((TransmittedEdl edl, IReadOnlyList<TransmittedFile> files) in _tally.Rows())
+        {
+            string group = edl.Headline.Length > 0 ? edl.Headline : $"EDL {edl.EdlId}";
+
+            foreach (TransmittedFile file in files) _transmitted.Add(ToRow(group, file));
+        }
+
+        int aired = _transmitted.Count(r => r.File.Aired);
+
+        TransmittedCountText.Text =
+            $"TRANSMITTED  ({aired} of {_transmitted.Count} file(s) to air, " +
+            $"{_tally.EdlCount} message{(_tally.EdlCount == 1 ? "" : "s")})";
+    }
+
+    private TransmittedRow ToRow(string group, TransmittedFile file) => new(
+        Group: group,
+        Kind: file.Kind,
+        Label: file.IsVideo ? "" : file.Label,
+        Channels: file.Channels,
+        FileName: file.FileName,
+        Path: file.Path,
+        State: file.State,
+        Times: file.TimesText,
+        Last: file.LastAiredText,
+        Queued: file.Queued is { } at ? at.ToString("HH:mm:ss") : "-",
+        KindBrush: Brush(file.IsVideo ? "Text" : "Tc"),
+        StateBrush: Brush(file.Aired ? "Ok" : "Muted"),
+        File: file);
+
+    private void View_Changed(object sender, RoutedEventArgs e)
+    {
+        bool transmitted = ReferenceEquals(sender, TransmittedTab);
+
+        ActivityTab.IsChecked = !transmitted;
+        TransmittedTab.IsChecked = transmitted;
+
+        ActivityPanel.Visibility = transmitted ? Visibility.Collapsed : Visibility.Visible;
+        TransmittedPanel.Visibility = transmitted ? Visibility.Visible : Visibility.Collapsed;
+
+        // Switching to it is the moment to catch up on everything folded while it was hidden.
+        if (transmitted) { _tallyDirty = true; DrawTransmitted(); }
+    }
+
+    /// <summary>Opens the folder the file is in, which is what an operator wants from a file name.</summary>
+    private void TransmittedList_DoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (TransmittedList.SelectedItem is not TransmittedRow row) return;
+
+        try
+        {
+            if (System.IO.File.Exists(row.Path))
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{row.Path}\"")
+                { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            ActivityLog.Shared.Warn(LogSource.App, $"Could not open {row.FileName}: {ex.Message}");
+        }
+    }
 
     // ------------------------------------------------------------------ filtering
 

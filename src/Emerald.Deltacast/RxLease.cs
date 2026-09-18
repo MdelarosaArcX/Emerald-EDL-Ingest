@@ -1,3 +1,5 @@
+using Emerald.Core;
+
 namespace Emerald.Deltacast;
 
 /// <summary>Thrown when an RX channel is already claimed by something that will not give it up.</summary>
@@ -88,7 +90,24 @@ public sealed class RxLease : IDisposable
         // It must finish before the new owner opens the channel, so this is not fire-and-forget.
         if (displaced is not null)
         {
-            try { displaced._onRevoked?.Invoke(); } catch { /* a stuck claimant must not block the recorder */ }
+            ActivityLog.Shared.Info(LogSource.Board,
+                $"RX{channel} on board {board} taken by {owner}; {displaced.Owner} stood aside.",
+                @event: "rx.taken");
+
+            try
+            {
+                displaced._onRevoked?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                // A stuck claimant must not block the recorder — but it has just failed to
+                // close its stream, so the open that follows will fail as a hardware error
+                // with no apparent cause. This is that cause, said once, in the right order.
+                ActivityLog.Shared.Warn(LogSource.Board,
+                    $"{displaced.Owner} did not release RX{channel} on board {board} cleanly: " +
+                    ex.Message + " - the next open may fail.",
+                    @event: "rx.stuck");
+            }
         }
 
         return lease;

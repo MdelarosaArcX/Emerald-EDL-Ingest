@@ -412,7 +412,7 @@ public sealed class PlayoutService : IDisposable
         try
         {
             foreach (AudioTrack track in req.AudioTracks ?? Array.Empty<AudioTrack>())
-                beds.Add(new AudioBed(_ffmpegPath!, track, req.FrameRate));
+                beds.Add(new AudioBed(_ffmpegPath!, track, req.FrameRate, entry.Id, beds.Count));
 
             if (beds.Count > 0)
             {
@@ -795,7 +795,13 @@ public sealed class PlayoutService : IDisposable
                     _ => LogLevel.Info,
                 },
                 status.Message,
-                @event: $"playout.{status.State.ToString().ToLowerInvariant()}",
+                // A line that names a file is the moment that file reached the transmitter,
+                // and it is tagged for what it is. The tally on the monitoring page counts
+                // these rather than reading prose — the difference between a number that is
+                // right and one that is right until somebody rewords a message.
+                @event: status.CurrentFilePath is { Length: > 0 }
+                    ? "playout.video"
+                    : $"playout.{status.State.ToString().ToLowerInvariant()}",
                 correlation: status.EntryId,
                 file: status.CurrentFilePath);
         }
@@ -836,12 +842,18 @@ public sealed class PlayoutService : IDisposable
         /// <summary>A frame of silence, for a muted track. Never written to, so one is enough.</summary>
         public short[] Silence { get; }
 
-        public AudioBed(string ffmpegPath, AudioTrack track, int frameRate)
+        private readonly string? _entryId;
+        private readonly int _track;
+
+        public AudioBed(string ffmpegPath, AudioTrack track, int frameRate,
+                        string? entryId = null, int trackIndex = 0)
         {
             _ffmpegPath = ffmpegPath;
             _files = track.Files;
             _frameRate = frameRate;
             _streamIndex = track.StreamIndex;
+            _entryId = entryId;
+            _track = trackIndex;
             Label = track.Label;
 
             int samplesPerFrame = AudioSource.SampleRate / frameRate;
@@ -852,7 +864,26 @@ public sealed class PlayoutService : IDisposable
             _source = _files.Count > 0
                 ? AudioSource.Open(ffmpegPath, _files[0], frameRate, _streamIndex)
                 : AudioSource.Silent(frameRate);
+
+            if (_files.Count > 0) Announce(_files[0]);
         }
+
+        /// <summary>
+        /// One line for one audio file reaching the transmitter, under the same EDL as the
+        /// picture and with the track it belongs to named.
+        ///
+        /// A message can carry eight languages off eight different files and loop each of them
+        /// independently of the video, so "which audio went to air under this EDL" is not
+        /// answerable from the video line — every track needs its own record.
+        /// </summary>
+        private void Announce(string path) =>
+            ActivityLog.Shared.Info(LogSource.Playout,
+                $"Audio {_track + 1} \"{Label}\" on ch {_track * 2 + 1}-{_track * 2 + 2}: " +
+                Path.GetFileName(path),
+                @event: "playout.audio",
+                correlation: _entryId,
+                file: path,
+                detail: $"track {_track + 1}\nlabel {Label}\nchannels {_track * 2 + 1}-{_track * 2 + 2}");
 
         public void Advance(int offsetMs)
         {
@@ -870,6 +901,10 @@ public sealed class PlayoutService : IDisposable
             _index = (_index + 1) % _files.Count;
             _source = AudioSource.Open(_ffmpegPath, _files[_index], _frameRate, _streamIndex);
             _position = 0;
+
+            // Said on every roll, not only the first: a bed that wraps three times during a
+            // long message put three files to air, and the record should show three.
+            Announce(_files[_index]);
 
             // Disposal kills an ffmpeg process and joins the decoder thread, up to ~4 s.
             // Inline that would stall the play loop and drop frames, since PushFrame is

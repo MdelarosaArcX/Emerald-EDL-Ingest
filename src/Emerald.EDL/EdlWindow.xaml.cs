@@ -1293,14 +1293,19 @@ public partial class EdlWindow : Window
                  correlation: entry.Id,
                  detail: command.Id);
 
+        // Video and audio are tagged apart rather than sharing one "media" tag. The monitoring
+        // page lists a message's picture and each of its languages as separate things, because
+        // that is what they are: eight tracks off eight files, each looping on its own.
         foreach (string path in files ?? Array.Empty<string>())
             log.Info(LogSource.Edl, $"EDL {entry.Id} video: {Path.GetFileName(path)}",
-                     @event: "edl.media", correlation: entry.Id, file: path);
+                     @event: "edl.video", correlation: entry.Id, file: path);
 
-        foreach (AudioTrack track in tracks)
-            foreach (string path in track.Files)
-                log.Info(LogSource.Edl, $"EDL {entry.Id} audio \"{track.Label}\": {Path.GetFileName(path)}",
-                         @event: "edl.media", correlation: entry.Id, file: path);
+        for (int t = 0; t < tracks.Count; t++)
+            foreach (string path in tracks[t].Files)
+                log.Info(LogSource.Edl,
+                         $"EDL {entry.Id} audio {t + 1} \"{tracks[t].Label}\": {Path.GetFileName(path)}",
+                         @event: "edl.audio", correlation: entry.Id, file: path,
+                         detail: $"track {t + 1}\nlabel {tracks[t].Label}\nchannels {t * 2 + 1}-{t * 2 + 2}");
     }
 
     private PostPlay SelectedPostPlay =>

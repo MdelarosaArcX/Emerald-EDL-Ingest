@@ -89,6 +89,16 @@
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <!-- Two views of one record: everything in order, or only what reached the
+                         transmitter, gathered under the message that sent it. -->
+                    <ToggleButton x:Name="ActivityTab" Content="ACTIVITY" IsChecked="True"
+                                  Style="{StaticResource IpSmallToggle}" Height="26" Padding="12,0"
+                                  FontSize="11" Click="View_Changed"/>
+                    <ToggleButton x:Name="TransmittedTab" Content="TRANSMITTED"
+                                  Style="{StaticResource IpSmallToggle}" Height="26" Padding="12,0"
+                                  FontSize="11" Margin="4,0,14,0" Click="View_Changed"
+                                  ToolTip="Every file that has gone to air, per EDL"/>
+
                     <TextBlock Text="Source" Style="{StaticResource FieldLabel}" Margin="0,0,7,0"
                                VerticalAlignment="Center"/>
                     <ComboBox x:Name="SourceCombo" Width="120" SelectionChanged="Filter_Changed"/>
@@ -125,7 +135,7 @@
         </Border>
 
         <!-- ==================================================== the record -->
-        <Border Grid.Row="2" Style="{StaticResource Card}" Padding="0">
+        <Border x:Name="ActivityPanel" Grid.Row="2" Style="{StaticResource Card}" Padding="0">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
@@ -207,6 +217,134 @@
                                         <TextBlock Text="{Binding Message}"
                                                    Foreground="{Binding Accent}"
                                                    TextTrimming="CharacterEllipsis"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+            </Grid>
+        </Border>
+
+        <!-- ==================================================== what went to air, per message -->
+        <Border x:Name="TransmittedPanel" Grid.Row="2" Style="{StaticResource Card}" Padding="0"
+                Visibility="Collapsed">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <Grid Grid.Row="0" Margin="14,10,14,8">
+                    <TextBlock x:Name="TransmittedCountText" Style="{StaticResource SectionHeader}"
+                               Margin="0"/>
+                    <TextBlock x:Name="TransmittedHintText" Style="{StaticResource Hint}"
+                               HorizontalAlignment="Right" Margin="0"
+                               Text="Picture and each language are separate rows - they go to air on their own."/>
+                </Grid>
+
+                <!-- Grouped by the message rather than sorted by it: an operator asking what a
+                     command put out wants its picture and all eight of its languages together,
+                     not interleaved with everything else that aired that hour. -->
+                <ListView x:Name="TransmittedList" Grid.Row="1" Margin="6,0,6,6"
+                          Background="Transparent" BorderThickness="0"
+                          SelectionMode="Single"
+                          ItemContainerStyle="{StaticResource LogGridRow}"
+                          Foreground="{StaticResource Muted}"
+                          MouseDoubleClick="TransmittedList_DoubleClick"
+                          ScrollViewer.IsDeferredScrollingEnabled="False"
+                          VirtualizingPanel.IsVirtualizing="True"
+                          VirtualizingPanel.VirtualizationMode="Recycling">
+                    <ListView.GroupStyle>
+                        <GroupStyle>
+                            <GroupStyle.HeaderTemplate>
+                                <DataTemplate>
+                                    <Border Background="#141922" Padding="9,5" Margin="0,8,0,2"
+                                            CornerRadius="3">
+                                        <TextBlock Text="{Binding Name}" FontFamily="Consolas"
+                                                   FontSize="11.5" FontWeight="Bold"
+                                                   Foreground="{StaticResource Tc}"
+                                                   TextTrimming="CharacterEllipsis"/>
+                                    </Border>
+                                </DataTemplate>
+                            </GroupStyle.HeaderTemplate>
+                        </GroupStyle>
+                    </ListView.GroupStyle>
+
+                    <ListView.View>
+                        <GridView AllowsColumnReorder="False"
+                                  ColumnHeaderContainerStyle="{StaticResource LogGridHeader}">
+                            <GridViewColumn Header="Kind" Width="82">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Kind}" FontSize="10"
+                                                   FontWeight="Bold"
+                                                   Foreground="{Binding KindBrush}"
+                                                   VerticalAlignment="Center"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="Track" Width="130">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Label}" Foreground="#7C8AA0"
+                                                   TextTrimming="CharacterEllipsis"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="Ch" Width="52">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Channels}" Foreground="#6B7382"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="File" Width="330">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding FileName}"
+                                                   Foreground="{StaticResource Text}"
+                                                   ToolTip="{Binding Path}"
+                                                   TextTrimming="CharacterEllipsis"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="State" Width="72">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding State}" FontSize="10"
+                                                   FontWeight="Bold"
+                                                   Foreground="{Binding StateBrush}"
+                                                   VerticalAlignment="Center"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="To air" Width="86">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Times}" Foreground="#6B7382"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="Last" Width="86">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Last}"
+                                                   Foreground="{StaticResource Tc}"/>
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+
+                            <GridViewColumn Header="Queued" Width="86">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Queued}" Foreground="#6B7382"/>
                                     </DataTemplate>
                                 </GridViewColumn.CellTemplate>
                             </GridViewColumn>

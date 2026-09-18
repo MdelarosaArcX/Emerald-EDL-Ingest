@@ -223,6 +223,59 @@ public sealed class ActivityLogTests : IDisposable
         Assert.Contains("tail me", reader.ReadToEnd());
     }
 
+
+    /// <summary>
+    /// The transmitted view loads the whole day back off the disk, so what was written has to
+    /// come back as what it was — the tags and the correlation especially, since the tally
+    /// keys on them and a null id would scatter a message's files across separate headings.
+    /// </summary>
+    [Fact]
+    public void A_day_written_comes_back_off_the_disk_as_it_went_on()
+    {
+        using ActivityLog log = New();
+
+        log.StartWriting(_folder, retentionDays: 14);
+        log.Info(LogSource.Edl, "queued", @event: "edl.queued", correlation: "a1b2c3d4");
+        log.Ok(LogSource.Playout, "playing", @event: "playout.video",
+               correlation: "a1b2c3d4", file: @"C:\m\promo.mov", detail: "track 1\nlabel English");
+        Drain(log);
+
+        LogLine[] back = ActivityLog.ReadDay(_folder, DateTime.Today);
+
+        Assert.Equal(2, back.Length);
+        Assert.Equal("edl.queued", back[0].Event);
+        Assert.Equal("a1b2c3d4", back[1].Correlation);
+        Assert.Equal(@"C:\m\promo.mov", back[1].File);
+        Assert.Equal(LogSource.Playout, back[1].Source);
+        Assert.Equal(LogLevel.Ok, back[1].Level);
+        Assert.Equal("track 1\nlabel English", back[1].Detail);
+    }
+
+    [Fact]
+    public void A_day_with_no_record_reads_back_as_nothing_rather_than_throwing()
+    {
+        Assert.Empty(ActivityLog.ReadDay(_folder, DateTime.Today.AddDays(-9)));
+    }
+
+    /// <summary>A crash leaves a half-written last line. The rest of the day is still good.</summary>
+    [Fact]
+    public void A_torn_line_is_skipped_and_the_rest_of_the_day_survives()
+    {
+        using ActivityLog log = New();
+
+        log.StartWriting(_folder, retentionDays: 14);
+        log.Info(LogSource.App, "whole");
+        Drain(log);
+        log.Dispose();
+
+        File.AppendAllText(TodaysFile(), "{\"Seq\":99,\"Message\":\"tor" + Environment.NewLine);
+
+        LogLine[] back = ActivityLog.ReadDay(_folder, DateTime.Today);
+
+        Assert.Single(back);
+        Assert.Equal("whole", back[0].Message);
+    }
+
     // ------------------------------------------------------------------ retention sweep
 
     [Fact]

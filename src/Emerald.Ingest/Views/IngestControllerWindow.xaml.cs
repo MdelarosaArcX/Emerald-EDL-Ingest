@@ -905,8 +905,26 @@ public partial class IngestControllerWindow : Window
         LogScroller.ScrollToEnd();
     }
 
-    private void Log(string message, IngestLogLevel level = IngestLogLevel.Info) =>
+    /// <summary>
+    /// Says something, on this panel and into the application record.
+    ///
+    /// This was the last panel in Emerald talking only to itself. The jobs themselves went
+    /// through <see cref="IngestLog"/> and were written down; the controller's own narration —
+    /// no board with an RX channel, a missing audio file, the timecode generator being
+    /// repointed for every module — was not, and vanished when the window closed.
+    /// </summary>
+    private void Log(string message, IngestLogLevel level = IngestLogLevel.Info)
+    {
+        ActivityLog.Shared.Write(LogSource.Ingest, level switch
+        {
+            IngestLogLevel.Ok => LogLevel.Ok,
+            IngestLogLevel.Warn => LogLevel.Warn,
+            IngestLogLevel.Error => LogLevel.Error,
+            _ => LogLevel.Info,
+        }, message);
+
         Append(new IngestLogEntry(DateTime.Now, message, level));
+    }
 
     private void ClearLog_Click(object sender, RoutedEventArgs e) => _log.Clear();
 

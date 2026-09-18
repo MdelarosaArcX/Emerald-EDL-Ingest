@@ -78,6 +78,24 @@ public sealed class TidalLock
     /// <summary>Raised on the caller's thread whenever anything above changes.</summary>
     public event Action<TidalLock>? Changed;
 
+    /// <summary>
+    /// Writes the transition down and then tells whoever is listening, in that order and both
+    /// outside the lock.
+    ///
+    /// The lock used to narrate only through <see cref="Changed"/>, which meant the record of
+    /// it was whatever a subscriber happened to write — and the only subscriber that wrote
+    /// anything was the playback deck. Close that window and a delay that never reached air
+    /// left no trace anywhere, which is the one thing about this feature nobody can afford to
+    /// be unable to reconstruct afterwards.
+    /// </summary>
+    private void Announce(TidalLockState state, LogLevel level)
+    {
+        ActivityLog.Shared.Write(LogSource.TidalLock, level, Detail,
+                                 @event: $"tidallock.{state.ToString().ToLowerInvariant()}");
+
+        Changed?.Invoke(this);
+    }
+
     // ------------------------------------------------------------------ the countdown
 
     /// <summary>Frames the recorder has put into the line.</summary>
@@ -128,7 +146,7 @@ public sealed class TidalLock
             Detail = $"Armed - waiting for the capture deck to record. {Describe(Delay)} behind.";
         }
 
-        Changed?.Invoke(this);
+        Announce(TidalLockState.Armed, LogLevel.Ok);
     }
 
     public void Disarm(string reason = "Tidal lock released.")
@@ -142,7 +160,7 @@ public sealed class TidalLock
             Detail = reason;
         }
 
-        Changed?.Invoke(this);
+        Announce(TidalLockState.Off, LogLevel.Warn);
     }
 
     /// <summary>
@@ -169,7 +187,7 @@ public sealed class TidalLock
                 : $"Recording rolled; on air once {Describe(Delay)} has been buffered.";
         }
 
-        Changed?.Invoke(this);
+        Announce(TidalLockState.CountingDown, LogLevel.Ok);
     }
 
     /// <summary>The delayed feed has reached the transmitter.</summary>
@@ -183,7 +201,7 @@ public sealed class TidalLock
             Detail = $"On air, {Describe(Delay)} behind the receiver.";
         }
 
-        Changed?.Invoke(this);
+        Announce(TidalLockState.OnAir, LogLevel.Ok);
     }
 
     public void Fail(string detail)
@@ -196,7 +214,7 @@ public sealed class TidalLock
             Detail = detail;
         }
 
-        Changed?.Invoke(this);
+        Announce(TidalLockState.Failed, LogLevel.Error);
     }
 
     /// <summary>
@@ -210,6 +228,8 @@ public sealed class TidalLock
     /// </summary>
     public void RecordingStopped()
     {
+        TidalLockState stopped;
+
         lock (_gate)
         {
             switch (_state)
@@ -230,9 +250,11 @@ public sealed class TidalLock
                 default:
                     return;
             }
+
+            stopped = _state;
         }
 
-        Changed?.Invoke(this);
+        Announce(stopped, LogLevel.Warn);
     }
 
     /// <summary>The line has run out; the last of the recording has been transmitted.</summary>
@@ -249,7 +271,7 @@ public sealed class TidalLock
             Detail = "The delay has played out - armed again, waiting for the next recording.";
         }
 
-        Changed?.Invoke(this);
+        Announce(TidalLockState.Armed, LogLevel.Ok);
     }
 
     /// <summary>Frames of delay at a given rate.</summary>

@@ -606,7 +606,7 @@ public partial class PlaybackWindow : Window
             // long as the card takes, and a button that appears to have done nothing until it
             // finishes is a button an operator presses again.
             TidalLock.Shared.Disarm();
-            Log("Tidal lock disarmed.", Level.Warn);
+            Show("Tidal lock disarmed.", Level.Warn);
 
             ArmButton.IsEnabled = false;
             await StopDelayedFeed();
@@ -632,17 +632,19 @@ public partial class PlaybackWindow : Window
 
         switch (lockState.State)
         {
+            // Shown, not logged: the lock writes its own transitions into the record, and
+            // logging them here would say everything twice.
             case TidalLockState.CountingDown:
-                Log(lockState.Detail, Level.Ok);
+                Show(lockState.Detail, Level.Ok);
                 StartDelayTransmitter(lockState);
                 break;
 
             case TidalLockState.Failed:
-                Log(lockState.Detail, Level.Error);
+                Show(lockState.Detail, Level.Error);
                 break;
 
             default:
-                Log(lockState.Detail);
+                Show(lockState.Detail);
                 break;
         }
     });
@@ -968,7 +970,35 @@ public partial class PlaybackWindow : Window
 
     private enum Level { Info, Ok, Warn, Error }
 
+    /// <summary>
+    /// Says something, on this panel and into the application record.
+    ///
+    /// The deck used to talk only to itself: four hundred lines that existed until the window
+    /// closed, and nothing about arming, disarming, taking the transmitter or putting a clip
+    /// to air ever reached the monitoring page. Everything an operator does here touches the
+    /// output, so all of it belongs in the record.
+    /// </summary>
     private void Log(string message, Level level = Level.Info)
+    {
+        ActivityLog.Shared.Write(LogSource.Playback, level switch
+        {
+            Level.Ok => LogLevel.Ok,
+            Level.Warn => LogLevel.Warn,
+            Level.Error => LogLevel.Error,
+            _ => LogLevel.Info,
+        }, message);
+
+        Show(message, level);
+    }
+
+    /// <summary>
+    /// Puts a line on this panel and nowhere else.
+    ///
+    /// For things already written down by whoever owns them — tidal lock narrates its own
+    /// transitions from inside Core now — where going through <see cref="Log"/> would put the
+    /// same sentence in the record twice.
+    /// </summary>
+    private void Show(string message, Level level = Level.Info)
     {
         Brush brush = level switch
         {

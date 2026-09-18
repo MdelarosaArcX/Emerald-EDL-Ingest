@@ -132,6 +132,9 @@ public sealed class ActivityLog : IDisposable
     private readonly object _ringGate = new();
     private readonly Queue<LogLine> _ring = new(RingSize);
 
+    /// <summary>1 once Dispose has run, so a second call is a no-op rather than a throw.</summary>
+    private int _stopped;
+
     private readonly ConcurrentQueue<LogLine> _pending = new();
     private readonly AutoResetEvent _wake = new(false);
 
@@ -275,6 +278,51 @@ public sealed class ActivityLog : IDisposable
     public void Clear()
     {
         lock (_ringGate) _ring.Clear();
+    }
+
+    /// <summary>
+    /// Reads a day back off the disk, oldest first.
+    ///
+    /// The ring holds five thousand lines, which on a busy plant is an hour or two. Anything
+    /// that wants to answer a question about the whole day — what went to air this morning,
+    /// which clip a message used before lunch — has to come back here for it.
+    ///
+    /// Opened <see cref="FileShare.ReadWrite"/> so it reads the file Emerald is still writing
+    /// to, and a line that will not parse is skipped rather than throwing: a half-written last
+    /// line is what a crash leaves behind, and the rest of the day is still good.
+    /// </summary>
+    public static LogLine[] ReadDay(string folder, DateTime day)
+    {
+        var lines = new List<LogLine>();
+
+        for (int index = 0; index < 100; index++)
+        {
+            string path = Path.Combine(folder, Name(day, index));
+
+            if (!File.Exists(path)) break;
+
+            try
+            {
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                                  FileShare.ReadWrite);
+                using var reader = new StreamReader(stream);
+
+                while (reader.ReadLine() is { } text)
+                {
+                    if (text.Length == 0) continue;
+
+                    try
+                    {
+                        if (JsonSerializer.Deserialize<LogLine>(text, Json) is { } line) lines.Add(line);
+                    }
+                    catch (JsonException) { /* a torn line; the rest of the day still counts */ }
+                }
+            }
+            catch (IOException) { break; }
+            catch (UnauthorizedAccessException) { break; }
+        }
+
+        return lines.ToArray();
     }
 
     private static string? Trim(string? detail) =>
@@ -556,8 +604,17 @@ public sealed class ActivityLog : IDisposable
               @event: "log.dropped");
     }
 
+    /// <summary>
+    /// Stops the writer and lets go of the handles.
+    ///
+    /// Safe to call twice, as Dispose is required to be: closing a window that owns one and
+    /// then letting a using block close it again threw on the second pass, because the wait
+    /// handle had already gone.
+    /// </summary>
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
+
         _cts?.Cancel();
         _wake.Set();
 

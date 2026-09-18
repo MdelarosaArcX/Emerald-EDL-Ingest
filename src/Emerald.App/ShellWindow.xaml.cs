@@ -243,6 +243,17 @@ public partial class ShellWindow : Window
             ? scan.Error
             : $"VideoMaster {scan.ApiVersionString} - {_boards.Count} board{(_boards.Count == 1 ? "" : "s")}";
 
+        // A deck with no boards is a deck that cannot record, and why is the first question
+        // asked about it. The playback deck has always written this down; this one did not.
+        if (scan.Error is { } problem)
+            ActivityLog.Shared.Error(LogSource.Board, $"Boards could not be scanned: {problem}",
+                                     @event: "board.scanfailed");
+        else
+            ActivityLog.Shared.Info(LogSource.Board,
+                $"VideoMaster {scan.ApiVersionString}, {_boards.Count} board(s): " +
+                $"{(_boards.Count == 0 ? "none" : string.Join(", ", _boards.Select(b => $"{b.Index} {b.Model}")))}.",
+                @event: "board.scanned");
+
         // Come up on whatever the operator last recorded from, and only on a board that can
         // actually receive: the preview and the recorder share one receiver, so showing a
         // different one by default would be misleading.
@@ -318,13 +329,37 @@ public partial class ShellWindow : Window
         }
     }
 
+    /// <summary>
+    /// The line under the picture — and, when it is a problem, the record as well.
+    ///
+    /// This label is where the capture deck says everything that went wrong: no receiver
+    /// selected, a folder it cannot write to, a recording the settings would not build, the
+    /// delay line dropping frames because the disk could not keep up. All of it was on screen
+    /// and nowhere else, so the deck could refuse to record and leave nothing behind at all —
+    /// no <c>capture.started</c>, no explanation, a gap where a recording should have been.
+    ///
+    /// Only the problems. The ordinary case is a caption that changes as the operator moves
+    /// around the deck, and writing that down would bury the record in narration.
+    /// </summary>
     private void SetStatus(string text, bool problem)
     {
         _previewNote = text;
         PreviewStatus.Text = text;
         PreviewStatus.Foreground = (Brush)FindResource(problem ? "Warn" : "IpMuted");
         SourceDescriptionText.Text = text;
+
+        // Repeats are dropped: some of these are set from the half-second tick, and the same
+        // sentence once a second for an hour is not a record of anything.
+        if (!problem || text == _lastProblem) return;
+
+        _lastProblem = text;
+
+        ActivityLog.Shared.Warn(LogSource.Capture, text, @event: "capture.problem",
+                                correlation: _recording ? _capture.SessionId : null);
     }
+
+    /// <summary>The last problem written down, so a repeated one is not written down again.</summary>
+    private string _lastProblem = "";
 
     private void OnPreviewFrame(WriteableBitmap bitmap)
     {
@@ -1379,7 +1414,19 @@ public partial class ShellWindow : Window
         Task.Run(() => StorageWarden.Enforce(folder, limit, DateTime.UtcNow))
             .ContinueWith(t =>
             {
-                if (t.IsFaulted || !t.Result.DidAnything) return;
+                // A sweep that threw means the limit is not being enforced and the store keeps
+                // growing. The successful case has always been written down; the failure
+                // mattered more and was not.
+                if (t.IsFaulted)
+                {
+                    ActivityLog.Shared.Error(LogSource.Media,
+                        $"The storage limit could not be enforced: " +
+                        $"{t.Exception?.GetBaseException().Message}",
+                        @event: "media.limitfailed", file: folder);
+                    return;
+                }
+
+                if (!t.Result.DidAnything) return;
 
                 StorageSweep sweep = t.Result;
 

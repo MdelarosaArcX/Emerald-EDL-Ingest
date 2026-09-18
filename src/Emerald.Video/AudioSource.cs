@@ -1,3 +1,4 @@
+using Emerald.Core;
 using System.Diagnostics;
 using System.IO;
 
@@ -49,8 +50,15 @@ public sealed class AudioSource : IDisposable
 
     public int SamplesPerFrame { get; }
 
-    private AudioSource(Process? ffmpeg, int samplesPerFrame)
+    /// <summary>The file being decoded and ffmpeg's last complaints, for explaining a silence.</summary>
+    private readonly string? _path;
+    private readonly Func<string>? _complaints;
+
+    private AudioSource(Process? ffmpeg, int samplesPerFrame,
+                        string? path = null, Func<string>? complaints = null)
     {
+        _path = path;
+        _complaints = complaints;
         _ffmpeg = ffmpeg;
         _output = ffmpeg?.StandardOutput.BaseStream;
         SamplesPerFrame = samplesPerFrame;
@@ -110,15 +118,40 @@ public sealed class AudioSource : IDisposable
         info.ArgumentList.Add("pipe:1");
 
         Process? ffmpeg;
+        string? why = null;
+
         try { ffmpeg = Process.Start(info); }
-        catch { ffmpeg = null; }
+        catch (Exception ex) { ffmpeg = null; why = ex.Message; }
 
-        if (ffmpeg is null) return Silent(frameRate);
+        if (ffmpeg is null)
+        {
+            // A track that will not decode becomes silence on air. That used to happen without
+            // a word anywhere, which makes "why was that language silent?" a question with no
+            // answer after the fact.
+            ActivityLog.Shared.Error(LogSource.Playout,
+                $"Audio could not be decoded and will be silent: {Path.GetFileName(mediaPath)}" +
+                (why is null ? "." : $" - {why}"),
+                @event: "playout.audiofailed", file: mediaPath);
 
-        ffmpeg.ErrorDataReceived += (_, _) => { };
+            return Silent(frameRate);
+        }
+
+        // ffmpeg's own account of a file it could not read. Kept to the last few lines and
+        // only said if the track then produces nothing, so a working decode stays quiet.
+        var complaints = new System.Collections.Concurrent.ConcurrentQueue<string>();
+
+        ffmpeg.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is not { Length: > 0 }) return;
+
+            complaints.Enqueue(e.Data);
+            while (complaints.Count > 4) complaints.TryDequeue(out string? _dropped);
+        };
+
         ffmpeg.BeginErrorReadLine();
 
-        return new AudioSource(ffmpeg, samplesPerFrame);
+        return new AudioSource(ffmpeg, samplesPerFrame, mediaPath,
+                               () => string.Join(" | ", complaints));
     }
 
     // ------------------------------------------------------------------ decoding
@@ -153,7 +186,21 @@ public sealed class AudioSource : IDisposable
 
             if (filled == 0)
             {
-                lock (_gate) _endOfStream = true;
+                bool silent;
+                lock (_gate) { _endOfStream = true; silent = _written == 0; }
+
+                // It ended having produced nothing. That is a track that will be silent on
+                // air, and ffmpeg has usually just said why on its stderr.
+                if (silent && _path is not null)
+                {
+                    string said = _complaints?.Invoke() ?? "";
+
+                    ActivityLog.Shared.Error(LogSource.Playout,
+                        $"Audio decoded to nothing and will be silent: {Path.GetFileName(_path)}" +
+                        (said.Length == 0 ? "." : $" - ffmpeg said: {said}"),
+                        @event: "playout.audiofailed", file: _path);
+                }
+
                 return;
             }
 
