@@ -957,6 +957,12 @@ public partial class ShellWindow : Window
             correlation: _capture.SessionId,
             detail: ProfileNote.Text);
 
+        // From here the store is watched for each segment as it is finished, and every one
+        // is written down with its length and its size under this session.
+        _segments = new SegmentWatch(folder, request.NamePrefix, _recordStartedUtc);
+        _segmentSession = _capture.SessionId;
+        _segmentRate = SelectedRate();
+
         _recording = true;
 
         // What ffmpeg was actually handed. From here the rows can say which of them are in
@@ -1141,6 +1147,12 @@ public partial class ShellWindow : Window
             file: result.Request.Folder,
             detail: $"frames {result.Frames}\nformat {result.Format?.Name ?? "unknown"}\n" +
                     $"folder {result.Request.Folder}\nreached limit {result.ReachedFrameLimit}");
+
+        // The encoder has closed its files, so the last segment is on the disk now and this
+        // is the one look that can see it. Then the watch is done with.
+        AnnounceSegments();
+        _segments = null;
+        _segmentSession = null;
 
         _captureFormat = null;
 
@@ -1437,6 +1449,66 @@ public partial class ShellWindow : Window
             }, TaskScheduler.Default);
     }
 
+
+    // ------------------------------------------------------------------ segments
+
+    /// <summary>
+    /// Watches the store for each segment as ffmpeg finishes it, so the record can say what
+    /// was actually written: two minutes, this many bytes, both halves. Null between
+    /// recordings.
+    /// </summary>
+    private SegmentWatch? _segments;
+
+    /// <summary>The session the watch belongs to, so its lines are filed under the right recording.</summary>
+    private string? _segmentSession;
+
+    /// <summary>
+    /// The rate the recording rolled at, kept here because the last look happens on the
+    /// capture thread when the encoder finishes, and a combo box cannot be read from there.
+    /// </summary>
+    private int _segmentRate = 25;
+
+    /// <summary>
+    /// Announces every segment that has been finished since the last look.
+    ///
+    /// Off the UI thread: each unfinished candidate costs an open and a few reads, and the
+    /// master index lists a folder. Small, but not something the clock tick should wait on.
+    /// Nothing here reads a control, because the last call comes from the capture thread.
+    /// </summary>
+    private void AnnounceSegments()
+    {
+        if (_segments is not { } watch) return;
+
+        int rate = _segmentRate;
+        string? session = _segmentSession;
+
+        Task.Run(() =>
+        {
+            foreach (CompletedSegment segment in watch.Poll())
+            {
+                string length = segment.Duration is { } d
+                    ? new Timecode((long)Math.Round(d.TotalSeconds * rate), rate).ToString()
+                    : "unknown length";
+
+                string master = segment.MasterPath is null
+                    ? "no master"
+                    : $"master {CompletedSegment.Size(segment.MasterBytes)}";
+
+                ActivityLog.Shared.Ok(LogSource.Capture,
+                    $"Segment {segment.Number} written: {segment.Name} - {length}, " +
+                    $"proxy {CompletedSegment.Size(segment.ProxyBytes)}, {master}, " +
+                    $"{CompletedSegment.Size(segment.TotalBytes)} in all.",
+                    @event: "capture.segment",
+                    correlation: session,
+                    file: segment.MasterPath ?? segment.ProxyPath,
+                    detail: $"segment {segment.Number}\n" +
+                            $"duration {segment.Duration?.TotalSeconds:F2} s\n" +
+                            $"proxy {segment.ProxyPath}\nproxy bytes {segment.ProxyBytes}\n" +
+                            $"master {segment.MasterPath ?? "-"}\nmaster bytes {segment.MasterBytes}");
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ added audio tracks
 
     private readonly ObservableCollection<CaptureAudioRow> _captureAudio = new();
@@ -1717,6 +1789,7 @@ public partial class ShellWindow : Window
             _storageTicks = 0;
             EnforceStorageLimit();
             ShowStorage();
+            AnnounceSegments();
         }
 
         // The recorder can also stop on its own - a failed start, or a signal that never

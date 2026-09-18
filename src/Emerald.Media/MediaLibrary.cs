@@ -121,7 +121,7 @@ public static class MediaLibrary
     /// Built once per listing rather than searched per proxy: a thousand proxies each scanning
     /// a thousand masters is a million comparisons for an answer that is the same every time.
     /// </summary>
-    private sealed class MasterIndex
+    internal sealed class MasterIndex
     {
         private readonly Dictionary<string, string> _byName = new(StringComparer.OrdinalIgnoreCase);
         private readonly List<(DateTime Stamp, string Path)> _byTime = new();

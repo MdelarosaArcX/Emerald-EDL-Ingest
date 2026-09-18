@@ -179,6 +179,106 @@ public static class MediaCodec
         return Encoding.ASCII.GetString(head[12..16]);
     }
 
+
+    // ------------------------------------------------------------------ duration
+
+    /// <summary>
+    /// How long the file plays for, from the movie header — or null when the file is not a
+    /// QuickTime-family container or has not finished being written.
+    ///
+    /// The same walk as the codec, for the same reason: ffprobe is two hundred milliseconds
+    /// a file and this is eight, and it is asked on every tick of the deck while recording.
+    /// Null for an unfinished file is the useful answer rather than a failure — the movie
+    /// header is written last, so its absence is exactly what "still being recorded" looks
+    /// like from the outside.
+    /// </summary>
+    public static TimeSpan? ReadDuration(string path)
+    {
+        try
+        {
+            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            return FindMvhd(file, 0, file.Length, 0);
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+        catch (NotSupportedException) { return null; }
+    }
+
+    private static TimeSpan? FindMvhd(Stream file, long start, long end, int depth)
+    {
+        if (depth > MaxDepth) return null;
+
+        long at = start;
+        Span<byte> header = stackalloc byte[16];
+
+        while (at + 8 <= end)
+        {
+            file.Position = at;
+            if (!Fill(file, header[..8])) return null;
+
+            long size = BinaryPrimitives.ReadUInt32BigEndian(header);
+            string type = Encoding.ASCII.GetString(header[4..8]);
+            long body = at + 8;
+
+            if (size == 1)
+            {
+                if (!Fill(file, header[8..16])) return null;
+                size = (long)BinaryPrimitives.ReadUInt64BigEndian(header[8..16]);
+                body += 8;
+            }
+            else if (size == 0)
+            {
+                size = end - at;
+            }
+
+            if (size < 8 || at + size > end) return null;
+
+            if (type == "mvhd") return MovieDuration(file, body);
+
+            if (type == "moov")
+            {
+                if (FindMvhd(file, body, at + size, depth + 1) is { } found) return found;
+            }
+
+            at += size;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Version 0 lays out creation, modification, timescale and duration as four 32-bit
+    /// words; version 1 widens the two times and the duration to 64 bits. The timescale is
+    /// 32 bits in both.
+    /// </summary>
+    private static TimeSpan? MovieDuration(Stream file, long body)
+    {
+        file.Position = body;
+
+        Span<byte> head = stackalloc byte[32];
+        if (!Fill(file, head)) return null;
+
+        byte version = head[0];
+
+        uint timescale;
+        ulong duration;
+
+        if (version == 1)
+        {
+            timescale = BinaryPrimitives.ReadUInt32BigEndian(head[20..24]);
+            duration = BinaryPrimitives.ReadUInt64BigEndian(head[24..32]);
+        }
+        else
+        {
+            timescale = BinaryPrimitives.ReadUInt32BigEndian(head[12..16]);
+            duration = BinaryPrimitives.ReadUInt32BigEndian(head[16..20]);
+        }
+
+        if (timescale == 0) return null;
+
+        return TimeSpan.FromSeconds(duration / (double)timescale);
+    }
+
     private static bool Fill(Stream file, Span<byte> into)
     {
         int read = 0;
