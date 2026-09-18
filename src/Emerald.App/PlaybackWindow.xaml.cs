@@ -677,7 +677,8 @@ public partial class PlaybackWindow : Window
 
         try
         {
-            _delayTx = new DelayTransmitter(board!.Index, port!.Index, line, lockState.Delay);
+            _delayTx = new DelayTransmitter(board!.Index, port!.Index, line, lockState.Delay,
+                                            _settings.RecordingSegmentSeconds);
         }
         catch (DelayLineException ex)
         {

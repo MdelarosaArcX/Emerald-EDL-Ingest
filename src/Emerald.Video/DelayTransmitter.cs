@@ -73,11 +73,18 @@ public sealed class DelayTransmitter : IDisposable
     public event Action<DelayStatus>? Status;
 
     /// <summary>
+    /// How many frames the recorder cuts each file at, so the pump can say which part of
+    /// the recording is reaching air. Zero means it does not know and says nothing about it.
+    /// </summary>
+    private readonly long _segmentFrames;
+
+    /// <summary>
     /// Throws <see cref="DelayLineException"/> when the receiver's format cannot be
     /// transmitted as it stands. Checked here as well as at arming time, because this is the
     /// last point before the card is opened and nothing beyond it can refuse safely.
     /// </summary>
-    public DelayTransmitter(uint boardIndex, int txChannel, DelayLine line, TimeSpan delay)
+    public DelayTransmitter(uint boardIndex, int txChannel, DelayLine line, TimeSpan delay,
+                            int segmentSeconds = 0)
     {
         if (!DelayFormats.TryMatch(line.Format, out VideoFormat? format, out string? problem))
             throw new DelayLineException(problem!);
@@ -87,6 +94,7 @@ public sealed class DelayTransmitter : IDisposable
         _line = line;
         _format = format!;
         _delay = delay;
+        _segmentFrames = segmentSeconds > 0 ? (long)segmentSeconds * _format.FrameRate : 0;
 
         _line.AddRef();
     }
@@ -134,6 +142,8 @@ public sealed class DelayTransmitter : IDisposable
         DelayFrameBuffer? onAir = null;
 
         long readSeq = 0;
+        long segmentOnAir = 0;
+        bool firstPictureSaid = false;
         var phase = DelayPhase.Opening;
 
         try
@@ -218,6 +228,10 @@ public sealed class DelayTransmitter : IDisposable
 
                 if (!PushWithAudio(output, into)) return;
 
+                // The frame just sent is readSeq frames into the recording. What that means
+                // for the operator is said here, before the counters move on.
+                AnnounceRecordingPosition(readSeq, ref segmentOnAir);
+
                 onAir = into;
                 next ^= 1;
                 readSeq++;
@@ -231,11 +245,22 @@ public sealed class DelayTransmitter : IDisposable
                     readSeq++;
                 }
 
+                // The first time is the one the operator is waiting for: the recording has
+                // reached the transmitter. Coming back on air after a hold is not that, and
+                // is said as what it is.
+                string onAirText = firstPictureSaid
+                    ? "On air."
+                    : $"On air: the first picture of the recording is now on TX{_txChannel} of " +
+                      $"board {_boardIndex}, {Describe(_delay)} behind the receiver. " +
+                      "The playback deck's RX is showing it.";
+
                 Announce(ref phase, _line.IsSealed ? DelayPhase.Draining : DelayPhase.OnAir,
                     _line.IsSealed
                         ? $"Playing out the last {Math.Max(0, _line.SealedAt - readSeq)} frames."
-                        : "On air.",
+                        : onAirText,
                     written);
+
+                if (phase == DelayPhase.OnAir) firstPictureSaid = true;
 
                 // Once a second, so the countdown and the frame count on screen keep up
                 // without the log being buried.
@@ -257,6 +282,60 @@ public sealed class DelayTransmitter : IDisposable
             _line.Release();
         }
     }
+
+
+    // ------------------------------------------------------------------ where in the recording
+
+    /// <summary>
+    /// The segment a frame belongs to, when it is a new one — or null when it is the same
+    /// segment as last time, the first (which the on-air line announces), or the segment
+    /// length is not known.
+    ///
+    /// Pure, and public, for the same reason <see cref="DelayPacer.Decide"/> is: the pump
+    /// cannot run without a card, and what it says on air should be checkable without one.
+    /// <paramref name="segmentOnAir"/> is the caller's memory of the last one announced and
+    /// is moved on here, so a resync that jumps forward announces once rather than once per
+    /// segment skipped.
+    /// </summary>
+    public static long? SegmentReached(long readSeq, long segmentFrames, ref long segmentOnAir)
+    {
+        if (segmentFrames <= 0) return null;
+
+        long segment = readSeq / segmentFrames + 1;
+        if (segment <= segmentOnAir) return null;
+
+        segmentOnAir = segment;
+
+        return segment == 1 ? null : segment;
+    }
+
+    /// <summary>
+    /// Says when the next segment's worth of the recording reaches the transmitter.
+    ///
+    /// The operator asked for this in exactly these terms: the first picture goes to air, and
+    /// then every two minutes the next file's worth of it does. The frame just sent is
+    /// <paramref name="readSeq"/> frames into the recording, and the recorder cuts a file
+    /// every <see cref="_segmentFrames"/>, so crossing a multiple of that is the next segment
+    /// arriving at the TX — and at the playback deck's RX, which is looking at the TX.
+    ///
+    /// Said in the recording's own time rather than by file name, because ffmpeg cuts on a
+    /// keyframe near the boundary rather than on it, and a name the operator then cannot find
+    /// on the disk is worse than a time they can.
+    /// </summary>
+    private void AnnounceRecordingPosition(long readSeq, ref long segmentOnAir)
+    {
+        if (SegmentReached(readSeq, _segmentFrames, ref segmentOnAir) is not { } segment) return;
+
+        var from = new Timecode((segment - 1) * _segmentFrames, _format.FrameRate);
+
+        ActivityLog.Shared.Ok(LogSource.TidalLock,
+            $"Segment {segment} of the recording (from {from}) is now going to air on " +
+            $"TX{_txChannel} of board {_boardIndex}. The playback deck's RX is showing it.",
+            @event: "delay.segment",
+            detail: $"segment {segment}\nfrom {from}\nframe {readSeq}");
+    }
+
+    private static string Describe(TimeSpan delay) => TidalLock.Describe(delay);
 
     // ------------------------------------------------------------------ audio
 
