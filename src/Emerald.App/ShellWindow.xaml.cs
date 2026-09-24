@@ -1010,6 +1010,10 @@ public partial class ShellWindow : Window
 
         _capture.Frame += _delayLine.Offer;
 
+        // So the ledger on the monitoring page can say how many frames the ring turned away.
+        DelayLine ring = _delayLine;
+        _capture.ReportDelayDrops(() => ring.Dropped);
+
         // The station clock is reported, not depended on: the countdown runs off frames in
         // the line, so a timecode outage does not stop the delay.
         Timecode? rolledAt = _timecode.TryGetCurrent(out Timecode now) ? now : null;
@@ -1040,6 +1044,7 @@ public partial class ShellWindow : Window
         _delayLine = null;
 
         _capture.Frame -= line.Offer;
+        _capture.ReportDelayDrops(null);
         line.Seal();
 
         // Said out loud rather than left in a counter. A ring that could not keep up has put
@@ -1490,14 +1495,21 @@ public partial class ShellWindow : Window
                     ? new Timecode((long)Math.Round(d.TotalSeconds * rate), rate).ToString()
                     : "unknown length";
 
-                string master = segment.MasterPath is null
-                    ? "no master"
-                    : $"master {CompletedSegment.Size(segment.MasterBytes)}";
+                // Name, size and where it is, in the line itself: the operator asked for all
+                // three to be readable without opening the detail. One line for each half,
+                // because they are two files in two folders and either can be the one wanted.
+                string proxyName = Path.GetFileName(segment.ProxyPath);
+                string proxyWhere = Path.GetDirectoryName(segment.ProxyPath) ?? "";
+
+                string master = segment.MasterPath is { } m
+                    ? $"master {Path.GetFileName(m)} {CompletedSegment.Size(segment.MasterBytes)} " +
+                      $"in {Path.GetDirectoryName(m)}"
+                    : "no master";
 
                 ActivityLog.Shared.Ok(LogSource.Capture,
-                    $"Segment {segment.Number} written: {segment.Name} - {length}, " +
-                    $"proxy {CompletedSegment.Size(segment.ProxyBytes)}, {master}, " +
-                    $"{CompletedSegment.Size(segment.TotalBytes)} in all.",
+                    $"SAVED segment {segment.Number} - {length}: " +
+                    $"proxy {proxyName} {CompletedSegment.Size(segment.ProxyBytes)} in {proxyWhere}; " +
+                    $"{master}; {CompletedSegment.Size(segment.TotalBytes)} in all.",
                     @event: "capture.segment",
                     correlation: session,
                     file: segment.MasterPath ?? segment.ProxyPath,

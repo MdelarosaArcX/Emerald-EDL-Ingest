@@ -109,6 +109,15 @@ public sealed class SdiCapture : IDisposable
     /// <summary>How many frames have been taken off the receiver so far, for a progress display.</summary>
     public long FramesRecorded => Interlocked.Read(ref _framesRecorded);
 
+    /// <summary>
+    /// Asks the delay ring how many frames it could not take, for the ledger. Set by whoever
+    /// attaches a ring; null when there is none. A function rather than a number so the
+    /// recorder never holds a reference to a ring that has been released.
+    /// </summary>
+    private Func<long>? _delayDrops;
+
+    public void ReportDelayDrops(Func<long>? drops) => Volatile.Write(ref _delayDrops, drops);
+
     private long _framesRecorded;
 
     /// <summary>
@@ -319,6 +328,8 @@ public sealed class SdiCapture : IDisposable
             using var audioQueue = new BlockingCollection<byte[]>(AudioQueueDepth);
 
             long dropped = 0;
+            long droppedSaid = 0;
+            long droppedSaidAt = 0;
 
             var videoWriter = new Thread(() =>
             {
@@ -483,8 +494,32 @@ public sealed class SdiCapture : IDisposable
                     VideoMasterHD.VHD_UnlockSlotHandle(slot);
                 }
 
+                // Once a second, the counts go where the monitoring page reads them: what came
+                // off the receiver, and what did not make it to the encoder or the ring.
+                if (frames % format.FrameRate == 0)
+                    PipelineState.Shared.SetRecorded(frames, dropped, _delayDrops?.Invoke() ?? 0);
+
+                // A drop is said the moment it happens, not thirty seconds later in a count. At
+                // most one line every five seconds, so a disk that is falling over does not
+                // fill the record with the news that it is still falling over.
+                if (dropped > droppedSaid && Environment.TickCount64 - droppedSaidAt > 5000)
+                {
+                    ActivityLog.Shared.Warn(LogSource.Capture,
+                        $"DROP  {dropped - droppedSaid} frame(s) not encoded at frame {frames} " +
+                        $"({new Timecode(frames, format.FrameRate)}) - the encoder could not keep up " +
+                        $"({dropped} dropped so far).",
+                        @event: "capture.dropped", correlation: SessionId,
+                        detail: $"frame {frames}\ndropped now {dropped - droppedSaid}\ndropped total {dropped}");
+
+                    droppedSaid = dropped;
+                    droppedSaidAt = Environment.TickCount64;
+                }
+
+                // The frame count is the recorder's own, so this is exact: the frames actually
+                // taken off the receiver, not an elapsed time. Dropped ones are said separately.
                 if (frames > 0 && frames % (format.FrameRate * 30) == 0)
-                    Report($"Capture: {new Timecode(frames, format.FrameRate)} recorded");
+                    Report($"REC   {request.NamePrefix} - {new Timecode(frames, format.FrameRate)} " +
+                           $"({frames} frames{(dropped > 0 ? $", {dropped} dropped" : "")})");
             }
 
             framesTaken = frames;

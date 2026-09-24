@@ -191,3 +191,24 @@ public class TransmissionTallyTests
         Assert.Equal("EDL first queued", rows[0].Edl.Headline);
     }
 }
+
+public class TransmissionTallyScriptTests
+{
+    private static LogLine Line(string @event, string? file) =>
+        new(1, DateTimeOffset.Now, null, LogSource.Playout, LogLevel.Info, "", @event, "a1b2c3d4", file);
+
+    /// <summary>
+    /// The script writes a PLAY line and an END line for every file, both naming it. Only the
+    /// first is the file reaching air; counting the second would double every transmission.
+    /// </summary>
+    [Fact]
+    public void A_file_ending_is_not_a_second_transmission()
+    {
+        var tally = new TransmissionTally();
+
+        tally.Add(Line("playout.video", @"C:\m\promo.mov"));
+        tally.Add(Line("playout.videoend", @"C:\m\promo.mov"));
+
+        Assert.Equal(1, tally.Flat().Single().Times);
+    }
+}

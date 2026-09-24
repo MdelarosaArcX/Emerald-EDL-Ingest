@@ -265,7 +265,10 @@ public sealed class DelayTransmitter : IDisposable
                 // Once a second, so the countdown and the frame count on screen keep up
                 // without the log being buried.
                 if (Counters.FramesOut % _format.FrameRate == 0)
+                {
                     Report(phase, "", written);
+                    PublishCounts(readSeq, written);
+                }
             }
         }
         catch (SdiOutputException ex)
@@ -280,9 +283,53 @@ public sealed class DelayTransmitter : IDisposable
         {
             output?.Dispose();
             _line.Release();
+            PipelineState.Shared.ClearAired();
         }
     }
 
+
+
+    // ------------------------------------------------------------------ the ledger
+
+    private long _repeatsSaid, _skipsSaid, _troubleSaidAt;
+
+    /// <summary>
+    /// Once a second: the counts to the monitoring page, and a warning if the transmitter has
+    /// had to repeat or skip since it last said so.
+    ///
+    /// A repeat is a frame that went out twice because nothing new had arrived — the picture
+    /// froze for a frame. A skip is a frame that never went out, dropped to bring the delay
+    /// back. Both are the operator's business the moment they happen, and both are said with
+    /// the frame of the recording they happened at, rate-limited to one line every five
+    /// seconds so a receiver that has gone away does not narrate every frame of its absence.
+    /// </summary>
+    private void PublishCounts(long readSeq, long written)
+    {
+        PipelineState.Shared.SetAired(Counters.FramesOut, Counters.Repeats, Counters.Skips, Counters.Resyncs);
+
+        long repeats = Counters.Repeats - _repeatsSaid;
+        long skips = Counters.Skips - _skipsSaid;
+
+        if (repeats == 0 && skips == 0) return;
+        if (Environment.TickCount64 - _troubleSaidAt < 5000) return;
+
+        _troubleSaidAt = Environment.TickCount64;
+        _repeatsSaid = Counters.Repeats;
+        _skipsSaid = Counters.Skips;
+
+        var at = new Timecode(readSeq, _format.FrameRate);
+
+        ActivityLog.Shared.Warn(LogSource.TidalLock,
+            $"DROP  on air at frame {readSeq} of the recording ({at}): " +
+            (skips > 0 ? $"{skips} frame(s) skipped to hold the delay" : "") +
+            (skips > 0 && repeats > 0 ? ", " : "") +
+            (repeats > 0 ? $"{repeats} frame(s) repeated because nothing new had arrived" : "") +
+            $". {Counters.FramesOut} out of {written} recorded so far; {Counters}.",
+            @event: "delay.trouble",
+            detail: $"frame {readSeq}\nskipped now {skips}\nrepeated now {repeats}\n" +
+                    $"skipped total {Counters.Skips}\nrepeated total {Counters.Repeats}\n" +
+                    $"resyncs {Counters.Resyncs}\naired {Counters.FramesOut}\nrecorded {written}");
+    }
 
     // ------------------------------------------------------------------ where in the recording
 

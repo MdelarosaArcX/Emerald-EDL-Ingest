@@ -422,10 +422,63 @@ public partial class MonitorWindow : Window
         Show(AirHeadline, AirDetail, state.OnAir);
         Show(IngestHeadline, IngestDetail, state.Ingest);
         Show(DelayHeadline, DelayDetail, Delay());
+        DrawFrames();
 
         RecordText.Text = ActivityLog.Shared.Dropped > 0
             ? $"{ActivityLog.Shared.Dropped} line(s) dropped"
             : "";
+    }
+
+
+    /// <summary>
+    /// The two frame counts, one under each side, so a drop reads as a number rather than
+    /// being suspected from a picture.
+    ///
+    /// Under CAPTURE: what the recorder took, and what it could not hand on. Under TIDAL LOCK:
+    /// what went out against what was recorded — the difference should be the delay and
+    /// nothing else — and every repeat and skip on the way. Red the moment anything is lost.
+    /// </summary>
+    private void DrawFrames()
+    {
+        FrameLedger frames = PipelineState.Shared.Frames;
+        TidalLock lockState = TidalLock.Shared;
+
+        if (frames.Recorded == 0 && !PipelineState.Shared.Recording)
+        {
+            CaptureFrames.Text = "";
+        }
+        else
+        {
+            CaptureFrames.Text =
+                $"{frames.Recorded:N0} frames" +
+                (frames.NotEncoded > 0 ? $"  ·  {frames.NotEncoded:N0} NOT ENCODED" : "  ·  0 dropped") +
+                (frames.NotDelayed > 0 ? $"  ·  {frames.NotDelayed:N0} NOT DELAYED" : "");
+
+            CaptureFrames.Foreground = Brush(frames.LostToDisk > 0 ? "Bad" : "Tc");
+        }
+
+        if (lockState.State is TidalLockState.Off or TidalLockState.Armed || frames.Aired == 0)
+        {
+            DelayFrames.Text = "";
+            return;
+        }
+
+        // The delay itself accounts for exactly this many frames not yet being out. Anything
+        // beyond it is a frame that was recorded and is not going to air.
+        long delay = lockState.Line?.TargetFrames ?? 0;
+        long behind = Math.Max(0, frames.Recorded - frames.Aired - delay);
+
+        DelayFrames.Text =
+            $"{frames.Aired:N0} out of {frames.Recorded:N0}  ·  delay {delay:N0}" +
+            (behind > 0 ? $"  ·  {behind:N0} BEHIND" : "") +
+            (frames.Skipped > 0 ? $"  ·  {frames.Skipped:N0} SKIPPED" : "") +
+            (frames.Repeated > 0 ? $"  ·  {frames.Repeated:N0} repeated" : "") +
+            (frames.Resyncs > 0 ? $"  ·  {frames.Resyncs} resync" : "") +
+            (frames.Skipped == 0 && frames.Repeated == 0 && behind == 0 ? "  ·  no drops" : "");
+
+        DelayFrames.Foreground = Brush(frames.Skipped > 0 || behind > 0 ? "Bad"
+                                     : frames.Repeated > 0 ? "Warn"
+                                     : "Tc");
     }
 
     /// <summary>

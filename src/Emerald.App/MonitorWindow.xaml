@@ -41,6 +41,9 @@
                             <TextBlock Text="CAPTURE" Style="{StaticResource StageLabel}"/>
                             <TextBlock x:Name="CaptureHeadline" Style="{StaticResource StageHeadline}"/>
                             <TextBlock x:Name="CaptureDetail" Style="{StaticResource StageDetail}"/>
+                            <!-- The recorder's own frame count, and what it could not hand on. -->
+                            <TextBlock x:Name="CaptureFrames" FontFamily="Consolas" FontSize="11"
+                                       Foreground="{StaticResource Tc}" Margin="0,4,0,0"/>
                         </StackPanel>
                     </Border>
 
@@ -49,6 +52,9 @@
                             <TextBlock Text="TIDAL LOCK" Style="{StaticResource StageLabel}"/>
                             <TextBlock x:Name="DelayHeadline" Style="{StaticResource StageHeadline}"/>
                             <TextBlock x:Name="DelayDetail" Style="{StaticResource StageDetail}"/>
+                            <!-- Frames out against frames recorded, so a drop is a number. -->
+                            <TextBlock x:Name="DelayFrames" FontFamily="Consolas" FontSize="11"
+                                       Foreground="{StaticResource Tc}" Margin="0,4,0,0"/>
                         </StackPanel>
                     </Border>
 

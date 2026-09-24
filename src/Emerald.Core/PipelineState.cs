@@ -7,6 +7,36 @@ public readonly record struct StageState(string Headline, string Detail, LogLeve
 }
 
 /// <summary>
+/// The frame counts on both sides of the plant, so a drop can be seen as a number rather than
+/// suspected from a picture.
+///
+/// <see cref="Recorded"/> is the recorder's own count of frames taken off the receiver.
+/// <see cref="NotEncoded"/> is how many of those never reached the encoder because it could
+/// not keep up; <see cref="NotDelayed"/> the same for the delay ring. On the other side,
+/// <see cref="Aired"/> is what the transmitter has actually sent, <see cref="Repeated"/> how
+/// often it had nothing new and held the last picture, and <see cref="Skipped"/> how many
+/// frames it dropped to shed drift. A plant with nothing wrong reads: aired = recorded minus
+/// the delay, everything else zero.
+/// </summary>
+public readonly record struct FrameLedger(
+    long Recorded,
+    long NotEncoded,
+    long NotDelayed,
+    long Aired,
+    long Repeated,
+    long Skipped,
+    long Resyncs)
+{
+    public static readonly FrameLedger Empty = default;
+
+    /// <summary>Frames lost on the way to the disk.</summary>
+    public long LostToDisk => NotEncoded;
+
+    /// <summary>Frames that existed at the receiver and were never put to air.</summary>
+    public long LostToAir => NotDelayed + Skipped;
+}
+
+/// <summary>
 /// The plant right now, from the receiver to the transmitter.
 ///
 /// The monitoring page answers two different questions and they need two different things.
@@ -37,6 +67,8 @@ public sealed class PipelineState
     private StageState _ingest = StageState.Idle;
 
     private bool _recording;
+
+    private FrameLedger _frames;
 
     /// <summary>Raised whenever any stage changes, on the caller's thread. Subscribers marshal.</summary>
     public event Action? Changed;
@@ -69,6 +101,42 @@ public sealed class PipelineState
 
             Changed?.Invoke();
         }
+    }
+
+
+    /// <summary>
+    /// The frame counts, read on the strip\x27s timer. Written once a second by each side, and
+    /// deliberately without raising <see cref="Changed"/>: two writers a second across every
+    /// subscriber would be a lot of redrawing for a number the timer picks up anyway.
+    /// </summary>
+    public FrameLedger Frames
+    {
+        get { lock (_gate) return _frames; }
+    }
+
+    /// <summary>The recorder\x27s side: what it has taken and what it could not hand on.</summary>
+    public void SetRecorded(long recorded, long notEncoded, long notDelayed)
+    {
+        lock (_gate)
+            _frames = _frames with { Recorded = recorded, NotEncoded = notEncoded, NotDelayed = notDelayed };
+    }
+
+    /// <summary>The transmitter\x27s side: what went out, and what it had to do to keep up.</summary>
+    public void SetAired(long aired, long repeated, long skipped, long resyncs)
+    {
+        lock (_gate)
+            _frames = _frames with { Aired = aired, Repeated = repeated, Skipped = skipped, Resyncs = resyncs };
+    }
+
+    /// <summary>A recording has ended; the next one starts its count from nothing.</summary>
+    public void ClearRecorded()
+    {
+        lock (_gate) _frames = _frames with { Recorded = 0, NotEncoded = 0, NotDelayed = 0 };
+    }
+
+    public void ClearAired()
+    {
+        lock (_gate) _frames = _frames with { Aired = 0, Repeated = 0, Skipped = 0, Resyncs = 0 };
     }
 
     /// <summary>The EDL queue: how many are waiting and what is cued.</summary>
@@ -113,6 +181,7 @@ public sealed class PipelineState
     {
         Recording = false;
         Capture = StageState.Idle;
+        ClearRecorded();
     }
 
     public void ClearEdl() => Edl = StageState.Idle;

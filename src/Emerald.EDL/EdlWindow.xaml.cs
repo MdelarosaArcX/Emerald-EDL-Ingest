@@ -1287,8 +1287,9 @@ public partial class EdlWindow : Window
         ActivityLog log = ActivityLog.Shared;
 
         log.Info(LogSource.Edl,
-                 $"EDL {entry.Id} queued - {DescribeSources(files, tracks)}, " +
-                 $"starts {entry.Request.Start}, {entry.DurationLabel}.",
+                 $"QUEUE {DescribeSources(files, tracks)} - EDL {entry.Id} on TX{entry.Request.TxChannel}, " +
+                 $"starts {entry.Request.Start}, {entry.DurationLabel}" +
+                 (entry.Request.SeekOffset > TimeSpan.Zero ? $", SOM {entry.Request.Som}" : "") + ".",
                  @event: "edl.queued",
                  correlation: entry.Id,
                  detail: command.Id);
@@ -1297,13 +1298,14 @@ public partial class EdlWindow : Window
         // page lists a message's picture and each of its languages as separate things, because
         // that is what they are: eight tracks off eight files, each looping on its own.
         foreach (string path in files ?? Array.Empty<string>())
-            log.Info(LogSource.Edl, $"EDL {entry.Id} video: {Path.GetFileName(path)}",
+            log.Info(LogSource.Edl, $"VIDEO {Path.GetFileName(path)} - picture of EDL {entry.Id}.",
                      @event: "edl.video", correlation: entry.Id, file: path);
 
         for (int t = 0; t < tracks.Count; t++)
             foreach (string path in tracks[t].Files)
                 log.Info(LogSource.Edl,
-                         $"EDL {entry.Id} audio {t + 1} \"{tracks[t].Label}\": {Path.GetFileName(path)}",
+                         $"AUDIO {Path.GetFileName(path)} - track {t + 1} \"{tracks[t].Label}\" of EDL {entry.Id}, " +
+                         $"ch {t * 2 + 1}-{t * 2 + 2}.",
                          @event: "edl.audio", correlation: entry.Id, file: path,
                          detail: $"track {t + 1}\nlabel {tracks[t].Label}\nchannels {t * 2 + 1}-{t * 2 + 2}");
     }

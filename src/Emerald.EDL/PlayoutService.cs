@@ -28,7 +28,14 @@ public sealed record PlayoutStatus(
     long? FramesTotal = null,
     string? CurrentFile = null,
     string? EntryId = null,
-    string? CurrentFilePath = null);
+    string? CurrentFilePath = null,
+
+    /// <summary>
+    /// The tag the record files this under, when the state alone is not it. A file reaching
+    /// air and a file ending are both "playing" as far as the deck is concerned and are not
+    /// the same event to anything counting transmissions.
+    /// </summary>
+    string? Event = null);
 
 /// <summary>
 /// One selectable audio track — a language — and the files behind it.
@@ -361,6 +368,32 @@ public sealed class PlayoutService : IDisposable
         }
     }
 
+    /// <summary>
+    /// What a message is made of, by file name, for the cue line: the picture and every
+    /// language named, because a cue sheet that says "message a1b2c3d4" says nothing to
+    /// the person reading it back.
+    /// </summary>
+    private static string DescribeMedia(PlayoutEntry entry)
+    {
+        PlayoutRequest req = entry.Request;
+        var parts = new List<string>();
+
+        if (req.VideoFiles is { Count: > 0 } video)
+            parts.Add(video.Count == 1
+                ? Path.GetFileName(video[0])
+                : $"{Path.GetFileName(video[0])} +{video.Count - 1} more");
+
+        if (req.AudioTracks is { Count: > 0 } audio)
+            parts.Add($"{audio.Count} audio: " +
+                      string.Join(", ", audio.Select(t => $"\"{t.Label}\"")));
+
+        return parts.Count == 0 ? $"message {entry.Id}" : string.Join(" + ", parts);
+    }
+
+    /// <summary>The station clock as text, for stamping a script line. Dashes when there is none.</summary>
+    private string Station() =>
+        _timecode.TryGetCurrent(out Timecode now) ? now.ToString() : "--:--:--:--";
+
     private PlayoutEntry? TakeNextQueued()
     {
         lock (_gate) return _entries.FirstOrDefault(e => e.State == EntryState.Queued);
@@ -400,9 +433,11 @@ public sealed class PlayoutService : IDisposable
         long framesOut;
 
         Report(new PlayoutStatus(PlayoutState.Playing,
-            target is { } t
-                ? $"Playing out TX{req.TxChannel} for {new Timecode(t, req.FrameRate)} (stops at {entry.StopLabel})."
-                : $"Playing out TX{req.TxChannel}, looping until stopped.",
+            $"START {DescribeMedia(entry)} - TX{req.TxChannel} of board {req.BoardIndex} at station " +
+            $"{Station()}, " +
+            (target is { } t
+                ? $"for {new Timecode(t, req.FrameRate)} ({t} frames), stops at {entry.StopLabel}."
+                : "looping until stopped."),
             0, target));
 
         // Beds are opened after the cue, so audio starts with the first frame of the message
@@ -423,10 +458,10 @@ public sealed class PlayoutService : IDisposable
                     beds.Select((b, i) => $"ch {i * 2 + 1}-{i * 2 + 2} \"{b.Label}\""));
 
                 Report(new PlayoutStatus(PlayoutState.Playing,
-                    $"Audio: {beds.Count} track(s), all on air - {map}.", 0, target));
+                    $"AUDIO {beds.Count} track(s) on air - {map}.", 0, target));
             }
             else
-                Report(new PlayoutStatus(PlayoutState.Playing, "Audio: none - video only, silent.", 0, target));
+                Report(new PlayoutStatus(PlayoutState.Playing, "AUDIO none - picture only, silent.", 0, target));
 
             framesOut = req.HasVideo
                 ? PlayWithVideo(entry, output, beds, ref lastFrame, ct)
@@ -445,9 +480,10 @@ public sealed class PlayoutService : IDisposable
         Report(new PlayoutStatus(
             ct.IsCancellationRequested ? PlayoutState.Stopped : PlayoutState.Finished,
             ct.IsCancellationRequested
-                ? $"Stopped after {framesOut} frames."
-                : $"Message complete - {framesOut} frames ({new Timecode(framesOut, req.FrameRate)}). " +
-                  $"Post play: {Describe(req.PostPlay)}.",
+                ? $"STOP  {DescribeMedia(entry)} - stopped at frame {framesOut} " +
+                  $"({new Timecode(framesOut, req.FrameRate)}) at station {Station()}."
+                : $"DONE  {DescribeMedia(entry)} - {framesOut} frames ({new Timecode(framesOut, req.FrameRate)}) " +
+                  $"put to air, ended at station {Station()}. Post play: {Describe(req.PostPlay)}.",
             framesOut, target));
     }
 
@@ -560,11 +596,16 @@ public sealed class PlayoutService : IDisposable
             {
                 using var source = FrameSource.Open(_ffmpegPath!, file, format, seek);
 
-                // The moment this file reaches the transmitter, and the one place where both
-                // the entry and the file are in scope. It is what makes "which messages used
-                // this clip" a question with an answer.
-                Report(new PlayoutStatus(PlayoutState.Playing, $"Playing {Path.GetFileName(file)}",
-                    framesOut, target, Path.GetFileName(file), CurrentFilePath: file));
+                // Loaded is not on air. The decoder is open here; the first frame reaches the
+                // card a moment later, and on a file that will not decode, never. Two lines,
+                // so the record says which of the two happened.
+                Report(new PlayoutStatus(PlayoutState.Playing,
+                    $"LOAD  {Path.GetFileName(file)} - decoder opened at frame {framesOut} of the " +
+                    $"message, from {Path.GetDirectoryName(file)}" +
+                    (seek is { } from ? $", starting {from.TotalSeconds:F2} s into the file" : "") + ".",
+                    framesOut, target, Path.GetFileName(file), Event: "playout.videoload"));
+
+                bool onAirSaid = false;
 
                 while (!ct.IsCancellationRequested && (target is null || framesOut < target))
                 {
@@ -576,6 +617,23 @@ public sealed class PlayoutService : IDisposable
                     {
                         Fail(entry, "The card stopped accepting frames.", framesOut, target);
                         return framesOut;
+                    }
+
+                    // The moment this file reaches the transmitter: its first frame has just
+                    // been taken by the card. The one place where both the entry and the file
+                    // are in scope, and what makes "which messages used this clip" a question
+                    // with an answer. Stamped with the frame of the message and the station
+                    // clock, so the record reads as a cue sheet.
+                    if (!onAirSaid)
+                    {
+                        onAirSaid = true;
+                        Report(new PlayoutStatus(PlayoutState.Playing,
+                            $"ONAIR {Path.GetFileName(file)} - first frame on TX{req.TxChannel} at frame " +
+                            $"{framesOut} of the message ({new Timecode(framesOut, req.FrameRate)}), " +
+                            $"station {Station()}.",
+                            framesOut, target, Path.GetFileName(file), CurrentFilePath: file));
+
+                        foreach (AudioBed bed in beds) bed.SayOnAir(framesOut);
                     }
 
                     framesOut++;
@@ -592,20 +650,30 @@ public sealed class PlayoutService : IDisposable
                 // Keep the final frame in case post-play is a freeze.
                 if (framesFromThisFile > 0) lastFrame = (byte[])frame.Clone();
 
-                // A file that ended before the duration was satisfied is worth explaining:
-                // it is either genuinely short, or the decode failed and said so on stderr.
-                if (target is not null && framesOut < target)
+                // Every file gets its END line, with exactly how many frames it put to air and
+                // where in the message that left things — not only the ones that came up
+                // short. Why it ended is said too: the duration was reached, the file ran
+                // out, or ffmpeg refused it and said so on stderr.
+                if (!ct.IsCancellationRequested)
                 {
-                    string why = source.Diagnostics is { } d ? $" - ffmpeg said: {d}" : " (end of file)";
+                    string why = target is not null && framesOut >= target ? "duration reached"
+                        : source.Diagnostics is { } d ? $"ffmpeg said: {d}"
+                        : "end of file";
+
                     Report(new PlayoutStatus(PlayoutState.Playing,
-                        $"{Path.GetFileName(file)} supplied {framesFromThisFile} frame(s){why}",
-                        framesOut, target));
+                        $"END   {Path.GetFileName(file)} - {framesFromThisFile} frames " +
+                        $"({new Timecode(framesFromThisFile, req.FrameRate)}) put to air, {why}; " +
+                        $"message at frame {framesOut}.",
+                        framesOut, target, Path.GetFileName(file), CurrentFilePath: file,
+                        Event: "playout.videoend"));
                 }
             }
             catch (Exception ex)
             {
                 Report(new PlayoutStatus(PlayoutState.Playing,
-                    $"Skipping {Path.GetFileName(file)}: {ex.Message}", framesOut, target));
+                    $"SKIP  {Path.GetFileName(file)} - could not be opened: {ex.Message}; " +
+                    $"message at frame {framesOut}.",
+                    framesOut, target));
             }
 
             barrenPasses = framesFromThisFile > 0 ? 0 : barrenPasses + 1;
@@ -652,6 +720,8 @@ public sealed class PlayoutService : IDisposable
                 return framesOut;
             }
 
+            if (framesOut == 0) foreach (AudioBed bed in beds) bed.SayOnAir(0);
+
             framesOut++;
             entry.FramesOut = framesOut;
 
@@ -681,7 +751,8 @@ public sealed class PlayoutService : IDisposable
         if (waitFrames <= 0)
         {
             Report(new PlayoutStatus(PlayoutState.WaitingForCue,
-                "Start timecode has already passed - starting immediately."));
+                $"CUE   {DescribeMedia(entry)} - start {req.Start} has already passed at station " +
+                $"{Station()}; playing immediately."));
             return;
         }
 
@@ -689,7 +760,8 @@ public sealed class PlayoutService : IDisposable
         entry.Detail = $"cues in {wait}";
 
         Report(new PlayoutStatus(PlayoutState.WaitingForCue,
-            $"Cued on TX{req.TxChannel} for {req.Start} (in {wait}), holding {Describe(fill)}."));
+            $"CUE   {DescribeMedia(entry)} - on TX{req.TxChannel} of board {req.BoardIndex} for " +
+            $"{req.Start}, in {wait} ({waitFrames} frames) from station {Station()}, holding {Describe(fill)}."));
 
         byte[] filler = FillFrame(output, fill, lastFrame);
 
@@ -799,9 +871,10 @@ public sealed class PlayoutService : IDisposable
                 // and it is tagged for what it is. The tally on the monitoring page counts
                 // these rather than reading prose — the difference between a number that is
                 // right and one that is right until somebody rewords a message.
-                @event: status.CurrentFilePath is { Length: > 0 }
-                    ? "playout.video"
-                    : $"playout.{status.State.ToString().ToLowerInvariant()}",
+                @event: status.Event
+                    ?? (status.CurrentFilePath is { Length: > 0 }
+                        ? "playout.video"
+                        : $"playout.{status.State.ToString().ToLowerInvariant()}"),
                 correlation: status.EntryId,
                 file: status.CurrentFilePath);
         }
@@ -865,7 +938,7 @@ public sealed class PlayoutService : IDisposable
                 ? AudioSource.Open(ffmpegPath, _files[0], frameRate, _streamIndex)
                 : AudioSource.Silent(frameRate);
 
-            if (_files.Count > 0) Announce(_files[0]);
+            if (_files.Count > 0) Announce(_files[0], "LOAD");
         }
 
         /// <summary>
@@ -876,19 +949,45 @@ public sealed class PlayoutService : IDisposable
         /// independently of the video, so "which audio went to air under this EDL" is not
         /// answerable from the video line — every track needs its own record.
         /// </summary>
-        private void Announce(string path) =>
+        private void Announce(string path, string verb) =>
             ActivityLog.Shared.Info(LogSource.Playout,
-                $"Audio {_track + 1} \"{Label}\" on ch {_track * 2 + 1}-{_track * 2 + 2}: " +
-                Path.GetFileName(path),
+                $"{verb}  {Path.GetFileName(path)} - AUDIO {_track + 1} \"{Label}\" on ch " +
+                $"{_track * 2 + 1}-{_track * 2 + 2}, at frame {_frames} of the message" +
+                (_files.Count > 1 ? $" (file {_index + 1} of {_files.Count})" : "") + ".",
                 @event: "playout.audio",
                 correlation: _entryId,
                 file: path,
-                detail: $"track {_track + 1}\nlabel {Label}\nchannels {_track * 2 + 1}-{_track * 2 + 2}");
+                detail: $"track {_track + 1}\nlabel {Label}\nchannels {_track * 2 + 1}-{_track * 2 + 2}\n" +
+                        $"frame {_frames}\nfile {_index + 1} of {_files.Count}");
+
+        /// <summary>Frames this bed has been advanced — the frame of the message it is at.</summary>
+        private long _frames;
+
+        private bool _onAirSaid;
+
+        /// <summary>
+        /// The bed's sound has just gone out with the message's first frame. Said once per
+        /// bed: a second video file loading later does not put the audio on air again.
+        /// </summary>
+        public void SayOnAir(long messageFrame)
+        {
+            if (_onAirSaid || _files.Count == 0) return;
+            _onAirSaid = true;
+
+            ActivityLog.Shared.Ok(LogSource.Playout,
+                $"ONAIR {Path.GetFileName(_files[_index])} - AUDIO {_track + 1} \"{Label}\" on ch " +
+                $"{_track * 2 + 1}-{_track * 2 + 2}, embedded from frame {messageFrame} of the message.",
+                @event: "playout.audioonair",
+                correlation: _entryId,
+                file: _files[_index],
+                detail: $"track {_track + 1}\nlabel {Label}\nchannels {_track * 2 + 1}-{_track * 2 + 2}\nframe {messageFrame}");
+        }
 
         public void Advance(int offsetMs)
         {
             _source.ReadFrame(Left, Right, _position, offsetMs);
             _position += Left.Length;
+            _frames++;
 
             if (_files.Count > 0 && _source.Exhausted) Roll();
         }
@@ -904,7 +1003,7 @@ public sealed class PlayoutService : IDisposable
 
             // Said on every roll, not only the first: a bed that wraps three times during a
             // long message put three files to air, and the record should show three.
-            Announce(_files[_index]);
+            Announce(_files[_index], "ROLL");
 
             // Disposal kills an ffmpeg process and joins the decoder thread, up to ~4 s.
             // Inline that would stall the play loop and drop frames, since PushFrame is

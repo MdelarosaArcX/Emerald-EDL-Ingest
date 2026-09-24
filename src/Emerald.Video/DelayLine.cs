@@ -133,6 +133,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private long _sealedAt = -1;
     private long _lastWriteTicks;
     private long _dropped;
+    private long _dropSaidAt;
     private int _refs = 1;
     private int _disposed;
 
@@ -433,7 +434,21 @@ public sealed class DelayLine : IDelayLine, IDisposable
             return;                       // sealed between the check and the add
         }
 
-        Interlocked.Increment(ref _dropped);
+        long dropped = Interlocked.Increment(ref _dropped);
+
+        // A frame that never reached the ring is a frame that will never reach air, which is
+        // worth a line of its own the moment it happens — rate-limited, because a disk that
+        // cannot keep up drops them by the hundred.
+        long now = Environment.TickCount64;
+        if (now - Volatile.Read(ref _dropSaidAt) > 5000)
+        {
+            Volatile.Write(ref _dropSaidAt, now);
+            ActivityLog.Shared.Warn(LogSource.TidalLock,
+                $"DROP  frame {frame.Sequence} not taken into the delay ring - the disk could not " +
+                $"keep up ({dropped} dropped so far). It will not reach air.",
+                @event: "delay.dropped",
+                detail: $"frame {frame.Sequence}\ndropped total {dropped}");
+        }
     }
 
     private void WriteLoop()
