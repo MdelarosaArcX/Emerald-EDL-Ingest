@@ -110,6 +110,18 @@ public sealed class SdiCapture : IDisposable
     public long FramesRecorded => Interlocked.Read(ref _framesRecorded);
 
     /// <summary>
+    /// How many stereo pairs this recording is writing, or 0 when nothing is recording.
+    ///
+    /// Settled once, before the encoder starts, and fixed for the life of it — the number of
+    /// channels on the audio pipe cannot change under ffmpeg. So this is the honest answer to
+    /// "which pairs are in the file", and it is not the same question as which pairs are on the
+    /// wire now: a pair that arrived after the recording rolled is not being written.
+    /// </summary>
+    public int PairsRecording => Volatile.Read(ref _pairsRecording);
+
+    private int _pairsRecording;
+
+    /// <summary>
     /// Asks the delay ring how many frames it could not take, for the ledger. Set by whoever
     /// attaches a ring; null when there is none. A function rather than a number so the
     /// recorder never holds a reference to a ring that has been released.
@@ -134,6 +146,7 @@ public sealed class SdiCapture : IDisposable
         LastError = null;
         SessionId = Guid.NewGuid().ToString("N")[..8];
         Interlocked.Exchange(ref _framesRecorded, 0);
+        Volatile.Write(ref _pairsRecording, 0);
 
         _cts = new CancellationTokenSource();
         CancellationToken ct = _cts.Token;
@@ -189,6 +202,16 @@ public sealed class SdiCapture : IDisposable
         try
         {
             Directory.CreateDirectory(folder);
+
+            // Both halves of the per-recording folder, before the encoder is started: the
+            // segment muxer does not create directories and fails on the first segment if the
+            // folder is not there - which looks exactly like a recording that never rolled.
+            if (!request.SingleFile && request.Names is { } naming)
+            {
+                foreach (RecordingOutput output in RecordingProfile.Outputs)
+                    Directory.CreateDirectory(
+                        Path.Combine(RecordingProfile.FolderFor(output, folder), naming.Folder));
+            }
 
             // Claim the receiver before touching it. A live preview on the same input holds
             // a yielding lease and is closed by this call; anything else is a real conflict.
@@ -286,6 +309,23 @@ public sealed class SdiCapture : IDisposable
             // frame is recorded. A feed on channels 1-2 records exactly as it always did.
             int pairs = request.AudioPairs ?? DetectPairs(stream, audio, ct);
             pairs = Math.Clamp(pairs, 1, SdiAudioReader.MaxPairs);
+
+            Volatile.Write(ref _pairsRecording, pairs);
+
+            // The audio selection that decides what is in the file, and the only one that cannot
+            // be changed afterwards — the channel count is fixed for the life of the encoder.
+            // Tagged, because "which pairs did that recording capture" has to be answerable
+            // from the record rather than by opening a segment.
+            ActivityLog.Shared.Ok(LogSource.Capture,
+                pairs == 1
+                    ? $"AUDIO recording 1 pair (CH 1-2) as one track" +
+                      (request.AudioPairs is null ? ", detected from the wire." : ", pinned by the operator.")
+                    : $"AUDIO recording {pairs} pairs (CH 1-{pairs * 2}) as {pairs} tracks" +
+                      (request.AudioPairs is null ? ", detected from the wire." : ", pinned by the operator."),
+                @event: "capture.audio.pairs",
+                correlation: SessionId,
+                detail: $"pairs {pairs}\nchannels 1-{pairs * 2}\n" +
+                        $"chosen {(request.AudioPairs is null ? "detected" : "pinned")}");
 
             Report(pairs == 1
                 ? "Capture: audio on channels 1-2."
@@ -562,6 +602,9 @@ public sealed class SdiCapture : IDisposable
 
             audio?.Dispose();
 
+            // Nothing is being written any more, so nothing may claim a pair is in a file.
+            Volatile.Write(ref _pairsRecording, 0);
+
             // Last, and only once the encoder has exited: by here the containers are closed,
             // so a caller may measure the files it was promised.
             try
@@ -592,7 +635,7 @@ public sealed class SdiCapture : IDisposable
             .Select(c => Path.GetInvalidFileNameChars().Contains(c) || c == '%' ? '_' : c)
             .ToArray());
 
-        return clean.Length == 0 ? "capture" : clean[..Math.Min(clean.Length, 60)];
+        return clean.Length == 0 ? RecordingSequence.DefaultPrefix : clean[..Math.Min(clean.Length, 60)];
     }
 
     private readonly List<string> _encoderErrors = new();
@@ -611,7 +654,8 @@ public sealed class SdiCapture : IDisposable
         // the EDL records with whatever they were left on.
         foreach (string a in request.Profile.EncoderArguments(
                      format, pipeName, request.Folder, request.NamePrefix, SampleRate,
-                     request.SingleFile, request.StartTimecode, request.ExtraAudio, audioPairs))
+                     request.SingleFile, request.StartTimecode, request.ExtraAudio, audioPairs,
+                     request.SingleFile ? null : request.Names))
             info.ArgumentList.Add(a);
 
         Process ff = Process.Start(info) ?? throw new InvalidOperationException("Could not start ffmpeg for capture.");

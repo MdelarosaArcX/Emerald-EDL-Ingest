@@ -7,7 +7,7 @@ namespace Emerald.Deltacast;
 /// time with <see cref="PushFrame"/>, which blocks until the card frees a slot — that is
 /// what paces playout, so the caller never needs its own timer.
 /// </summary>
-public sealed class SdiOutput : IDisposable
+public sealed class SdiOutput : ISdiOutput
 {
     private const uint BufferQueueDepth = 4;
     private const uint IoTimeoutMs = 2000;

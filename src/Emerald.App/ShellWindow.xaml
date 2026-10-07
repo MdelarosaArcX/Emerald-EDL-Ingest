@@ -82,7 +82,79 @@
                 <!-- ============================ stage ============================ -->
                 <Border Grid.Column="1" Background="{StaticResource IpPanel}"
                         BorderBrush="{StaticResource IpLine}" BorderThickness="1" CornerRadius="7">
-                    <Grid>
+                  <Grid>
+                    <!-- ===================== the capture record =====================
+                         What an operator watches on this side of the page is what the plant is
+                         doing, and this is where it is written down. The receiver is the thing
+                         being recorded, not a clip being auditioned - the store has its own
+                         window - so the picture and the clip strip that used to be here were
+                         answering a question nobody asks while a recording is running.
+
+                         Capture-side lines only. The playback deck keeps its own record of the
+                         transmitter; mixing the two made both harder to read and neither
+                         complete. -->
+                    <Grid x:Name="StageLog" Margin="3">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <Grid Grid.Row="0" Margin="10,9,10,8">
+                            <TextBlock Text="CAPTURE ACTIVITY" Foreground="{StaticResource IpMuted}"
+                                       FontSize="9.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
+
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                <ToggleButton x:Name="FollowCaptureLog" Content="FOLLOW"
+                                              IsChecked="True"
+                                              Style="{StaticResource IpSmallToggle}"
+                                              Height="20" Padding="9,0" FontSize="9.5"
+                                              ToolTip="Keep the newest line in view"/>
+                                <Button Content="Clear" Style="{StaticResource GhostButton}"
+                                        Margin="6,0,0,0" Height="20" Padding="9,0" FontSize="10.5"
+                                        Click="ClearCaptureLog_Click"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <Border Grid.Row="1" Background="{StaticResource IpStage}" CornerRadius="5"
+                                Margin="3,0,3,3" Padding="10,8">
+                            <ScrollViewer x:Name="CaptureLogScroller"
+                                          VerticalScrollBarVisibility="Auto">
+                                <ItemsControl x:Name="CaptureLogList">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Margin="0,1">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="{Binding Time}"
+                                                           FontFamily="Consolas" FontSize="10.5"
+                                                           Foreground="{StaticResource IpDim}"
+                                                           Margin="0,0,8,0"/>
+                                                <TextBlock Grid.Column="1" Text="{Binding Source}"
+                                                           FontFamily="Consolas" FontSize="9"
+                                                           Foreground="{StaticResource IpDim}"
+                                                           Width="58"/>
+                                                <TextBlock Grid.Column="2" Text="{Binding Message}"
+                                                           FontFamily="Consolas" FontSize="10.5"
+                                                           Foreground="{Binding Brush}"
+                                                           TextWrapping="Wrap"/>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+                        </Border>
+                    </Grid>
+
+                    <!-- The old stage: player, transport, breadcrumbs and clip strip. Kept in
+                         the tree and collapsed rather than deleted, because every control in it
+                         is wired to a handler and a named field in the code behind, and tearing
+                         all of that out while a recording is running is not a change worth
+                         risking for a panel nobody can see. It costs nothing while collapsed -
+                         the clip listing that fed it is skipped too. -->
+                    <Grid x:Name="StageMedia" Visibility="Collapsed">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="*"/>
                             <RowDefinition Height="Auto"/>
@@ -268,6 +340,7 @@
                                        Visibility="Collapsed"/>
                         </Grid>
                     </Grid>
+                  </Grid>
                 </Border>
 
                 <!-- Right handle: collapses the capture deck to widen the stage. -->
@@ -399,22 +472,36 @@
                                             <Grid Margin="0,0,0,3">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="82"/>
+                                                    <ColumnDefinition Width="26"/>
                                                     <ColumnDefinition Width="*"/>
                                                     <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="58"/>
                                                 </Grid.ColumnDefinitions>
 
                                                 <!-- Selecting a pair is what sends it to the
-                                                     speakers. Absent pairs cannot be picked,
-                                                     rather than selecting silence. -->
+                                                     speakers, and it changes nothing else: not
+                                                     the picture, not the recording, not what is
+                                                     on the transmitter. A pair with no signal is
+                                                     still selectable, so a language can be chosen
+                                                     before it starts arriving. -->
                                                 <RadioButton Grid.Column="0" Content="{Binding Name}"
                                                              Style="{StaticResource IpTrackRadio}"
                                                              GroupName="AudioPair"
                                                              IsChecked="{Binding Listening, Mode=TwoWay}"
-                                                             IsEnabled="{Binding Present}"
                                                              Checked="AudioPair_Checked"
                                                              ToolTip="{Binding ChannelLabel}"/>
 
-                                                <StackPanel Grid.Column="1">
+                                                <!-- In the file. Not the same as being on the
+                                                     wire: the channel count is settled when the
+                                                     encoder starts and cannot change under it. -->
+                                                <TextBlock Grid.Column="1" Text="{Binding RecordedText}"
+                                                           FontSize="8" FontWeight="Bold"
+                                                           FontFamily="Consolas" TextAlignment="Center"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="{StaticResource IpMint}"
+                                                           ToolTip="This pair is being written into the recording"/>
+
+                                                <StackPanel Grid.Column="2">
                                                     <ProgressBar x:Name="LeftMeter"
                                                                  Style="{StaticResource IpMeter}"
                                                                  Value="{Binding Left, Mode=OneWay}"
@@ -424,18 +511,31 @@
                                                                  Value="{Binding Right, Mode=OneWay}"/>
                                                 </StackPanel>
 
-                                                <TextBlock x:Name="Readout" Grid.Column="2"
+                                                <TextBlock x:Name="Readout" Grid.Column="3"
                                                            Text="{Binding Readout}"
                                                            FontFamily="Consolas" FontSize="8.5"
                                                            Width="48" TextAlignment="Right"
                                                            Margin="6,0,0,0" VerticalAlignment="Center"
                                                            Foreground="{StaticResource IpMuted}"/>
+
+                                                <!-- Which one you are hearing. The whole point of
+                                                     the panel: LISTENING on exactly one row. -->
+                                                <TextBlock x:Name="Status" Grid.Column="4"
+                                                           Text="{Binding StatusText}"
+                                                           FontFamily="Consolas" FontSize="8"
+                                                           FontWeight="Bold" TextAlignment="Right"
+                                                           Margin="4,0,0,0" VerticalAlignment="Center"
+                                                           Foreground="{StaticResource IpDim}"/>
                                             </Grid>
 
                                             <!-- Amber past -10 dBFS, red at full scale: the
                                                  colours a desk meter uses, so a level that is
                                                  about to be a problem reads as one at a glance. -->
                                             <DataTemplate.Triggers>
+                                                <DataTrigger Binding="{Binding Audible}" Value="True">
+                                                    <Setter TargetName="Status" Property="Foreground"
+                                                            Value="{StaticResource IpMint}"/>
+                                                </DataTrigger>
                                                 <DataTrigger Binding="{Binding Hot}" Value="True">
                                                     <Setter TargetName="LeftMeter" Property="Foreground"
                                                             Value="{StaticResource IpMeterHot}"/>

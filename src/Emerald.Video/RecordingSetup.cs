@@ -59,7 +59,17 @@ public sealed record CaptureRequest(
     /// tracks without anyone having to say so. Pinning it is for a feed whose pairs come and
     /// go, where the track layout has to be the same in every segment.
     /// </summary>
-    int? AudioPairs = null)
+    int? AudioPairs = null,
+
+    /// <summary>
+    /// The folder this recording writes into and the numbers its segments take, or null to write
+    /// the old flat timestamped names.
+    ///
+    /// Decided by the caller rather than here, because the running number belongs to the machine
+    /// and has to be read from and written back to the settings — which the recorder has no
+    /// business touching.
+    /// </summary>
+    RecordingNames? Names = null)
 {
     /// <summary>The files this request will write, proxy first — the order ffmpeg is given them in.</summary>
     public IReadOnlyList<string> OutputPaths => SingleFile

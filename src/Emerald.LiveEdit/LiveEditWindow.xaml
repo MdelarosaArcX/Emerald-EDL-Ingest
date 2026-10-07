@@ -3,87 +3,261 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Emerald - Live Edit" Height="820" Width="1360"
         WindowStartupLocation="CenterScreen"
-        Background="{StaticResource Bg}">
+        Background="{StaticResource Bg}"
+        PreviewKeyDown="Window_PreviewKeyDown"
+        MouseWheel="Window_MouseWheel">
+
+    <Window.Resources>
+        <!-- One row of either media list. Keyed rather than inline because the capture list and
+             the ingest list are two views of the same kind of thing and should not drift apart
+             visually. -->
+        <Style x:Key="MediaRow" TargetType="ListBoxItem">
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Margin" Value="0,0,0,4"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                        <Border x:Name="b" Background="#1F242D" CornerRadius="4"
+                                Padding="10,8" BorderThickness="1" BorderBrush="Transparent">
+                            <ContentPresenter/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="b" Property="Background" Value="#262D38"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="b" Property="BorderBrush"
+                                        Value="{StaticResource Accent}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
 
     <Grid Margin="18">
+        <!-- The media panel's width is the operator's to set.
+             The viewer is a star column and the panel a fixed one, so dragging the splitter
+             between them takes width from one and gives it to the other - the big screen
+             re-lays itself out as the panel moves, which is what makes the drag worth having.
+             MinWidth on both, so neither can be collapsed to a sliver that cannot be grabbed
+             back. -->
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="*" MinWidth="320"/>
             <ColumnDefinition Width="16"/>
-            <ColumnDefinition Width="300"/>
+            <ColumnDefinition x:Name="PanelColumn" Width="300" MinWidth="210"/>
         </Grid.ColumnDefinitions>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="190"/>
+            <RowDefinition Height="286"/>
         </Grid.RowDefinitions>
+
+        <!-- In the spacer column, filling it, so the whole gap between the two is the handle
+             rather than a hairline somebody has to hunt for. -->
+        <GridSplitter Grid.Row="1" Grid.Column="1" Width="16"
+                      HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                      Background="Transparent" ResizeDirection="Columns"
+                      ResizeBehavior="PreviousAndNext"
+                      Cursor="SizeWE" ShowsPreview="False"
+                      ToolTip="Drag to resize the media panel and the viewer"/>
 
         <StackPanel Grid.Row="0" Grid.ColumnSpan="3" Orientation="Horizontal" Margin="0,0,0,14">
             <TextBlock Text="LIVE EDIT" Foreground="{StaticResource Ok}" FontSize="16" FontWeight="Bold"/>
-            <TextBlock Text="layout only - trimming and rendering are not built yet"
-                       Margin="14,0,0,0" VerticalAlignment="Center"
-                       Foreground="{StaticResource Warn}" FontSize="11.5"/>
+            <TextBlock x:Name="KeyHintText" Margin="14,0,0,0" VerticalAlignment="Center"
+                       Foreground="{StaticResource Muted}" FontSize="11.5"
+                       Text="space play/pause  -  arrows one frame  -  I/O mark  -  B bookmark  -  +/- zoom  -  A on air  -  middle-drag to pan"/>
+
+            <StackPanel Orientation="Horizontal" Margin="20,0,0,0" VerticalAlignment="Center">
+                <Button Content="&#8592;" Style="{StaticResource GhostButton}" Width="26"
+                        Click="DayBack_Click" ToolTip="The day before"/>
+                <TextBlock x:Name="DayText" Margin="8,0,8,0" VerticalAlignment="Center"
+                           FontFamily="Consolas" FontSize="12" Foreground="{StaticResource Text}"/>
+                <Button Content="&#8594;" Style="{StaticResource GhostButton}" Width="26"
+                        Click="DayForward_Click" ToolTip="The day after"/>
+            </StackPanel>
+
+            <TextBlock x:Name="RecordingText" Margin="16,0,0,0" VerticalAlignment="Center"
+                       FontFamily="Consolas" FontSize="11.5"
+                       Foreground="{StaticResource Muted}"/>
+
+            <TextBlock x:Name="OnAirText" Margin="20,0,0,0" VerticalAlignment="Center"
+                       FontFamily="Consolas" FontSize="12" FontWeight="Bold"
+                       Foreground="{StaticResource Bad}"/>
         </StackPanel>
 
         <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource PanelDeep}"
                 BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6">
             <Grid>
-                <Image x:Name="PreviewImage" Stretch="Uniform" Margin="1"/>
-                <TextBlock x:Name="PreviewPlaceholder" Text="select a clip"
+                <MediaElement x:Name="Player" LoadedBehavior="Manual" UnloadedBehavior="Stop"
+                              Stretch="Uniform" Margin="1" ScrubbingEnabled="True"
+                              MediaOpened="Player_Opened" MediaEnded="Player_Ended"
+                              MediaFailed="Player_Failed"/>
+                <!-- One player per layer. In the tree because WPF will not play a MediaElement
+                     that is not, zero-sized because there is nothing of theirs to look at. -->
+                <MediaElement x:Name="LayerA" LoadedBehavior="Manual" UnloadedBehavior="Stop"
+                              Width="0" Height="0" Volume="1"/>
+                <MediaElement x:Name="LayerB" LoadedBehavior="Manual" UnloadedBehavior="Stop"
+                              Width="0" Height="0" Volume="1"/>
+
+                <!-- This screen is the timeline's. It shows whatever the playhead is over, so
+                     the prompt is about the timeline and not about the lists - picking a file
+                     from a list previews it in the small monitor on the right instead. -->
+                <TextBlock x:Name="PreviewPlaceholder" Text="click the timeline below"
                            HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextAlignment="Center" TextWrapping="Wrap"
                            Foreground="{StaticResource Muted}" FontSize="14"/>
             </Grid>
         </Border>
 
         <Border Grid.Row="1" Grid.Column="2" Style="{StaticResource Card}" Padding="0">
-            <DockPanel>
-                <Grid DockPanel.Dock="Top" Margin="14,14,14,10">
-                    <TextBlock Text="CAPTURED MEDIA" Style="{StaticResource SectionHeader}" Margin="0"/>
-                    <Button x:Name="RefreshButton" Content="Refresh" Style="{StaticResource GhostButton}"
-                            HorizontalAlignment="Right" Height="22" FontSize="10.5" Padding="9,0"
-                            Click="Refresh_Click"/>
+            <!-- A Grid rather than a DockPanel, so the monitor's height is adjustable too: a
+                 DockPanel has no notion of a row a splitter can resize. The monitor row carries
+                 the height and the list row takes the rest. -->
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition x:Name="MonitorRow" Height="166" MinHeight="74"/>
+                    <RowDefinition Height="7"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*" MinHeight="90"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- ================= the monitor for the selected file =================
+                     A second, small player, and it exists because the big screen belongs to
+                     the timeline. Clicking a file in a list used to load it into the main
+                     viewer, which moved the playhead and threw away whatever the operator had
+                     lined up - checking "is this the right clip" cost them their place. So a
+                     list selection plays here instead, and the two never interfere: this one
+                     knows nothing about the station day. -->
+                <Border Grid.Row="0" Margin="14,14,14,0"
+                        Background="#101419" BorderBrush="{StaticResource Line}"
+                        BorderThickness="1" CornerRadius="5">
+                    <Grid>
+                        <MediaElement x:Name="Monitor" LoadedBehavior="Manual" UnloadedBehavior="Stop"
+                                      Stretch="Uniform" Margin="1" ScrubbingEnabled="True"
+                                      MediaOpened="Monitor_Opened" MediaEnded="Monitor_Ended"
+                                      MediaFailed="Monitor_Failed"/>
+
+                        <TextBlock x:Name="MonitorPlaceholder" Text="select a file to preview it"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                                   Foreground="{StaticResource Muted}" FontSize="11.5"
+                                   TextWrapping="Wrap" TextAlignment="Center" Margin="12,0"/>
+
+                        <!-- Its own transport. The window's space bar belongs to the timeline,
+                             so this needs a control of its own or it could only ever autoplay. -->
+                        <Border VerticalAlignment="Bottom" Background="#C0101419" Padding="6,4">
+                          <StackPanel>
+                            <!-- A seek bar for the file in hand. This monitor is for answering
+                                 "is this the right material", and that question is usually
+                                 about a particular moment rather than the opening frame. It is
+                                 the file's own position, not the station day - this player has
+                                 nothing to do with the timeline. -->
+                            <Grid Margin="0,0,0,3">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+
+                                <Slider x:Name="MonitorSeek" Grid.Column="0" Minimum="0" Maximum="1"
+                                        IsEnabled="False" VerticalAlignment="Center"
+                                        IsMoveToPointEnabled="True"
+                                        Thumb.DragStarted="MonitorSeek_DragStarted"
+                                        Thumb.DragCompleted="MonitorSeek_DragCompleted"
+                                        ValueChanged="MonitorSeek_Changed"
+                                        ToolTip="Drag to seek within this file"/>
+
+                                <TextBlock x:Name="MonitorTimeText" Grid.Column="1" Margin="6,0,2,0"
+                                           VerticalAlignment="Center" FontFamily="Consolas"
+                                           FontSize="9" Foreground="{StaticResource Muted}"
+                                           Text="--:-- / --:--"/>
+                            </Grid>
+
+                            <StackPanel Orientation="Horizontal">
+                                <Button x:Name="MonitorPlayButton" Content="&#9654;"
+                                        Style="{StaticResource GhostButton}" Width="30" Height="20"
+                                        FontSize="9" Padding="0" IsEnabled="False"
+                                        Click="MonitorPlay_Click" ToolTip="Play or pause the preview"/>
+                                <Button x:Name="MonitorStopButton" Content="&#9632;"
+                                        Style="{StaticResource GhostButton}" Width="30" Height="20"
+                                        FontSize="9" Padding="0" Margin="4,0,0,0" IsEnabled="False"
+                                        Click="MonitorStop_Click" ToolTip="Stop the preview"/>
+
+                                <TextBlock x:Name="MonitorText" Margin="8,0,0,0"
+                                           VerticalAlignment="Center" FontFamily="Consolas"
+                                           FontSize="9.5" Foreground="{StaticResource Muted}"
+                                           TextTrimming="CharacterEllipsis" MaxWidth="150"/>
+
+                                <!-- A file that will not open is the only thing here worth an
+                                     action, so the button appears only when there is one. -->
+                                <Button x:Name="MonitorDeleteButton" Content="Delete"
+                                        Style="{StaticResource GhostButton}" Height="20"
+                                        FontSize="9.5" Padding="7,0" Margin="6,0,0,0"
+                                        Visibility="Collapsed" Click="MonitorDelete_Click"
+                                        ToolTip="Delete this unreadable file from the disk"/>
+                            </StackPanel>
+                          </StackPanel>
+                        </Border>
+                    </Grid>
+                </Border>
+
+                <GridSplitter Grid.Row="1" Height="7" HorizontalAlignment="Stretch"
+                              VerticalAlignment="Stretch" Background="Transparent"
+                              ResizeDirection="Rows" ResizeBehavior="PreviousAndNext"
+                              Cursor="SizeNS" ShowsPreview="False"
+                              ToolTip="Drag to resize the preview"/>
+
+                <!-- Two lists in one place. What the plant recorded is read-only and arrives
+                     by itself; what has been cut out of it by hand is a different kind of
+                     thing, and mixing the two made it impossible to see at a glance whether an
+                     export had actually been written. -->
+                <Grid Grid.Row="2" Margin="14,7,14,10">
+                    <StackPanel Orientation="Horizontal">
+                        <ToggleButton x:Name="CaptureTab" Content="CAPTURE MEDIA" IsChecked="True"
+                                      Style="{StaticResource IpSmallToggle}" Height="24"
+                                      Padding="10,0" FontSize="10" Click="Tab_Changed"
+                                      ToolTip="What the plant has recorded"/>
+                        <ToggleButton x:Name="IngestTab" Content="INGEST MEDIA" Margin="6,0,0,0"
+                                      Style="{StaticResource IpSmallToggle}" Height="24"
+                                      Padding="10,0" FontSize="10" Click="Tab_Changed"
+                                      ToolTip="Ranges exported out of the recording"/>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <!-- Where the files actually are. "Where is the ingest folder" is not a
+                             question an operator should have to ask twice. -->
+                        <Button x:Name="OpenFolderButton" Content="Folder"
+                                Style="{StaticResource GhostButton}" Height="22" FontSize="10.5"
+                                Padding="9,0" Margin="0,0,6,0" Click="OpenFolder_Click"/>
+                        <Button x:Name="RefreshButton" Content="Refresh" Style="{StaticResource GhostButton}"
+                                Height="22" FontSize="10.5" Padding="9,0"
+                                Click="Refresh_Click"/>
+                    </StackPanel>
                 </Grid>
 
-                <TextBlock x:Name="StoreText" DockPanel.Dock="Bottom" Style="{StaticResource Hint}"
-                           Margin="14,8,14,14"/>
+                <TextBlock x:Name="StoreText" Grid.Row="4" Style="{StaticResource Hint}"
+                           Margin="14,8,14,14" TextWrapping="Wrap"/>
 
+                <Grid Grid.Row="3">
                 <ListBox x:Name="ClipList" Background="Transparent" BorderThickness="0"
                          Margin="6,0,6,0" Foreground="{StaticResource Text}"
+                         ItemContainerStyle="{StaticResource MediaRow}"
                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"
-                         SelectionChanged="ClipList_SelectionChanged">
-                    <ListBox.ItemContainerStyle>
-                        <Style TargetType="ListBoxItem">
-                            <Setter Property="Padding" Value="0"/>
-                            <Setter Property="Margin" Value="0,0,0,4"/>
-                            <Setter Property="Template">
-                                <Setter.Value>
-                                    <ControlTemplate TargetType="ListBoxItem">
-                                        <Border x:Name="b" Background="#1F242D" CornerRadius="4"
-                                                Padding="10,8" BorderThickness="1" BorderBrush="Transparent">
-                                            <ContentPresenter/>
-                                        </Border>
-                                        <ControlTemplate.Triggers>
-                                            <Trigger Property="IsMouseOver" Value="True">
-                                                <Setter TargetName="b" Property="Background" Value="#262D38"/>
-                                            </Trigger>
-                                            <Trigger Property="IsSelected" Value="True">
-                                                <Setter TargetName="b" Property="BorderBrush"
-                                                        Value="{StaticResource Accent}"/>
-                                            </Trigger>
-                                        </ControlTemplate.Triggers>
-                                    </ControlTemplate>
-                                </Setter.Value>
-                            </Setter>
-                        </Style>
-                    </ListBox.ItemContainerStyle>
-
+                         SelectionChanged="ClipList_SelectionChanged"
+                         MouseDoubleClick="ClipList_DoubleClick"
+                         ToolTip="Click to preview, double-click to take the timeline there">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
                             <StackPanel>
-                                <TextBlock Text="{Binding Name}" FontSize="12" TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding DisplayName}" FontSize="12"
+                                           TextTrimming="CharacterEllipsis"/>
                                 <TextBlock Foreground="{StaticResource Muted}" FontSize="10.5" Margin="0,3,0,0">
                                     <Run Text="{Binding DurationText, Mode=OneWay}"/>
-                                    <Run Text=" - "/>
+                                    <Run Text="  -  "/>
+                                    <Run Text="{Binding FrameText, Mode=OneWay}"/>
+                                    <Run Text="  -  "/>
                                     <Run Text="{Binding SizeText, Mode=OneWay}"/>
                                     <Run Text=" - "/>
                                     <Run Text="{Binding FormatText, Mode=OneWay}"/>
@@ -98,7 +272,72 @@
                         </DataTemplate>
                     </ListBox.ItemTemplate>
                 </ListBox>
-            </DockPanel>
+
+                <!-- What has been exported out of the recording. Empty until somebody marks a
+                     range, so it says so rather than showing a blank panel. -->
+                <Grid x:Name="IngestPanel" Visibility="Collapsed">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- An export in progress.
+                         Shown from the moment Export is pressed until the file is on disk,
+                         because the cut is seconds and the playable copy beside it is a real
+                         encode that can run for minutes - and for all of that the list would
+                         otherwise look exactly as it did before, as though nothing had
+                         happened. Indeterminate: ffmpeg's progress is not read, so a bar that
+                         claimed a percentage would be inventing one. -->
+                    <Border x:Name="ExportBusy" Grid.Row="0" Visibility="Collapsed"
+                            Margin="6,0,6,6" Padding="10,8"
+                            Background="#1F242D" CornerRadius="4"
+                            BorderBrush="{StaticResource Warn}" BorderThickness="1">
+                        <StackPanel>
+                            <TextBlock x:Name="ExportBusyName" FontSize="11.5"
+                                       Foreground="{StaticResource Text}"
+                                       TextTrimming="CharacterEllipsis"/>
+                            <TextBlock x:Name="ExportBusyStage" Margin="0,3,0,0" FontSize="10.5"
+                                       Foreground="{StaticResource Warn}" TextWrapping="Wrap"/>
+                            <ProgressBar x:Name="ExportBusyBar" Height="3" Margin="0,7,0,0"
+                                         IsIndeterminate="True" Background="Transparent"
+                                         BorderThickness="0"
+                                         Foreground="{StaticResource Warn}"/>
+                        </StackPanel>
+                    </Border>
+
+                    <TextBlock x:Name="IngestEmptyText" Grid.Row="1" Margin="18,6,18,0"
+                               Foreground="{StaticResource Muted}" FontSize="11.5"
+                               TextWrapping="Wrap" VerticalAlignment="Top"
+                               Text="Nothing exported yet. Mark in with I and out with O on the timeline, then Export."/>
+
+                    <ListBox x:Name="IngestList" Grid.Row="1" Background="Transparent" BorderThickness="0"
+                             Margin="6,0,6,0" Foreground="{StaticResource Text}"
+                             ItemContainerStyle="{StaticResource MediaRow}"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             SelectionChanged="IngestList_SelectionChanged"
+                             PreviewMouseLeftButtonDown="IngestList_MouseDown"
+                             PreviewMouseMove="IngestList_MouseMove"
+                             ToolTip="Click to preview, or drag onto the timeline to place it">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel>
+                                    <TextBlock Text="{Binding DisplayName}" FontSize="12"
+                                               TextTrimming="CharacterEllipsis"/>
+                                    <TextBlock Foreground="{StaticResource Muted}" FontSize="10.5"
+                                               Margin="0,3,0,0">
+                                        <Run Text="{Binding DurationText, Mode=OneWay}"/>
+                                        <Run Text="  -  "/>
+                                        <Run Text="{Binding SizeText, Mode=OneWay}"/>
+                                        <Run Text="  -  "/>
+                                        <Run Text="{Binding FormatText, Mode=OneWay}"/>
+                                    </TextBlock>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+                </Grid>
+            </Grid>
         </Border>
 
         <Border Grid.Row="2" Grid.ColumnSpan="3" Margin="0,14,0,0" Padding="14,10"
@@ -106,16 +345,108 @@
                 BorderThickness="1" CornerRadius="6">
             <Grid>
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                    <Button Content="&#9668;&#9668;" Style="{StaticResource GhostButton}" Width="46" IsEnabled="False"/>
-                    <Button Content="&#9654;" Style="{StaticResource GhostButton}" Width="46" Margin="8,0" IsEnabled="False"/>
-                    <Button Content="&#9658;&#9658;" Style="{StaticResource GhostButton}" Width="46" IsEnabled="False"/>
-                    <Button Content="Mark In" Style="{StaticResource GhostButton}" Margin="20,0,8,0" IsEnabled="False"/>
-                    <Button Content="Mark Out" Style="{StaticResource GhostButton}" IsEnabled="False"/>
+                    <Button x:Name="BackButton" Content="&#9668;&#9668;" Style="{StaticResource GhostButton}"
+                            Width="46" Click="StepBack_Click"
+                            ToolTip="Back one step of the current zoom (left arrow)"/>
+                    <Button x:Name="PlayButton" Content="&#9654;" Style="{StaticResource GhostButton}"
+                            Width="46" Margin="8,0" Click="PlayPause_Click"
+                            ToolTip="Play or pause (space)"/>
+                    <Button x:Name="ForwardButton" Content="&#9658;&#9658;" Style="{StaticResource GhostButton}"
+                            Width="46" Click="StepForward_Click"
+                            ToolTip="Forward one step of the current zoom (right arrow)"/>
+
+                    <Button x:Name="MarkInButton" Content="Mark In" Style="{StaticResource GhostButton}"
+                            Margin="20,0,8,0" Click="MarkIn_Click"
+                            ToolTip="Mark in at the playhead, or clear it if it is already here (I)"/>
+                    <Button x:Name="MarkOutButton" Content="Mark Out" Style="{StaticResource GhostButton}"
+                            Click="MarkOut_Click"
+                            ToolTip="Mark out at the playhead, or clear it if it is already here (O)"/>
+
+                    <!-- A single point, not a range: "bleep here", "cut from here". Amber, so it
+                         is never mistaken for the green in/out pair or the red transmitter. -->
+                    <Button x:Name="BookmarkButton" Content="Bookmark" Style="{StaticResource GhostButton}"
+                            Margin="8,0,0,0" Click="Bookmark_Click"
+                            ToolTip="Mark an edit or censor point at the playhead, with a note (B)"/>
+
+                    <!-- Only live once there is a range to export, because an export with one
+                         mark set has no defensible meaning. -->
+                    <Button x:Name="ExportButton" Content="Export" Style="{StaticResource GhostButton}"
+                            Margin="8,0,0,0" IsEnabled="False" Click="Export_Click"
+                            ToolTip="Cut the marked range out of the masters and put it in Ingest Media"/>
+
+                    <!-- The level for what this window plays on this PC. It is a monitor
+                         control: it changes nothing recorded, nothing on the transmitter. -->
+                    <ToggleButton x:Name="MuteButton" Content="MUTE" Margin="20,0,6,0"
+                                  Style="{StaticResource IpSmallToggle}" Height="26" Padding="10,0"
+                                  FontSize="10.5" Click="Mute_Changed"
+                                  ToolTip="Silence the preview (M)"/>
+
+                    <Slider x:Name="LevelSlider" Width="110" Minimum="0" Maximum="1"
+                            Value="0.8" VerticalAlignment="Center"
+                            IsSnapToTickEnabled="False"
+                            ValueChanged="Level_Changed"
+                            ToolTip="How loud the preview plays on this PC"/>
+
+                    <TextBlock x:Name="LevelText" Width="62" Margin="6,0,0,0"
+                               VerticalAlignment="Center" TextAlignment="Right"
+                               FontFamily="Consolas" FontSize="10.5"
+                               Foreground="{StaticResource Tc}"/>
                 </StackPanel>
 
-                <TextBlock x:Name="PositionText" Text="00:00:00:00" HorizontalAlignment="Right"
-                           VerticalAlignment="Center" FontFamily="Consolas" FontSize="15"
-                           Foreground="{StaticResource Tc}"/>
+                <!-- Zoom lives with the transport rather than on the timeline: it is a thing
+                     done while watching, and the keyboard is the real control. -->
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center">
+                    <Button x:Name="ZoomOutButton" Content="&#8722;" Style="{StaticResource GhostButton}"
+                            Width="30" Click="ZoomOut_Click" ToolTip="Show more time (-)"/>
+                    <TextBlock x:Name="ZoomText" Width="120" TextAlignment="Center"
+                               VerticalAlignment="Center" FontFamily="Consolas" FontSize="11.5"
+                               Foreground="{StaticResource Tc}"/>
+                    <Button x:Name="ZoomInButton" Content="+" Style="{StaticResource GhostButton}"
+                            Width="30" Click="ZoomIn_Click" ToolTip="Show less time, in more detail (+)"/>
+
+                    <!-- Two ways of looking at the same recording: every file on the clock, or
+                         only what runs from the start of the capture to the transmitter.
+                         The infinity sign rather than the word - it is the one glyph that says
+                         this without needing eight characters of the transport bar. -->
+                    <ToggleButton x:Name="InfiniteButton" Content="&#8734;" Margin="16,0,0,0"
+                                  Style="{StaticResource IpSmallToggle}" Height="24" Width="34"
+                                  Padding="0" FontSize="17" Click="Infinite_Changed"
+                                  ToolTip="Infinite view: the capture up to the on-air point, as one bar"/>
+
+                    <!-- What is selected on a layer, and its level. Keyboard-driven: the
+                         brackets move it a decibel at a time, Delete takes it off. -->
+                    <TextBlock x:Name="LayerText" Margin="16,0,0,0" VerticalAlignment="Center"
+                               FontFamily="Consolas" FontSize="11"
+                               Foreground="{StaticResource Ok}"/>
+                </StackPanel>
+
+                <!-- The right-hand readouts. Nothing in here grows with what the operator does:
+                     a mark readout used to live at the left of this panel and widen as marks were
+                     set, and because this panel and the volume slider share one Grid it reached
+                     back across the slider and swallowed the clicks meant for it. The marks are
+                     labelled on the timeline itself, which is where they are. -->
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <!-- Go to an exact frame, typed. At anything short of the last zoom level one
+                         pixel of the timeline is many frames, so there is no click that can land
+                         on a chosen frame; this is how you name one. Takes a timecode, or a bare
+                         frame number. -->
+                    <TextBox x:Name="GoToBox" Width="104" Height="24" Margin="0,0,6,0"
+                             FontFamily="Consolas" FontSize="11.5" Padding="6,0"
+                             VerticalContentAlignment="Center"
+                             KeyDown="GoTo_KeyDown" LostFocus="GoTo_LostFocus"
+                             ToolTip="Type a timecode (10:23:45:12) or a frame number and press Enter"/>
+
+                    <TextBlock x:Name="PositionText" Margin="4,0,0,0" Text="00:00:00:00"
+                               VerticalAlignment="Center" FontFamily="Consolas" FontSize="15"
+                               Foreground="{StaticResource Tc}"/>
+
+                    <!-- The same position as a frame count. Timecode is what a plant speaks;
+                         frames are what an edit is measured in, and converting in your head
+                         between them is the arithmetic this exists to save. -->
+                    <TextBlock x:Name="FramesText" Margin="10,0,0,0" VerticalAlignment="Center"
+                               FontFamily="Consolas" FontSize="11"
+                               Foreground="{StaticResource Muted}"/>
+                </StackPanel>
             </Grid>
         </Border>
 
@@ -126,16 +457,56 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="24"/>
                     <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
+                <!-- The ruler drags too. It is the part of the timeline that most looks like
+                     something you would grab. -->
                 <Canvas x:Name="RulerCanvas" Grid.Row="0" ClipToBounds="True"
-                        Background="#141920" SizeChanged="Timeline_SizeChanged"/>
+                        Background="#141920" SizeChanged="Timeline_SizeChanged"
+                        MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
+                        MouseLeave="Pan_Leave"/>
 
+                <!-- Left button puts the playhead somewhere; the middle button - the scroll
+                     wheel pressed - drags the view itself, which is what a hand cursor over a
+                     timeline means everywhere else. -->
                 <Canvas x:Name="TrackCanvas" Grid.Row="1" ClipToBounds="True"
-                        SizeChanged="Timeline_SizeChanged"/>
+                        SizeChanged="Timeline_SizeChanged"
+                        MouseLeftButtonDown="Timeline_Click" Background="Transparent"
+                        MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
+                        MouseLeave="Pan_Leave"/>
 
-                <Rectangle x:Name="Playhead" Grid.RowSpan="2" Width="1.5" HorizontalAlignment="Left"
-                           Fill="{StaticResource Bad}" Margin="0"/>
+                <!-- The layers. Drop an audio or video file on one to lay it over the recording
+                     at the time you dropped it - an ad, a bed, a voice track. Two, because two
+                     is what a lane and an alternate need and more would make the timeline a
+                     thicket at this height. -->
+                <!-- 108: two hand-drop lanes and the ingest lane below them, 36 each. -->
+                <Canvas x:Name="OverlayCanvas" Grid.Row="2" Height="108" ClipToBounds="True"
+                        Background="#101419" AllowDrop="True"
+                        SizeChanged="Timeline_SizeChanged"
+                        DragOver="Overlay_DragOver" Drop="Overlay_Drop"
+                        MouseLeftButtonDown="Overlay_Click"/>
+
+                <!-- Left-aligned with a margin rather than drawn on the canvas: it moves every
+                     frame, and moving a margin does not rebuild the timeline under it. -->
+                <!-- Two markers, and they are not the same thing. The playhead is where the
+                     operator is looking; the on-air marker is where the transmitter actually
+                     is. Red is the one that matters on air. -->
+                <Rectangle x:Name="Playhead" Grid.RowSpan="3" Width="1.5" HorizontalAlignment="Left"
+                           Fill="{StaticResource Tc}" Margin="0" IsHitTestVisible="False"/>
+
+                <Rectangle x:Name="OnAirMarker" Grid.RowSpan="3" Width="2" HorizontalAlignment="Left"
+                           Fill="{StaticResource Bad}" Margin="0" IsHitTestVisible="False"
+                           Visibility="Collapsed"/>
+
+                <!-- Only there when there is something to scroll: at the widest zoom the whole
+                     day is across the window and a scrollbar would be a control that does
+                     nothing. Its units are frames of the day, like everything else here. -->
+                <ScrollBar x:Name="TimeScroll" Grid.Row="3" Orientation="Horizontal"
+                           Height="18" Margin="0,2,0,0" Minimum="0"
+                           SmallChange="1" Visibility="Collapsed"
+                           Scroll="TimeScroll_Scroll"/>
             </Grid>
         </Border>
     </Grid>

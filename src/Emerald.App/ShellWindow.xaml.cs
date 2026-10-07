@@ -78,6 +78,9 @@ public partial class ShellWindow : Window
     private readonly AudioMonitor _audio = new();
     private readonly ObservableCollection<AudioPairRow> _audioPairs = new();
 
+    /// <summary>The pair count last acted on, so the added tracks are renumbered when it moves.</summary>
+    private int _pairsSeen = -1;
+
     /// <summary>The application's one clock. This window joins it; it never owns it.</summary>
     private readonly TimecodeService _timecode = TimecodeLink.Service;
     private readonly ObservableCollection<ClipItem> _clips = new();
@@ -181,7 +184,7 @@ public partial class ShellWindow : Window
     private async void ShellWindow_Loaded(object sender, RoutedEventArgs e)
     {
         OutputPathBox.Text = MediaLibrary.FolderFor(_settings);
-        RecordTitleBox.Text = _settings.RecordingTitle.Length == 0 ? "capture" : _settings.RecordingTitle;
+        RecordTitleBox.Text = RecordingSequence.PrefixOr(_settings.RecordingTitle);
         RecordDescriptionBox.Text = _settings.RecordingDescription;
         SetDurationBox.Text = _settings.RecordingDuration;
 
@@ -200,6 +203,10 @@ public partial class ShellWindow : Window
 
         _clock.Start();
         _tick.Start();
+
+        // Before the board scan, so the scan's own lines land on the panel rather than being
+        // the first thing missing from it.
+        StartCaptureLog();
 
         await ScanBoards();
         RefreshClips();
@@ -264,7 +271,10 @@ public partial class ShellWindow : Window
         BoardBox.SelectedItem = board;
         _loading = wasLoading;
 
-        PopulatePorts(_settings.CapturePort);
+        // Whatever is in the box wins over the stored value where both exist, so a re-scan keeps
+        // the operator's choice. RememberSource normally keeps the two the same; this is the
+        // floor under it for the paths that re-scan without going through a selection change.
+        PopulatePorts((PortBox.SelectedItem as ChannelPort)?.Name ?? _settings.CapturePort);
         RefreshButton.IsEnabled = true;
         UpdateBoardDetail();
         StartPreview();
@@ -389,18 +399,63 @@ public partial class ShellWindow : Window
 
         PopulatePorts(null);
         UpdateBoardDetail();
+        RememberSource();
         StartPreview();
     }
 
     private void PortBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_loading) return;
+
+        RememberSource();
         StartPreview();
+    }
+
+    /// <summary>
+    /// Writes the chosen board and receiver into the settings as soon as they are chosen.
+    ///
+    /// <b>This is what makes a refresh keep the change.</b> The port used to live only in the
+    /// combo box until something else happened to save the deck, and a refresh re-populates the
+    /// list from the <i>stored</i> port — so changing RX0 to RX1 and then pressing refresh put it
+    /// straight back to RX0, silently, and the next recording came off the old receiver. Saving
+    /// here means the stored value and the box always agree.
+    ///
+    /// Said in the log too. Which receiver a recording came from is not recoverable afterwards
+    /// from the file, so the moment it changed is worth having written down.
+    /// </summary>
+    private void RememberSource()
+    {
+        if (BoardBox.SelectedItem is not BoardInfo board) return;
+
+        string? port = (PortBox.SelectedItem as ChannelPort)?.Name;
+
+        bool moved = board.Index != _settings.CaptureBoardIndex ||
+                     (port is not null && port != _settings.CapturePort);
+
+        if (!moved) return;
+
+        string was = $"board {_settings.CaptureBoardIndex} {_settings.CapturePort}";
+
+        _settings.CaptureBoardIndex = board.Index;
+        if (port is not null) _settings.CapturePort = port;
+        _settings.Save();
+
+        ActivityLog.Shared.Info(LogSource.Capture,
+            $"SOURCE set to board {board.Index} {port ?? "-"} (was {was}). " +
+            "A recording already running keeps the receiver it started on.",
+            @event: "capture.source");
+
+        SetStatus($"source: board {board.Index} {port ?? "-"}", false);
     }
 
     private async void Refresh_Click(object sender, RoutedEventArgs e)
     {
         _preview.Stop();
+
+        // The current choice, not the stored one, so a refresh never undoes a change the operator
+        // has just made in the box beside it.
+        RememberSource();
+
         await ScanBoards();
     }
 
@@ -503,6 +558,12 @@ public partial class ShellWindow : Window
 
     private void RefreshClips()
     {
+        // The clip strip is collapsed - this side of the page is the capture log now - and
+        // listing the store runs ffprobe once per file. On this plant's own store that is a
+        // minute of disk for a panel nobody can see, and it would run again on every refresh
+        // while a recording is going. The window that lists the store is Live Edit.
+        if (StageMedia.Visibility != Visibility.Visible) return;
+
         string folder = StoreFolder;
         int rate = SelectedRate();
         string? ffmpeg = Ffmpeg.Locate(_settings.FfmpegPath);
@@ -926,6 +987,13 @@ public partial class ShellWindow : Window
 
         IReadOnlyList<CaptureAudioTrack> addedAudio = CurrentCaptureAudio();
 
+        // A folder of its own for this recording, and the next numbers in the year's run. The
+        // counter is read here and written back as segments land, because it belongs to the
+        // machine rather than to any one recording — the whole point is that it carries on.
+        DateTime rolledAt = DateTime.Now;
+
+        RecordingNames naming = RecordingSequence.Next(rolledAt, RecordTitleBox.Text);
+
         if (!RecordingSetup.TryBuild(_settings, board.Index, port.Index, folder, SelectedRate(),
                                      RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem,
                                      extraAudio: addedAudio))
@@ -945,7 +1013,16 @@ public partial class ShellWindow : Window
         // the line itself once the receiver reports what it locked to, whether tidal lock was
         // armed before this recording or part-way through it.
 
-        _capture.Start(request!);
+        _capture.Start(request! with { Names = naming });
+
+        ActivityLog.Shared.Info(LogSource.Capture,
+            $"FOLDER {naming.Folder} - this recording's own folder, segments from " +
+            $"{naming.FirstFile(RecordingProfile.LowRes.Extension)}, one every " +
+            $"{_settings.RecordingSegmentSeconds} s.",
+            @event: "capture.folder",
+            correlation: _capture.SessionId,
+            file: Path.Combine(RecordingProfile.FolderFor(RecordingProfile.LowRes, folder), naming.Folder),
+            detail: $"folder {naming.Folder}\nfirst number {naming.Start}");
 
         // After Start, because that is where the session is minted, and the whole point of the
         // line is to name the recording everything after it will refer to.
@@ -959,7 +1036,7 @@ public partial class ShellWindow : Window
 
         // From here the store is watched for each segment as it is finished, and every one
         // is written down with its length and its size under this session.
-        _segments = new SegmentWatch(folder, request.NamePrefix, _recordStartedUtc);
+        _segments = new SegmentWatch(folder, request.NamePrefix, _recordStartedUtc, naming.Folder);
         _segmentSession = _capture.SessionId;
         _segmentRate = SelectedRate();
 
@@ -1317,9 +1394,18 @@ public partial class ShellWindow : Window
     /// Correlated to the recording when one is running, so the change and the file it affected
     /// are the same thread on the monitoring page.
     /// </summary>
-    private void LogAudio(string message, string @event, LogLevel level = LogLevel.Info) =>
+    /// <summary>
+    /// Every audio choice on the deck, into the record.
+    ///
+    /// <paramref name="file"/> matters for the added tracks: a line naming a file that cannot be
+    /// searched for by path is a line that cannot answer "which bed was that", and two files
+    /// called english.wav in different folders are not the same audio.
+    /// </summary>
+    private void LogAudio(string message, string @event, LogLevel level = LogLevel.Info,
+                          string? file = null, string? detail = null) =>
         ActivityLog.Shared.Write(LogSource.Capture, level, message, @event,
-                                 correlation: _capture.IsRunning ? _capture.SessionId : null);
+                                 correlation: _capture.IsRunning ? _capture.SessionId : null,
+                                 file: file, detail: detail);
 
     /// <summary>
     /// Counts what the store's masters are encoded with, and says so once per listing.
@@ -1518,6 +1604,7 @@ public partial class ShellWindow : Window
                             $"proxy {segment.ProxyPath}\nproxy bytes {segment.ProxyBytes}\n" +
                             $"master {segment.MasterPath ?? "-"}\nmaster bytes {segment.MasterBytes}");
             }
+
         });
     }
 
@@ -1557,8 +1644,9 @@ public partial class ShellWindow : Window
                 Label = Path.GetFileNameWithoutExtension(path),
             });
 
-            LogAudio($"Added audio track \"{Path.GetFileNameWithoutExtension(path)}\": {path}",
-                     "capture.audio.added");
+            LogAudio($"SELECT added audio track \"{Path.GetFileNameWithoutExtension(path)}\" - " +
+                     $"{Path.GetFileName(path)} from {Path.GetDirectoryName(path)}.",
+                     "capture.audio.added", file: path);
         }
 
         RenumberCaptureAudio();
@@ -1569,7 +1657,8 @@ public partial class ShellWindow : Window
         if ((sender as FrameworkElement)?.DataContext is not CaptureAudioRow row) return;
 
         _captureAudio.Remove(row);
-        LogAudio($"Removed audio track \"{row.Label}\".", "capture.audio.removed");
+        LogAudio($"REMOVE added audio track \"{row.Label}\" - {Path.GetFileName(row.Path)}.",
+                 "capture.audio.removed", file: row.Path);
         RenumberCaptureAudio();
     }
 
@@ -1664,27 +1753,56 @@ public partial class ShellWindow : Window
     {
         _audio.Tick(_clock.Interval);
 
-        // Rows follow what is on the wire. A feed with one pair shows one row rather than
-        // three dead ones, and a four-language message grows the panel when it starts.
-        int pairs = Math.Max(1, Math.Min(_audio.PairsPresent, SdiAudioReader.MaxPairs));
-
-        if (_audioPairs.Count != pairs)
+        // Every pair the receiver can carry, listed whether it has signal or not.
+        //
+        // It used to show only the pairs that were live, which meant a language you were
+        // waiting for could not be selected until it arrived, and a pair carried on 5-6 with
+        // nothing on 3-4 was never listed at all - the count stops at the first gap. SMPTE 299
+        // carries eight pairs, so eight rows, each saying what it is doing.
+        if (_audioPairs.Count != SdiAudioReader.MaxPairs)
         {
-            while (_audioPairs.Count < pairs) _audioPairs.Add(new AudioPairRow { Pair = _audioPairs.Count });
-            while (_audioPairs.Count > pairs) _audioPairs.RemoveAt(_audioPairs.Count - 1);
+            while (_audioPairs.Count < SdiAudioReader.MaxPairs)
+                _audioPairs.Add(new AudioPairRow { Pair = _audioPairs.Count });
 
-            // Added tracks are numbered after the embedded pairs, so they move when the feed
-            // starts or stops carrying a language.
             RenumberCaptureAudio();
         }
 
-        foreach (AudioPairRow row in _audioPairs) row.Update(_audio);
+        // The added tracks are numbered after the embedded pairs, so they move when the feed
+        // starts or stops carrying a language. The row count no longer changes with it, so the
+        // pair count is what this watches.
+        if (_audio.PairsPresent != _pairsSeen)
+        {
+            int was = _pairsSeen;
+            _pairsSeen = _audio.PairsPresent;
+            RenumberCaptureAudio();
 
+            // What there is to choose from has changed. Written down because it is the thing
+            // that explains a selection: a language that was not there to pick five minutes
+            // ago, or one that has gone away under a pair still selected. Not on the first
+            // pass, which is the panel filling in rather than the feed changing.
+            if (was >= 0)
+                LogAudio(
+                    $"WIRE  audio pairs on the receiver: {_pairsSeen} of {SdiAudioReader.MaxPairs} " +
+                    $"carrying (was {was})" +
+                    (_recording ? $" - the recording keeps the {_capture.PairsRecording} it started with" : "") + ".",
+                    "capture.audio.detected",
+                    _pairsSeen == 0 ? LogLevel.Warn : LogLevel.Info,
+                    detail: $"pairs now {_pairsSeen}\npairs before {was}\n" +
+                            $"recording {(_recording ? _capture.PairsRecording : 0)}");
+        }
+
+        bool listening = ListenButton.IsChecked == true;
+        int recording = _recording ? _capture.PairsRecording : 0;
+
+        foreach (AudioPairRow row in _audioPairs) row.Update(_audio, listening, recording);
+
+        // Out of eight, because all eight are listed now: "1 pair" against eight rows would
+        // read as seven of them having gone missing.
         AudioPairsText.Text = _audio.PairsPresent switch
         {
-            0 => "no audio",
-            1 => "1 pair",
-            var n => $"{n} pairs",
+            0 => "no audio on the wire",
+            var n => $"{n} of {SdiAudioReader.MaxPairs} pairs carrying"
+                     + (recording > 0 ? $", {recording} recorded" : ""),
         };
     }
 
@@ -1695,7 +1813,23 @@ public partial class ShellWindow : Window
 
         foreach (AudioPairRow other in _audioPairs) other.Listening = ReferenceEquals(other, row);
 
-        LogAudio($"Monitoring {row.Name} ({row.ChannelLabel}).", "capture.audio.pair");
+        // Said plainly, and said accurately: selecting a pair with the speakers off is a
+        // selection and not monitoring, and claiming otherwise leaves an operator wondering why
+        // they cannot hear the pair the record says they are listening to. What it never
+        // changes is stated either way, because that is the thing to be sure of before touching
+        // this while on air.
+        bool speakers = ListenButton.IsChecked == true;
+        bool inFile = _recording && row.Pair < _capture.PairsRecording;
+
+        LogAudio(
+            $"SELECT {row.Name} ({row.ChannelLabel}) - " +
+            (speakers ? "now on the speakers of this PC" : "selected; the speakers are off") +
+            (row.Present ? "" : ", no signal on it") +
+            (inFile ? ", and it is in the recording" : "") +
+            ". The picture, the recording and the transmitter are untouched.",
+            "capture.audio.pair",
+            detail: $"pair {row.Pair + 1}\nchannels {row.Pair * 2 + 1}-{row.Pair * 2 + 2}\n" +
+                    $"speakers {speakers}\nsignal {row.Present}\nin recording {inFile}");
 
         if (ListenButton.IsChecked == true) StartListening(row.Pair);
     }
@@ -1989,6 +2123,10 @@ public partial class ShellWindow : Window
         TimecodeLink.UrlChanged -= OnTimecodeUrlChanged;
         TidalLock.Shared.Changed -= OnTidalLockChanged;
 
+        // A static event holds this window for the life of the process otherwise, and every line
+        // written after it closes would still run its handler.
+        StopCaptureLog();
+
         SaveDeckSettings();
 
         // Every module, by name. They are not owned windows — see ShowModule — so nothing
@@ -2023,4 +2161,98 @@ public partial class ShellWindow : Window
         int rate = SelectedRate();
         return new Timecode((long)Math.Round(span.TotalSeconds * rate), rate).ToString();
     }
+
+    // ------------------------------------------------------------- the capture record
+
+    /// <summary>One line on the capture log panel.</summary>
+    private sealed record CaptureLogRow(string Time, string Source, string Message, Brush Brush);
+
+    private Brush Brush(string key) => (Brush)FindResource(key);
+
+    private readonly ObservableCollection<CaptureLogRow> _captureLog = new();
+
+    /// <summary>
+    /// How many lines the panel keeps.
+    ///
+    /// The record itself is kept by <see cref="ActivityLog"/>, in memory and on disk — this is
+    /// only what is rendered, and every row is a live visual. A day of capture is tens of
+    /// thousands of lines and WPF will not draw them.
+    /// </summary>
+    private const int CaptureLogLimit = 600;
+
+    /// <summary>
+    /// Which sources belong on the capture side.
+    ///
+    /// Capture is the receiver, the encoder and the store: what the plant is taking in and what
+    /// it is writing. <b>Board</b> is here because which card and which receiver is a capture
+    /// question on this page. <b>Preview</b> is the monitoring of that same receiver.
+    ///
+    /// Deliberately not here: Playout, Playback and TidalLock, which are the transmitter's story
+    /// and have their own panel on the playback deck. Nor Edl or Ingest, which are other windows.
+    /// </summary>
+    private static bool IsCapture(LogSource source) =>
+        source is LogSource.Capture or LogSource.Preview or LogSource.Board or LogSource.Media;
+
+    /// <summary>
+    /// Takes a line from the shared record, if it is a capture line.
+    ///
+    /// Raised from the capture thread and the encoder's reader thread among others, so it crosses
+    /// to the dispatcher before touching the collection.
+    /// </summary>
+    private void OnCaptureLogLine(LogLine line)
+    {
+        if (!IsCapture(line.Source)) return;
+
+        Dispatcher.BeginInvoke(() => AddCaptureLine(line));
+    }
+
+    private void AddCaptureLine(LogLine line)
+    {
+        _captureLog.Add(new CaptureLogRow(
+            line.At.ToString("HH:mm:ss"),
+            line.SourceText,
+            line.Message,
+            Brush(line.Level switch
+            {
+                Emerald.Core.LogLevel.Error => "IpRed",
+                Emerald.Core.LogLevel.Warn => "Warn",
+                Emerald.Core.LogLevel.Ok => "IpMint",
+                _ => "IpText",
+            })));
+
+        while (_captureLog.Count > CaptureLogLimit) _captureLog.RemoveAt(0);
+
+        // Only when the operator has left it following. Scrolling back to read something and
+        // having the view yanked to the bottom by the next line is the thing that makes a live
+        // log useless to read.
+        if (FollowCaptureLog.IsChecked == true) CaptureLogScroller.ScrollToEnd();
+    }
+
+    private void ClearCaptureLog_Click(object sender, RoutedEventArgs e)
+    {
+        _captureLog.Clear();
+
+        // Said plainly: this clears the panel, not the record. The log on disk is the thing an
+        // operator will be asked about tomorrow and a button on a deck must not be able to lose
+        // it.
+        _captureLog.Add(new CaptureLogRow(
+            DateTime.Now.ToString("HH:mm:ss"), "app",
+            "Panel cleared. The record itself is untouched - it is still on disk.",
+            Brush("IpDim")));
+    }
+
+    /// <summary>Starts the panel: the backlog first, then everything as it arrives.</summary>
+    private void StartCaptureLog()
+    {
+        CaptureLogList.ItemsSource = _captureLog;
+
+        // What has already been said this session, so opening the deck into a running plant does
+        // not show a blank page.
+        foreach (LogLine line in ActivityLog.Shared.Snapshot())
+            if (IsCapture(line.Source)) AddCaptureLine(line);
+
+        ActivityLog.Shared.Line += OnCaptureLogLine;
+    }
+
+    private void StopCaptureLog() => ActivityLog.Shared.Line -= OnCaptureLogLine;
 }

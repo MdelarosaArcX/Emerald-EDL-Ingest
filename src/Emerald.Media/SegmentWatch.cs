@@ -1,3 +1,4 @@
+using Emerald.Core;
 using System.IO;
 using Emerald.Video;
 
@@ -6,6 +7,9 @@ namespace Emerald.Media;
 /// <summary>One segment of a continuous recording, once both halves of it are on the disk.</summary>
 public sealed record CompletedSegment(
     int Number,
+
+    /// <summary>The number in the filename, which is the year's running count rather than 1,2,3.</summary>
+    long Sequence,
     string ProxyPath,
     long ProxyBytes,
     string? MasterPath,
@@ -47,12 +51,21 @@ public sealed class SegmentWatch
     /// <param name="root">The store: the folder the low and high subfolders live in.</param>
     /// <param name="namePrefix">What the recording's files are called before the timestamp.</param>
     /// <param name="sinceUtc">When the recording started. Older files are somebody else's.</param>
-    public SegmentWatch(string root, string namePrefix, DateTime sinceUtc)
+    /// <param name="recordingFolder">
+    /// The per-recording folder to watch, or null for the flat store an older recording wrote to.
+    /// </param>
+    public SegmentWatch(string root, string namePrefix, DateTime sinceUtc, string? recordingFolder = null)
     {
         _root = root;
         _prefix = namePrefix;
         _sinceUtc = sinceUtc;
+        _recordingFolder = recordingFolder;
     }
+
+    private readonly string? _recordingFolder;
+
+    /// <summary>The highest number written so far, for carrying the year's counter forward.</summary>
+    public long HighestSequence { get; private set; } = -1;
 
     /// <summary>
     /// The segments finished since the last call, oldest first. Cheap enough to call on a
@@ -62,6 +75,10 @@ public sealed class SegmentWatch
     public IReadOnlyList<CompletedSegment> Poll()
     {
         string low = RecordingProfile.FolderFor(RecordingProfile.LowRes, _root);
+
+        // Inside this recording's own folder when there is one, so a second recorder writing
+        // at the same time into its own folder is never mistaken for this one's segments.
+        if (_recordingFolder is not null) low = Path.Combine(low, _recordingFolder);
         var done = new List<CompletedSegment>();
 
         IEnumerable<string> candidates;
@@ -94,8 +111,12 @@ public sealed class SegmentWatch
 
             _announced.Add(proxy);
 
+            long sequence = RecordingSequence.NumberIn(Path.GetFileName(proxy)) ?? -1;
+            if (sequence > HighestSequence) HighestSequence = sequence;
+
             done.Add(new CompletedSegment(
                 Number: ++_number,
+                Sequence: sequence,
                 ProxyPath: proxy,
                 ProxyBytes: SafeLength(proxy),
                 MasterPath: master,

@@ -46,7 +46,14 @@ public enum TidalLockState
 public sealed class TidalLock
 {
     /// <summary>The default gap between the receiver and the transmitter.</summary>
-    public static readonly TimeSpan DefaultDelay = TimeSpan.FromMinutes(1);
+    /// <summary>
+    /// The delay offered before anybody chooses one.
+    ///
+    /// Two minutes. This is the compliance window — how long somebody has to notice something
+    /// and stop it reaching air — so the default should be the one a plant would want if nobody
+    /// thought about it, not the smallest one that works.
+    /// </summary>
+    public static readonly TimeSpan DefaultDelay = TimeSpan.FromMinutes(2);
 
     /// <summary>The one instance the two decks talk through.</summary>
     public static TidalLock Shared { get; } = new();

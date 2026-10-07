@@ -50,7 +50,7 @@ public sealed class AppSettings
     /// <summary>Rate the recorder falls back to when the receiver reports no standard.</summary>
     [JsonPropertyName("captureFrameRate")] public int CaptureFrameRate { get; set; } = 25;
 
-    /// <summary>Names the files a recording writes, in place of the default "capture".</summary>
+    /// <summary>Names the files a recording writes, in place of <see cref="RecordingSequence.DefaultPrefix"/>.</summary>
     [JsonPropertyName("recordingTitle")] public string RecordingTitle { get; set; } = "";
 
     /// <summary>The operator's note about what is being recorded.</summary>
@@ -79,7 +79,69 @@ public sealed class AppSettings
     [JsonPropertyName("recordingVideoBitrateKbps")] public int RecordingVideoBitrateKbps { get; set; }
     [JsonPropertyName("recordingAudioBitrateKbps")] public int RecordingAudioBitrateKbps { get; set; } = 192;
     [JsonPropertyName("recordingAudioSampleRate")] public int RecordingAudioSampleRate { get; set; } = 48000;
-    [JsonPropertyName("recordingSegmentSeconds")] public int RecordingSegmentSeconds { get; set; } = 120;
+    /// <summary>
+    /// How long each recorded segment runs.
+    ///
+    /// Thirty seconds rather than two minutes. The segment length is also how long a recording
+    /// is unreadable for: ffmpeg writes the index last, so the segment being written cannot be
+    /// played, probed or exported until it closes. At two minutes that meant up to two minutes
+    /// of the most recent material was out of reach in Live Edit — which is the material anybody
+    /// looking at a live plant actually wants.
+    ///
+    /// The cost is four times as many files and four times as many closing boundaries, which is
+    /// cheap: a day is 2,880 segments per profile rather than 720.
+    /// </summary>
+    [JsonPropertyName("recordingSegmentSeconds")] public int RecordingSegmentSeconds { get; set; } = DefaultSegmentSeconds;
+
+    public const int DefaultSegmentSeconds = 30;
+
+    /// <summary>
+    /// The segment length written into every settings file before the default changed.
+    ///
+    /// Like <see cref="RecordingSequence.FormerDefaultPrefix"/>, this is not a choice anybody
+    /// made: it was saved the first time the deck opened. A changed default reaches only a
+    /// machine with no settings file, so without this every machine that has ever run Emerald
+    /// would keep two-minute segments for good — which is also two minutes before the newest
+    /// material can be played, probed or exported.
+    ///
+    /// There is no control for this on the deck, so an operator could not have set it
+    /// deliberately through the application either.
+    /// </summary>
+    public const int FormerDefaultSegmentSeconds = 120;
+
+    /// <summary>
+    /// Whether this machine serves its monitoring to other machines on the network.
+    ///
+    /// Off unless asked for. Nothing listens, no port is open, and a plant that never wants
+    /// this is exactly as it was.
+    /// </summary>
+    /// <summary>
+    /// Every TX port the delayed feed goes out of, as names separated by a bar.
+    ///
+    /// Names rather than indices because a settings file outlives a board being moved to another
+    /// slot. <see cref="PlaybackPort"/> is kept alongside it as the first of them, so anything
+    /// that still expects a single port finds one.
+    /// </summary>
+    [JsonPropertyName("playbackPorts")] public string PlaybackPorts { get; set; } = "";
+
+    /// <summary>
+    /// Whether the EDL records the receiver by itself while a message is on air.
+    ///
+    /// <b>Off unless asked for, and that default is the point of this setting.</b> The EDL used
+    /// to start a recording of its own every time playout began — no toggle, no mention of it on
+    /// the page — writing the same receiver into the same store as the capture deck under the
+    /// older flat naming. Two recorders, two schemes, one folder: a store with a recording in it
+    /// that nobody had started, at roughly 1.8 GB of master every two minutes.
+    ///
+    /// The feature itself is defensible — what lands on disk lines up with what was transmitted —
+    /// so it is kept and made a choice rather than removed.
+    /// </summary>
+    [JsonPropertyName("edlRecordWhileOnAir")] public bool EdlRecordWhileOnAir { get; set; }
+
+    [JsonPropertyName("monitorApi")] public bool MonitorApi { get; set; }
+
+    /// <summary>The port the monitoring is served on when it is on.</summary>
+    [JsonPropertyName("monitorApiPort")] public int MonitorApiPort { get; set; } = MonitorServer.DefaultPort;
 
     /// <summary>The language tracks, in list order — which is also their engine track index.</summary>
     [JsonPropertyName("audioTracks")] public List<AudioTrackSetting> AudioTracks { get; set; } = new();
@@ -165,13 +227,32 @@ public sealed class AppSettings
                         : "";
 
             if (path.Length > 0)
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Options) ?? new AppSettings();
+                return Migrate(
+                    JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Options)
+                    ?? new AppSettings());
         }
         catch
         {
             // A corrupt or unreadable settings file is never worth blocking startup over.
         }
         return new AppSettings();
+    }
+
+    /// <summary>
+    /// Brings a settings file written by an older Emerald up to date.
+    ///
+    /// Only values that were defaults rather than decisions. A changed default reaches a fresh
+    /// install and nothing else, so without this the only machines running the current behaviour
+    /// would be ones that had never run Emerald before.
+    ///
+    /// Not saved here: loading is not the moment to write, and the next ordinary Save carries it.
+    /// </summary>
+    public static AppSettings Migrate(AppSettings settings)
+    {
+        if (settings.RecordingSegmentSeconds == FormerDefaultSegmentSeconds)
+            settings.RecordingSegmentSeconds = DefaultSegmentSeconds;
+
+        return settings;
     }
 
     public void Save()

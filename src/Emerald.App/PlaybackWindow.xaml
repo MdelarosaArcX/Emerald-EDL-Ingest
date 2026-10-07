@@ -38,130 +38,135 @@
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
-                <!-- ====================== media, on the left ====================== -->
+                <!-- ====================== the record, on the left ======================
+                     This deck used to audition clips on a large stage with a strip of them
+                     underneath. Nothing about that was what an operator watches here: the
+                     transmitter carries the delayed receiver, not a clip chosen by hand, and
+                     what they need is what it is doing and what it has done. So the stage is
+                     the log, and the two things worth seeing across a room - whether it is on
+                     air, and how much of the delay is left - sit above it. -->
                 <Border Grid.Column="0" Background="{StaticResource IpPanel}"
                         BorderBrush="{StaticResource IpLine}" BorderThickness="1" CornerRadius="7">
-                    <Grid>
+                    <Grid Margin="3">
                         <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
                             <RowDefinition Height="*"/>
-                            <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
 
-                        <!-- The clip being auditioned before it goes out. -->
-                        <Border Grid.Row="0" Background="{StaticResource IpStage}" CornerRadius="6,6,0,0"
-                                Margin="3,3,3,0" ClipToBounds="True">
+                        <!-- On air, and the countdown while the delay fills. -->
+                        <Border Grid.Row="0" Background="{StaticResource IpStage}" CornerRadius="5"
+                                Padding="14,11" Margin="0,0,0,7">
                             <Grid>
-                                <MediaElement x:Name="Player" LoadedBehavior="Manual" UnloadedBehavior="Stop"
-                                              Stretch="Uniform" ScrubbingEnabled="True"
-                                              MediaOpened="Player_MediaOpened" MediaEnded="Player_MediaEnded"
-                                              MediaFailed="Player_MediaFailed"/>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
 
-                                <TextBlock x:Name="StagePlaceholder" Text="no clip selected"
-                                           HorizontalAlignment="Center" VerticalAlignment="Center"
-                                           Foreground="{StaticResource IpDim}" FontSize="12.5"/>
+                                <StackPanel Grid.Column="0" Orientation="Horizontal"
+                                            VerticalAlignment="Center">
+                                    <Ellipse x:Name="AirDot" Width="11" Height="11"
+                                             Fill="{StaticResource IpDim}" VerticalAlignment="Center"
+                                             Margin="0,0,9,0"/>
+                                    <TextBlock x:Name="AirText" Text="TX idle" FontSize="13"
+                                               FontWeight="SemiBold"
+                                               Foreground="{StaticResource IpMuted}"
+                                               VerticalAlignment="Center"/>
+                                </StackPanel>
 
-                                <!-- Tidal lock takes the whole stage while it is running: it is
-                                     the thing an operator is watching, and the countdown has to
-                                     be readable across the room. -->
-                                <Border x:Name="LockPanel" Visibility="Collapsed"
-                                        Background="#E6060A10" CornerRadius="6">
-                                    <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
-                                        <TextBlock x:Name="LockHeadline" Text="TIDAL LOCK"
-                                                   Foreground="{StaticResource IpMuted}" FontSize="12"
-                                                   FontWeight="SemiBold" HorizontalAlignment="Center"/>
-                                        <TextBlock x:Name="CountdownText" Text="01:00" FontFamily="Consolas"
-                                                   FontSize="76" FontWeight="Bold"
-                                                   Foreground="{StaticResource IpMint}"
-                                                   HorizontalAlignment="Center" Margin="0,4,0,0"/>
-                                        <TextBlock x:Name="CountdownDetail" Text=""
-                                                   Foreground="{StaticResource IpDim}" FontSize="11.5"
-                                                   HorizontalAlignment="Center" TextAlignment="Center"
-                                                   TextWrapping="Wrap" MaxWidth="420"/>
-                                    </StackPanel>
-                                </Border>
+                                <StackPanel Grid.Column="1" Margin="18,0,0,0" VerticalAlignment="Center">
+                                    <TextBlock x:Name="LockHeadline" Text="TIDAL LOCK"
+                                               Foreground="{StaticResource IpMuted}" FontSize="10"
+                                               FontWeight="SemiBold"/>
+                                    <TextBlock x:Name="CountdownDetail" Text=""
+                                               Foreground="{StaticResource IpDim}" FontSize="11"
+                                               TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                </StackPanel>
 
-                                <!-- On-air state, over the picture where it cannot be missed. -->
-                                <Border VerticalAlignment="Top" HorizontalAlignment="Right"
-                                        Margin="10" Background="#CC060A10" CornerRadius="3" Padding="10,5"
-                                        BorderThickness="1" BorderBrush="{StaticResource IpLine}">
-                                    <StackPanel Orientation="Horizontal">
-                                        <Ellipse x:Name="AirDot" Width="9" Height="9"
-                                                 Fill="{StaticResource IpDim}" VerticalAlignment="Center"
-                                                 Margin="0,0,8,0"/>
-                                        <TextBlock x:Name="AirText" Text="TX idle" FontSize="11"
-                                                   Foreground="{StaticResource IpMuted}" VerticalAlignment="Center"/>
-                                    </StackPanel>
+                                <!-- Kept named and in the tree so the countdown still has somewhere
+                                     to go. It is a panel in name only now; the number is the part
+                                     that mattered. -->
+                                <Border x:Name="LockPanel" Grid.Column="2" Visibility="Collapsed"
+                                        VerticalAlignment="Center">
+                                    <TextBlock x:Name="CountdownText" Text="01:00" FontFamily="Consolas"
+                                               FontSize="40" FontWeight="Bold"
+                                               Foreground="{StaticResource IpMint}"/>
                                 </Border>
                             </Grid>
                         </Border>
 
-                        <!-- Transport for the audition, and the way on to air. -->
-                        <Grid Grid.Row="1" Margin="9,7,9,4">
-                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                <Button Style="{StaticResource IpIconButton}" Width="26" Height="22"
-                                        Tag="{StaticResource IconPlay}" Click="PlayPause_Click"
-                                        ToolTip="Play or pause the audition"/>
-                                <Button Style="{StaticResource IpIconButton}" Width="26" Height="22"
-                                        Tag="{StaticResource IconStop}" Click="StopAudition_Click"
-                                        ToolTip="Stop the audition"/>
-                                <TextBlock x:Name="ClipNameText" Text="-" Foreground="{StaticResource IpMuted}"
-                                           FontSize="11" VerticalAlignment="Center" Margin="12,0,0,0"
-                                           TextTrimming="CharacterEllipsis" MaxWidth="330"/>
-                            </StackPanel>
+                        <!-- Frames out against frames recorded. The question an operator asks of a
+                             delay is whether it is still keeping up, and that is a number. -->
+                        <Border Grid.Row="1" Background="{StaticResource IpStage}" CornerRadius="5"
+                                Padding="14,9" Margin="0,0,0,7">
+                            <Grid>
+                                <TextBlock Text="ON AIR FRAMES" Foreground="{StaticResource IpMuted}"
+                                           FontSize="9.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                <TextBlock x:Name="AirFramesText" HorizontalAlignment="Right"
+                                           VerticalAlignment="Center" FontFamily="Consolas"
+                                           FontSize="12.5" Foreground="{StaticResource IpTeal}"
+                                           Text="-"/>
+                            </Grid>
+                        </Border>
 
-                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                                <Button Style="{StaticResource IpIconButton}" Width="24" Height="22"
-                                        Tag="{StaticResource IconRefresh}" Click="RefreshClips_Click"
-                                        ToolTip="Re-read the store"/>
-                                <Button x:Name="PlayToTxButton" Content="PLAY TO TX" Margin="8,0,0,0"
-                                        Style="{StaticResource GhostButton}" Height="24" Padding="14,0"
-                                        FontSize="11" FontWeight="SemiBold"
-                                        Foreground="{StaticResource IpMint}"
-                                        Click="PlayToTx_Click"
-                                        ToolTip="Put the selected clip on the transmitter now"/>
-                            </StackPanel>
-                        </Grid>
+                        <!-- The log itself, which is now the point of this side of the page. -->
+                        <Border Grid.Row="2" Background="{StaticResource IpStage}" CornerRadius="5"
+                                Padding="12,10">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
 
-                        <!-- Clip strip -->
-                        <Grid Grid.Row="2" Height="226" Margin="9,0,9,9">
-                            <ListBox x:Name="ClipStrip" Style="{StaticResource IpClipStrip}"
-                                     SelectionChanged="ClipStrip_SelectionChanged">
-                                <ListBox.ItemTemplate>
-                                    <DataTemplate>
-                                        <Grid>
-                                            <Grid.RowDefinitions>
-                                                <RowDefinition Height="70"/>
-                                                <RowDefinition Height="Auto"/>
-                                            </Grid.RowDefinitions>
+                                <Grid Grid.Row="0" Margin="0,0,0,7">
+                                    <TextBlock x:Name="LogHeader" Text="PLAYBACK ACTIVITY"
+                                               Foreground="{StaticResource IpMuted}"
+                                               FontSize="9.5" FontWeight="SemiBold"
+                                               VerticalAlignment="Center"/>
 
-                                            <Border Grid.Row="0" Background="#070B11" CornerRadius="3,3,0,0"
-                                                    ClipToBounds="True">
-                                                <Grid>
-                                                    <Path Data="{StaticResource IconFilm}" Fill="#22303F"
-                                                          Stretch="Uniform" Width="26" Height="26"
-                                                          HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                                                    <Image Source="{Binding Thumbnail}" Stretch="UniformToFill"/>
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                        <ToggleButton x:Name="FollowLogButton" Content="FOLLOW"
+                                                      IsChecked="True"
+                                                      Style="{StaticResource IpSmallToggle}"
+                                                      Height="20" Padding="9,0" FontSize="9.5"
+                                                      ToolTip="Keep the newest line in view"/>
+                                        <Button Content="Clear" Style="{StaticResource GhostButton}"
+                                                Margin="6,0,0,0" Height="20" Padding="9,0"
+                                                FontSize="10.5" Click="ClearLog_Click"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <ScrollViewer x:Name="LogScroller" Grid.Row="1"
+                                              VerticalScrollBarVisibility="Auto">
+                                    <ItemsControl x:Name="LogList">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid Margin="0,1">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="{Binding Time}"
+                                                               FontFamily="Consolas" FontSize="10.5"
+                                                               Foreground="{StaticResource IpDim}"
+                                                               Margin="0,0,8,0"/>
+                                                    <TextBlock Grid.Column="1" Text="{Binding Source}"
+                                                               FontFamily="Consolas" FontSize="9"
+                                                               Foreground="{StaticResource IpDim}"
+                                                               Width="62"/>
+                                                    <TextBlock Grid.Column="2" Text="{Binding Message}"
+                                                               FontFamily="Consolas" FontSize="10.5"
+                                                               Foreground="{Binding Brush}"
+                                                               TextWrapping="Wrap"/>
                                                 </Grid>
-                                            </Border>
-
-                                            <StackPanel Grid.Row="1" Margin="7,5,7,6">
-                                                <TextBlock Text="{Binding Display}" Foreground="{StaticResource IpText}"
-                                                           FontSize="10.5" TextTrimming="CharacterEllipsis"
-                                                           TextWrapping="NoWrap"/>
-                                                <TextBlock Text="{Binding Stamp}" Foreground="{StaticResource IpDim}"
-                                                           FontSize="9.5" Margin="0,2,0,0"/>
-                                            </StackPanel>
-                                        </Grid>
-                                    </DataTemplate>
-                                </ListBox.ItemTemplate>
-                            </ListBox>
-
-                            <TextBlock x:Name="StripEmpty" Text="the capture store is empty"
-                                       HorizontalAlignment="Center" VerticalAlignment="Center"
-                                       Foreground="{StaticResource IpDim}" FontSize="11.5"
-                                       Visibility="Collapsed"/>
-                        </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </ScrollViewer>
+                            </Grid>
+                        </Border>
                     </Grid>
                 </Border>
 
@@ -202,9 +207,52 @@
                                 <ComboBox x:Name="TxBoardBox" Style="{StaticResource IpMiniCombo}"
                                           Tag="no board detected" SelectionChanged="TxBoard_Changed"/>
 
-                                <TextBlock Text="TX port" Style="{StaticResource IpLabel}" Margin="0,8,0,3"/>
-                                <ComboBox x:Name="TxPortBox" Style="{StaticResource IpMiniCombo}"
-                                          Tag="no TX channel" SelectionChanged="Field_Changed"/>
+                                <!-- Every TX port the board has, each switched on or off.
+                                     More than one is the ordinary case: a transmitter and a
+                                     monitoring chain want the same delayed picture, and there is
+                                     one read of it per frame either way. -->
+                                <TextBlock Text="TX ports" Style="{StaticResource IpLabel}" Margin="0,8,0,3"/>
+
+                                <ItemsControl x:Name="TxPortList">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Margin="0,0,0,3" ToolTip="{Binding Hint}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+
+                                                <!-- The port, then ON or OFF. The toggle says which
+                                                     it is rather than only looking pressed. -->
+                                                <TextBlock Grid.Column="0" Text="{Binding ToggleText}"
+                                                           VerticalAlignment="Center" Width="38"
+                                                           FontFamily="Consolas" FontSize="11.5"
+                                                           FontWeight="Bold"
+                                                           Foreground="{StaticResource IpText}"/>
+
+                                                <ToggleButton Grid.Column="1" Width="46" Height="22"
+                                                              HorizontalAlignment="Left"
+                                                              Style="{StaticResource IpSmallToggle}"
+                                                              FontSize="9.5" Padding="0"
+                                                              Content="{Binding OnOffText}"
+                                                              IsChecked="{Binding On, Mode=TwoWay}"
+                                                              IsEnabled="{Binding CanToggle}"
+                                                              Click="TxPort_Toggled"/>
+
+                                                <TextBlock Grid.Column="2" Text="{Binding StateText}"
+                                                           VerticalAlignment="Center"
+                                                           FontFamily="Consolas" FontSize="8.5"
+                                                           FontWeight="Bold"
+                                                           Foreground="{Binding StateBrush}"/>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+
+                                <TextBlock x:Name="TxPortsEmpty" FontSize="9.5" TextWrapping="Wrap"
+                                           Foreground="{StaticResource IpDim}"
+                                           Text="No TX ports on this board."/>
 
                                 <TextBlock x:Name="TxInfoText" Text="-" Foreground="{StaticResource IpDim}"
                                            FontSize="10" Margin="0,5,0,0" TextWrapping="Wrap"/>
@@ -299,43 +347,6 @@
                             </StackPanel>
                         </Border>
 
-                        <!-- ============ activity ============ -->
-                        <Border Style="{StaticResource IpCardBorder}" Margin="0,7,0,0">
-                            <Grid Height="150">
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="*"/>
-                                </Grid.RowDefinitions>
-
-                                <Grid Grid.Row="0" Margin="0,0,0,6">
-                                    <TextBlock Text="Activity" Style="{StaticResource IpCardTitle}"/>
-                                    <Button Content="Clear" Style="{StaticResource GhostButton}"
-                                            HorizontalAlignment="Right" Height="20" Padding="9,0"
-                                            FontSize="10.5" Click="ClearLog_Click"/>
-                                </Grid>
-
-                                <ScrollViewer x:Name="LogScroller" Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                                    <ItemsControl x:Name="LogList">
-                                        <ItemsControl.ItemTemplate>
-                                            <DataTemplate>
-                                                <Grid Margin="0,1">
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="Auto"/>
-                                                        <ColumnDefinition Width="*"/>
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Grid.Column="0" Text="{Binding Time}"
-                                                               FontFamily="Consolas" FontSize="10"
-                                                               Foreground="{StaticResource IpDim}" Margin="0,0,7,0"/>
-                                                    <TextBlock Grid.Column="1" Text="{Binding Message}"
-                                                               FontFamily="Consolas" FontSize="10"
-                                                               Foreground="{Binding Brush}" TextWrapping="Wrap"/>
-                                                </Grid>
-                                            </DataTemplate>
-                                        </ItemsControl.ItemTemplate>
-                                    </ItemsControl>
-                                </ScrollViewer>
-                            </Grid>
-                        </Border>
                     </StackPanel>
                 </ScrollViewer>
             </Grid>

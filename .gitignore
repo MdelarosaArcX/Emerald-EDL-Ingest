@@ -93,3 +93,6 @@ ehthumbs.db
 desktop.ini
 $RECYCLE.BIN/
 .DS_Store
+
+# The published, installable folder. Built by publish.bat, not source.
+dist/

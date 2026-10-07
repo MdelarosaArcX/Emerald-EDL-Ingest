@@ -137,7 +137,15 @@ public sealed record RecordingProfile(
     /// <summary>What the receiver's own sound is called in a file that carries more than one track.</summary>
     public const string OriginalAudioLabel = "Original";
 
-    public static RecordingProfile Default { get; } = new(0, 192, 48000, 120);
+    /// <summary>
+    /// What the recorder uses when the settings say nothing usable.
+    ///
+    /// The segment length here is the one that actually governs: <see cref="From"/> runs the
+    /// stored value through <see cref="Pick"/>, so anything not on <see cref="SegmentLengths"/>
+    /// lands on this instead. Changing the default in AppSettings alone left this at two
+    /// minutes and nothing moved.
+    /// </summary>
+    public static RecordingProfile Default { get; } = new(0, 192, 48000, 30);
 
     // The lists the deck offers. They live here so the values ffmpeg is given and the words
     // the operator picks between cannot drift apart.
@@ -170,6 +178,10 @@ public sealed record RecordingProfile(
 
     public static IReadOnlyList<RecordingOption<int>> SegmentLengths { get; } = new[]
     {
+        // 30 seconds is the default, and it has to be on this list to be usable at all: Pick
+        // treats a value that is not here as unknown and falls back, so a settings file asking
+        // for 30 would have been silently overruled.
+        new RecordingOption<int>(30, "30 s"),
         new RecordingOption<int>(60, "1 min"),
         new RecordingOption<int>(120, "2 min"),
         new RecordingOption<int>(300, "5 min"),
@@ -249,7 +261,8 @@ public sealed record RecordingProfile(
                                                 string folder, string namePrefix, int inputSampleRate,
                                                 bool singleFile = false, string? startTimecode = null,
                                                 IReadOnlyList<CaptureAudioTrack>? extraAudio = null,
-                                                int embeddedPairs = 1)
+                                                int embeddedPairs = 1,
+                                                RecordingNames? names = null)
     {
         // The receiver's audio arrives on one pipe carrying every channel it had. One pair is
         // the ordinary case and is left exactly as it always was, straight through as stereo.
@@ -334,6 +347,24 @@ public sealed record RecordingProfile(
                 args.Add("-preset"); args.Add("ultrafast");
                 args.Add("-tune"); args.Add("zerolatency");
 
+                // A keyframe every half second, so the proxy can be seeked.
+                //
+                // This is the proxy's whole purpose: Live Edit scrubs it because the DNxHD
+                // master will not scrub, and a player can only seek to a keyframe. Measured on
+                // this plant's own store, a 120-second segment held 3000 frames and 11
+                // keyframes - one every eleven seconds - so clicking the timeline put the
+                // picture up to eleven seconds from where it was pointed, which reads as "it
+                // played from the wrong place".
+                //
+                // Half a second rather than a frame: all-intra would make the seek exact and
+                // multiply the proxy's size by something like five, and this store already
+                // holds terabytes. Half a second is within a shot.
+                args.Add("-g"); args.Add(Math.Max(1, format.FrameRate / 2).ToString());
+
+                // Keyframes on the interval and not only on scene changes, so the spacing is
+                // the one asked for rather than whatever the pictures happened to do.
+                args.Add("-sc_threshold"); args.Add("0");
+
                 // No bitrate means the encoder's own rate control, which is what Emerald
                 // recorded with before the setting existed.
                 if (ProxyBitrateKbps > 0)
@@ -395,9 +426,28 @@ public sealed record RecordingProfile(
                 args.Add("-segment_time"); args.Add(SegmentSeconds.ToString());
                 args.Add("-segment_format"); args.Add(output.Muxer);
                 args.Add("-reset_timestamps"); args.Add("1");
-                args.Add("-strftime"); args.Add("1");
-                args.Add(Path.Combine(FolderFor(output, folder),
-                                      $"{namePrefix}_%Y-%m-%d_%H-%M-%S.{output.Extension}"));
+
+                if (names is { } naming)
+                {
+                    // A folder for this recording, and a running number in the name.
+                    //
+                    // Deliberately NOT -strftime: under it the pattern goes to strftime, where
+                    // %d is the day of the month, so a pattern asking for a sequence writes
+                    // every segment to one filename and loses all but the last. The moment is
+                    // in the folder instead, which is where it belongs anyway.
+                    args.Add("-segment_start_number"); args.Add(naming.Start.ToString());
+
+                    args.Add(Path.Combine(FolderFor(output, folder), naming.Folder,
+                                          naming.PatternFor(output.Extension)));
+                }
+                else
+                {
+                    // The scheme recordings were written under before folders and numbers. Kept
+                    // so an old caller, and the tests that pin the old command, still work.
+                    args.Add("-strftime"); args.Add("1");
+                    args.Add(Path.Combine(FolderFor(output, folder),
+                                          $"{namePrefix}_%Y-%m-%d_%H-%M-%S.{output.Extension}"));
+                }
             }
 
             outputIndex++;

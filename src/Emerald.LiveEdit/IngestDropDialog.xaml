@@ -1,0 +1,95 @@
+<Window x:Class="Emerald.LiveEdit.IngestDropDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Place ingest media" Width="620" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Background="{StaticResource Bg}">
+
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="PLACE INGEST MEDIA" Foreground="{StaticResource Ok}"
+                   FontSize="14" FontWeight="Bold"/>
+
+        <!-- What was dropped, how long it is, and where. An operator choosing between these
+             four needs all three in front of them. -->
+        <TextBlock x:Name="WhatText" Grid.Row="1" Margin="0,8,0,0"
+                   FontFamily="Consolas" FontSize="11.5"
+                   Foreground="{StaticResource Tc}" TextWrapping="Wrap"/>
+
+        <StackPanel Grid.Row="2" Margin="0,14,0,0">
+            <RadioButton x:Name="OverlayRadio" IsChecked="True" GroupName="Mode"
+                         Click="Mode_Changed">
+                <StackPanel Margin="0,0,0,2">
+                    <TextBlock Text="Overlay" FontWeight="SemiBold" FontSize="12.5"
+                               Foreground="{StaticResource Text}"/>
+                    <TextBlock Foreground="{StaticResource Muted}" FontSize="11"
+                               TextWrapping="Wrap" MaxWidth="540"
+                               Text="Plays over the captured media, replacing its video and audio, for as long as this file runs. Nothing is moved and nothing changes speed."/>
+                </StackPanel>
+            </RadioButton>
+
+            <RadioButton x:Name="FitRadio" GroupName="Mode" Margin="0,10,0,0"
+                         Click="Mode_Changed">
+                <StackPanel Margin="0,0,0,2">
+                    <TextBlock Text="Fit to fill" FontWeight="SemiBold" FontSize="12.5"
+                               Foreground="{StaticResource Text}"/>
+                    <TextBlock Foreground="{StaticResource Muted}" FontSize="11"
+                               TextWrapping="Wrap" MaxWidth="540"
+                               Text="Dropped between mark in and mark out, and stretched to fill it exactly. Longer material is sped up, shorter material slowed down. The only option that changes the speed of the media."/>
+                </StackPanel>
+            </RadioButton>
+
+            <RadioButton x:Name="ReplaceRadio" GroupName="Mode" Margin="0,10,0,0"
+                         Click="Mode_Changed">
+                <StackPanel Margin="0,0,0,2">
+                    <TextBlock Text="Replace" FontWeight="SemiBold" FontSize="12.5"
+                               Foreground="{StaticResource Text}"/>
+                    <TextBlock Foreground="{StaticResource Muted}" FontSize="11"
+                               TextWrapping="Wrap" MaxWidth="540"
+                               Text="Covers the marked range at its own speed, starting at its own first frame. A shorter range cuts it off early; a longer range leaves the rest of the original playing after it."/>
+                </StackPanel>
+            </RadioButton>
+
+            <RadioButton x:Name="InsertRadio" GroupName="Mode" Margin="0,10,0,0"
+                         Click="Mode_Changed">
+                <StackPanel Margin="0,0,0,2">
+                    <TextBlock Text="Insert" FontWeight="SemiBold" FontSize="12.5"
+                               Foreground="{StaticResource Text}"/>
+                    <TextBlock Foreground="{StaticResource Muted}" FontSize="11"
+                               TextWrapping="Wrap" MaxWidth="540"
+                               Text="Goes in before the recording rather than over it: this file plays, then the captured media resumes. Everything after moves later, so the timeline and the delay both grow."/>
+                </StackPanel>
+            </RadioButton>
+        </StackPanel>
+
+        <!-- What the chosen option will actually do at this length. Recomputed as the choice
+             changes, because "sped up to 1.42x" is the fact that decides it and the option's
+             name does not carry it. -->
+        <Border Grid.Row="3" Margin="0,16,0,0" Padding="11,9" CornerRadius="4"
+                Background="#1F242D" BorderBrush="{StaticResource Line}" BorderThickness="1">
+            <StackPanel>
+                <TextBlock x:Name="EffectText" FontSize="11.5" TextWrapping="Wrap"
+                           Foreground="{StaticResource Text}"/>
+                <TextBlock x:Name="WarnText" Margin="0,6,0,0" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{StaticResource Warn}" Visibility="Collapsed"/>
+            </StackPanel>
+        </Border>
+
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right"
+                    Margin="0,16,0,0">
+            <Button Content="Cancel" Style="{StaticResource GhostButton}" Width="92"
+                    Height="30" IsCancel="True" Click="Cancel_Click"/>
+            <Button x:Name="PlaceButton" Content="Place" Style="{StaticResource PrimaryButton}"
+                    Width="110" Height="30" Margin="8,0,0,0" IsDefault="True"
+                    Click="Place_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

@@ -275,6 +275,42 @@ public sealed class ActivityLog : IDisposable
         lock (_ringGate) return _ring.ToArray();
     }
 
+
+    /// <summary>
+    /// Lines after <paramref name="afterSeq"/>, oldest first, at most <paramref name="limit"/>.
+    ///
+    /// The cursor for a remote monitor. <see cref="LogLine.Seq"/> only ever increases and is
+    /// assigned inside the ring lock, so asking for everything after the last sequence seen is
+    /// exact: no duplicates across a reconnect, and no gap unless the ring has genuinely rolled
+    /// past — which the caller can tell, because the first line it gets back will not be the
+    /// one it expected next.
+    /// </summary>
+    public LogLine[] Since(long afterSeq, int limit = 500)
+    {
+        if (limit <= 0) return Array.Empty<LogLine>();
+
+        lock (_ringGate)
+        {
+            var taken = new List<LogLine>(Math.Min(limit, _ring.Count));
+
+            foreach (LogLine line in _ring)
+            {
+                if (line.Seq <= afterSeq) continue;
+
+                taken.Add(line);
+                if (taken.Count >= limit) break;
+            }
+
+            return taken.ToArray();
+        }
+    }
+
+    /// <summary>The newest sequence written, so a caller can start at the end rather than the beginning.</summary>
+    public long LastSeq
+    {
+        get { lock (_ringGate) return _ring.Count == 0 ? 0 : _ring.Last().Seq; }
+    }
+
     public void Clear()
     {
         lock (_ringGate) _ring.Clear();

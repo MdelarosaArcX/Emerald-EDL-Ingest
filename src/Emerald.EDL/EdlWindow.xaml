@@ -137,8 +137,17 @@
                                     Style="{StaticResource GhostButton}" Margin="8,0,0,0"
                                     Click="BrowseCaptureFolder_Click"/>
                         </Grid>
+                        <!-- Off by default, and a control rather than a hidden behaviour. This
+                             used to happen on its own: anything going to air started a second
+                             recording of the receiver into the same store as the capture deck's,
+                             which nobody had asked for and nothing on this page mentioned. -->
+                        <CheckBox x:Name="RecordWhileOnAirBox" Margin="0,10,0,0"
+                                  Content="Record the receiver while a message is on air"
+                                  Click="RecordWhileOnAir_Changed"
+                                  ToolTip="Off by default. The capture deck's Record button is the usual way to record."/>
+
                         <TextBlock x:Name="CaptureFolderHint" Style="{StaticResource Hint}"
-                                   Text="Leave empty for no recording. RX is recorded while a message is on air, in 2-minute files."/>
+                                   Text="Leave empty for no recording. Each recording gets its own folder."/>
                     </StackPanel>
                 </ScrollViewer>
             </Border>

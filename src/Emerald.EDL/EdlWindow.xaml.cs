@@ -139,6 +139,9 @@ public partial class EdlWindow : Window
         CaptureFolderBox.Text = string.IsNullOrWhiteSpace(_settings.CaptureFolder)
                               ? MediaLibrary.DefaultFolder
                               : _settings.CaptureFolder;
+
+        RecordWhileOnAirBox.IsChecked = _settings.EdlRecordWhileOnAir;
+
         AudioTrackList.ItemsSource = _audioTracks;
 
         Log("EDL Generator started.", LogLevel.Info);
@@ -1420,19 +1423,71 @@ public partial class EdlWindow : Window
 
         if (folder.Length == 0)
         {
-            CaptureFolderHint.Text = "Leave empty for no recording. RX is recorded while a message is on air, in 2-minute files.";
+            CaptureFolderHint.Text = "Leave empty for no recording. Each recording gets its own folder.";
             CaptureFolderHint.Foreground = Brush("Muted", "#6B7382");
         }
-        else if (Directory.Exists(folder))
-        {
-            CaptureFolderHint.Text = $"Recording here while a message is on air, in 2-minute files. {FreeSpace(folder)}";
-            CaptureFolderHint.Foreground = Brush("Muted", "#6B7382");
-        }
-        else
+        else if (!Directory.Exists(folder))
         {
             CaptureFolderHint.Text = "That folder does not exist.";
             CaptureFolderHint.Foreground = Brush("Bad");
         }
+        else if (!_settings.EdlRecordWhileOnAir)
+        {
+            // Said plainly, because a folder set here used to mean "record", and now it does not
+            // on its own. An operator who set the folder and found nothing recorded would
+            // otherwise be looking for a fault.
+            CaptureFolderHint.Text =
+                $"Nothing is recorded here unless the box above is ticked. {FreeSpace(folder)}";
+            CaptureFolderHint.Foreground = Brush("Muted", "#6B7382");
+        }
+        else
+        {
+            CaptureFolderHint.Text =
+                $"Recording here while a message is on air, in {_settings.RecordingSegmentSeconds / 60}-minute " +
+                $"files, in a folder per recording. {FreeSpace(folder)}";
+            CaptureFolderHint.Foreground = Brush("Muted", "#6B7382");
+        }
+    }
+
+    /// <summary>
+    /// The operator turning the EDL's own recording on or off.
+    ///
+    /// Saved at once rather than on the way out, because the thing it controls writes gigabytes
+    /// and "I turned that off" must survive whatever happens to this window next.
+    /// </summary>
+    private void RecordWhileOnAir_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_initialising) return;
+
+        bool on = RecordWhileOnAirBox.IsChecked == true;
+
+        _settings.EdlRecordWhileOnAir = on;
+        _settings.Save();
+
+        // Turning it off mid-message stops the recording it started. Leaving it running would
+        // mean the setting said one thing and the disk did another.
+        if (!on && _captureArmed)
+        {
+            _captureArmed = false;
+            _capture.Stop();
+
+            Log("Recording while on air turned off - the EDL's own recording has stopped. " +
+                "What is on air is unaffected.", LogLevel.Warn);
+        }
+        else
+        {
+            Log(on
+                    ? "Recording while on air turned on - the EDL will record the receiver into " +
+                      "its own folder whenever a message plays."
+                    : "Recording while on air turned off. Only the capture deck's Record button records.",
+                LogLevel.Info);
+        }
+
+        ActivityLog.Shared.Info(LogSource.Edl,
+            $"EDL recording while on air turned {(on ? "on" : "off")}.",
+            @event: "edl.recordonair");
+
+        CaptureFolder_Changed(CaptureFolderBox, null!);
     }
 
     private static string FreeSpace(string folder)
@@ -1454,10 +1509,19 @@ public partial class EdlWindow : Window
     /// <summary>
     /// Recording follows playout: it starts when a message goes on air and stops when the
     /// message ends, so what lands on disk lines up with what was transmitted.
+    ///
+    /// <b>Only when it has been asked for.</b> This used to run unconditionally, so sending
+    /// anything to air started a recording of the receiver that nobody had pressed Record for —
+    /// into the same store as the capture deck's own recording, under the older flat naming, at
+    /// about 1.8 GB of master every two minutes. An operator looking at the store found segments
+    /// from two recorders and no way to tell which was which.
+    ///
+    /// So it is off unless <see cref="AppSettings.EdlRecordWhileOnAir"/> says otherwise, and the
+    /// capture deck's Record button is the only thing that records by default.
     /// </summary>
     private void UpdateCapture(PlayoutState state)
     {
-        bool shouldRun = state is PlayoutState.Playing;
+        bool shouldRun = state is PlayoutState.Playing && _settings.EdlRecordWhileOnAir;
 
         if (shouldRun && !_captureArmed)
         {
@@ -1488,13 +1552,33 @@ public partial class EdlWindow : Window
         // encoded exactly the way the deck is set to encode.
         if (!RecordingSetup.TryBuild(_settings, board.Index, rx.Index, folder,
                                      _frameRate > 0 ? _frameRate : FallbackFrameRate,
-                                     "capture", out CaptureRequest? request, out string? problem))
+                                     RecordingSequence.DefaultPrefix, out CaptureRequest? request,
+                                     out string? problem))
         {
             Log($"Capture skipped: {problem}", LogLevel.Warn);
             return;
         }
 
-        _capture.Start(request!);
+        // A folder of its own, like every other recording.
+        //
+        // Without names, the encoder falls back to the scheme from before folders existed and
+        // writes its segments loose into the root of the store with a timestamp in each
+        // filename. Beside the capture deck's folders that was indistinguishable from litter,
+        // and no window could tell which recording a root-level segment belonged to.
+        RecordingNames naming = RecordingSequence.Next(DateTime.Now, RecordingSequence.DefaultPrefix);
+
+        _capture.Start(request! with { Names = naming });
+
+        Log($"Recording the receiver while on air, into {naming.Folder}. " +
+            "This is the EDL's own recording, separate from the capture deck's.", LogLevel.Info);
+
+        ActivityLog.Shared.Info(LogSource.Capture,
+            $"FOLDER {naming.Folder} - the EDL's own recording of board {board.Index} RX{rx.Index}, " +
+            "started because a message went on air.",
+            @event: "capture.folder",
+            correlation: _capture.SessionId,
+            file: Path.Combine(RecordingProfile.FolderFor(RecordingProfile.LowRes, folder),
+                               naming.Folder));
     }
 
     // ------------------------------------------------------------------ queue display

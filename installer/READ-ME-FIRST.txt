@@ -1,0 +1,110 @@
+===========================================================================
+ EMERALD - installing on a fresh Windows machine
+===========================================================================
+
+WHAT TO DO
+
+  1. Copy this whole folder onto the machine.
+  2. Right-click install.bat and choose "Run as administrator".
+  3. It asks where recordings should go. Take the suggestion or type a path.
+  4. Start Menu > Emerald.
+
+That is the install. There is nothing to download first.
+
+
+WHAT IS ALREADY IN THIS FOLDER
+
+  The .NET 8 runtime.  Emerald is published self-contained, so there is no
+  runtime to install and no internet needed. This is most of the 170 MB.
+
+  ffmpeg and ffprobe, if they were bundled when this folder was built.
+  Emerald looks for ffmpeg beside its own executable before anything on
+  PATH, so nothing needs configuring.
+
+
+WHAT EMERALD CANNOT BRING WITH IT
+
+  THE DELTACAST DRIVER.  Capture and playout go through VideoMasterHD.dll,
+  which lives in C:\Windows\System32 and is put there by DELTACAST's own
+  installer. It is a kernel driver; no application installer may carry it.
+
+  Install it from DELTACAST before expecting to record or transmit. The
+  install script checks for it and tells you if it is not there.
+
+  Without it Emerald still opens, and the Monitor, Live Edit and the clip
+  store all work - which is exactly what you want on a machine used only to
+  watch another one.
+
+
+WHERE THINGS GO
+
+  Program        C:\Program Files\Emerald
+  Recordings     wherever you chose during the install
+  Settings       %APPDATA%\Emerald\settings.json
+  Logs           %APPDATA%\Emerald\logs        (kept 14 days)
+
+  Recordings are deliberately NOT put under Program Files. A standard user
+  cannot write there, and it is the wrong home for terabytes of video.
+
+  Reinstalling over a working machine does not touch the settings file, so
+  the boards, ports and store you have set up survive an upgrade.
+
+
+REMOTE MONITORING
+
+  The install opens TCP 8787 in the firewall for it. Turn it on from the
+  Monitor page (the REMOTE button), and the page will show the address to
+  type into a browser on another machine. Nothing is installed on the other
+  machine.
+
+  It is read-only. Nothing reachable over it can start or stop a recording
+  or touch the transmitter.
+
+
+UPDATING IT LATER
+
+  On the master, close Emerald and run publish.bat. That rebuilds dist\Emerald.
+
+  Then on THIS machine, close Emerald and do one of:
+
+    A. Copy the whole dist\Emerald folder over, then right-click update.bat
+       inside the copy and Run as administrator. With no argument it updates
+       from the folder it is sitting in.
+
+    B. Share dist\Emerald from the master and run, as administrator:
+
+         update.bat \\MASTER\Emerald
+
+       Nothing is copied by hand. This is the one for a scheduled task.
+
+  Either way install.bat from the new folder does the same job - it notices an
+  existing install and says "update" instead of "install".
+
+  It checks the build date before copying, so pointing it at the build you are
+  already running costs a few seconds and changes nothing.
+
+  Your recordings and your settings are untouched: boards, ports, the store
+  folder and the segment counter all survive.
+
+  Emerald must be closed - it holds its own files open. If it is RECORDING,
+  stop the recording before closing it: the segment being written has no index
+  yet and will not play.
+
+UNINSTALLING
+
+  Settings > Apps, or run uninstall.bat as administrator from
+  C:\Program Files\Emerald.
+
+  It never deletes recordings. It asks before deleting settings and logs.
+
+
+IF SOMETHING IS WRONG
+
+  The install script ends with a list of what it found and what is missing.
+  Read that first - it names the two things that usually matter, the driver
+  and ffmpeg.
+
+  Once Emerald is running, the Monitor page is the place to look: it carries
+  everything from the receiver to the transmitter, and it writes it all down
+  under %APPDATA%\Emerald\logs so yesterday's problem is still readable
+  today.

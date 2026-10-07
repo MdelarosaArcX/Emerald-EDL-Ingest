@@ -35,39 +35,15 @@ namespace Emerald.App;
 /// </summary>
 public partial class PlaybackWindow : Window
 {
-    private sealed record LogRow(string Time, string Message, Brush Brush);
-
-    /// <summary>One tile in the clip strip. The thumbnail arrives later, hence the notification.</summary>
-    private sealed class ClipItem : INotifyPropertyChanged
-    {
-        public required string Path { get; init; }
-        public required string Display { get; init; }
-        public required string Stamp { get; init; }
-
-        private ImageSource? _thumbnail;
-
-        public ImageSource? Thumbnail
-        {
-            get => _thumbnail;
-            set
-            {
-                _thumbnail = value;
-                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Thumbnail)));
-            }
-        }
-
-        public event PropertyChangedEventHandler? PropertyChanged;
-    }
-
-    private readonly ObservableCollection<ClipItem> _clips = new();
-
     /// <summary>
-    /// Bumped whenever the strip is rebuilt, so thumbnails from a previous pass are dropped
-    /// rather than landing on tiles that are no longer the ones they were rendered for.
+    /// One line on this deck's log.
+    ///
+    /// <see cref="Source"/> is carried because the panel now shows the playout engine and tidal
+    /// lock alongside the deck's own narration, and a line with no source on it is a line whose
+    /// subject has to be guessed from its wording.
     /// </summary>
-    private int _stripGeneration;
+    private sealed record LogRow(string Time, string Source, string Message, Brush Brush);
 
-    private bool _auditionPlaying;
 
     private readonly AppSettings _settings;
     private readonly TimecodeService _timecode = TimecodeLink.Service;
@@ -96,10 +72,18 @@ public partial class PlaybackWindow : Window
         InitializeComponent();
 
         LogList.ItemsSource = _log;
-        ClipStrip.ItemsSource = _clips;
 
         _preview.Status += OnPreviewStatus;
         _preview.FrameReady += OnPreviewFrame;
+
+        // Full resolution on this deck.
+        //
+        // The capture deck's monitor is a 352-wide thumbnail and a quarter-size picture is more
+        // than it can show. This one is the picture an operator judges the output by - "is that
+        // the right material, is it clean" - and a 480x270 image scaled up to fill it was soft
+        // enough to make that a guess. A 1080 frame converts in a couple of milliseconds, which
+        // is affordable now that at most one frame is ever in flight to this thread.
+        _preview.Decimation = 1;
 
         _clock.Tick += OnClockTick;
 
@@ -133,180 +117,27 @@ public partial class PlaybackWindow : Window
         if (ffmpeg is null)
             Log("ffmpeg was not found - nothing can be decoded for the transmitter.", Level.Warn);
 
+        TxPortList.ItemsSource = _txPorts;
+
+        // Whatever playback has already said this session, so opening the deck half an hour in
+        // does not show a blank page.
+        foreach (LogLine line in ActivityLog.Shared.Snapshot()) OnLogLine(line);
+
+        ActivityLog.Shared.Line += OnLogLine;
+
         TidalLock.Shared.Changed += OnTidalLockChanged;
         PipelineState.Shared.Changed += OnPipelineChanged;
+        SdiPorts.Shared.Changed += OnPortsChanged;
 
         _clock.Start();
         _loading = false;
 
         await ScanBoardsAsync();
         RenderTidalLock();
-        RefreshClips();
     }
 
     // ------------------------------------------------------------------ media
 
-    /// <summary>
-    /// Reads the same store the capture deck records into and Live Edit lists, so what is on
-    /// this strip is exactly what has been captured — nothing is copied or imported.
-    /// </summary>
-    private void RefreshClips()
-    {
-        int generation = ++_stripGeneration;
-        string? ffmpeg = _playout?.FfmpegPath;
-
-        _clips.Clear();
-        StripEmpty.Text = "reading the capture store...";
-        StripEmpty.Visibility = Visibility.Visible;
-
-        // Listing probes every clip through ffprobe, which is far too slow for the UI thread
-        // once the store has a few hours in it.
-        Task.Run(() => MediaLibrary.List(_settings))
-            .ContinueWith(t =>
-            {
-                if (generation != _stripGeneration) return;
-
-                IReadOnlyList<CapturedClip> clips =
-                    t.IsFaulted ? Array.Empty<CapturedClip>() : t.Result;
-
-                foreach (CapturedClip clip in clips)
-                {
-                    _clips.Add(new ClipItem
-                    {
-                        Path = clip.Path,
-                        Display = clip.Name,
-                        Stamp = $"{clip.DurationText}  |  {clip.SizeText}",
-                    });
-                }
-
-                StripEmpty.Text = "the capture store is empty";
-                StripEmpty.Visibility = clips.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-
-                if (clips.Count > 0) Log($"{clips.Count} clip(s) in the store.");
-
-                if (ffmpeg is not null) LoadThumbnails(generation, ffmpeg);
-            }, TaskScheduler.FromCurrentSynchronizationContext());
-    }
-
-    private void LoadThumbnails(int generation, string ffmpeg)
-    {
-        ClipItem[] tiles = _clips.ToArray();
-
-        Task.Run(() =>
-        {
-            foreach (ClipItem tile in tiles)
-            {
-                if (generation != _stripGeneration) return;
-
-                BitmapImage? thumb = ClipThumbnails.Get(ffmpeg, tile.Path);
-                if (thumb is null) continue;
-
-                Dispatcher.BeginInvoke(() =>
-                {
-                    if (generation == _stripGeneration) tile.Thumbnail = thumb;
-                });
-            }
-        });
-    }
-
-    private void RefreshClips_Click(object sender, RoutedEventArgs e) => RefreshClips();
-
-    private ClipItem? SelectedClip => ClipStrip.SelectedItem as ClipItem;
-
-    private void ClipStrip_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (SelectedClip is not { } clip)
-        {
-            Player.Source = null;
-            StagePlaceholder.Visibility = Visibility.Visible;
-            ClipNameText.Text = "-";
-            return;
-        }
-
-        ClipNameText.Text = clip.Display;
-        StagePlaceholder.Visibility = Visibility.Collapsed;
-
-        Player.Source = new Uri(clip.Path);
-        Player.Play();          // a paused MediaElement shows nothing until it has presented
-        _auditionPlaying = true;
-    }
-
-    private void PlayPause_Click(object sender, RoutedEventArgs e)
-    {
-        if (Player.Source is null) return;
-
-        if (_auditionPlaying) Player.Pause();
-        else Player.Play();
-
-        _auditionPlaying = !_auditionPlaying;
-    }
-
-    private void StopAudition_Click(object sender, RoutedEventArgs e)
-    {
-        Player.Stop();
-        _auditionPlaying = false;
-    }
-
-    private void Player_MediaOpened(object sender, RoutedEventArgs e) =>
-        StagePlaceholder.Visibility = Visibility.Collapsed;
-
-    private void Player_MediaEnded(object sender, RoutedEventArgs e)
-    {
-        Player.Stop();
-        _auditionPlaying = false;
-    }
-
-    private void Player_MediaFailed(object sender, ExceptionRoutedEventArgs e)
-    {
-        StagePlaceholder.Text = "this clip cannot be previewed here";
-        StagePlaceholder.Visibility = Visibility.Visible;
-        Log($"Audition failed: {e.ErrorException?.Message}", Level.Warn);
-    }
-
-    /// <summary>
-    /// Puts the selected clip on the transmitter now. The audition on the left is a WPF
-    /// player and reaches no hardware; this is the same engine the EDL plays out with, so
-    /// what goes to air is cued, paced and encoded the way everything else in Emerald is.
-    /// </summary>
-    private void PlayToTx_Click(object sender, RoutedEventArgs e)
-    {
-        if (SelectedClip is not { } clip)
-        {
-            Log("Select a clip first.", Level.Warn);
-            return;
-        }
-
-        if (!TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)) return;
-
-        if (TidalLock.Shared.State is TidalLockState.CountingDown or TidalLockState.OnAir)
-        {
-            Log("Tidal lock has the transmitter. Disarm it before playing a clip out.", Level.Warn);
-            return;
-        }
-
-        int rate = _timecode.FrameRate > 0 ? _timecode.FrameRate : _settings.CaptureFrameRate;
-        Timecode start = _timecode.TryGetCurrent(out Timecode now) ? now : Timecode.Zero(rate);
-
-        _playout!.Enqueue(new PlayoutEntry
-        {
-            Id = Guid.NewGuid().ToString("N")[..8],
-            MediaLabel = clip.Display,
-            Request = new PlayoutRequest(
-                BoardIndex: board!.Index,
-                BoardModel: board.Model,
-                TxChannel: port!.Index,
-                VideoFiles: new[] { clip.Path },
-                Start: start,                  // now: a start already gone by cues immediately
-                DurationFrames: null,
-                FrameRate: rate,
-                Som: Timecode.Zero(rate),
-                SeekOffset: TimeSpan.Zero,
-                PostPlay: PostPlay.BlackScreen,
-                AudioTracks: new[] { new AudioTrack(clip.Display, new[] { clip.Path }) }),
-        });
-
-        Log($"Playing {clip.Display} out of {port.Name} on board {board.Index}.", Level.Ok);
-    }
 
     private void Window_Closing(object? sender, CancelEventArgs e)
     {
@@ -328,6 +159,11 @@ public partial class PlaybackWindow : Window
         _clock.Stop();
         TidalLock.Shared.Changed -= OnTidalLockChanged;
         PipelineState.Shared.Changed -= OnPipelineChanged;
+        SdiPorts.Shared.Changed -= OnPortsChanged;
+
+        // A static event holds this window for the life of the application otherwise, and every
+        // line written after it closes still runs its handler.
+        ActivityLog.Shared.Line -= OnLogLine;
 
         if (TidalLock.Shared.State != TidalLockState.Off)
             TidalLock.Shared.Disarm("Playback deck closed - tidal lock released.");
@@ -340,7 +176,10 @@ public partial class PlaybackWindow : Window
         _playout?.Dispose();
 
         if (SelectedTxBoard is { } tx) _settings.PlaybackBoardIndex = tx.Index;
-        if (TxPortBox.SelectedItem is ChannelPort port) _settings.PlaybackPort = port.Name;
+        // The whole chosen set, and the first of them in the old single-port field so a downgrade
+        // or an older module still finds something sensible there.
+        _settings.PlaybackPorts = string.Join('|', _txPorts.Where(r => r.On).Select(r => r.Name));
+        _settings.PlaybackPort = _txPorts.FirstOrDefault(r => r.On)?.Name ?? _settings.PlaybackPort;
         _settings.Save();
     }
 
@@ -385,32 +224,155 @@ public partial class PlaybackWindow : Window
         ?? _boards.FirstOrDefault(usable)
         ?? _boards[0];
 
+    /// <summary>
+    /// Every TX port of the selected board, with the ones the operator has switched on.
+    ///
+    /// Remembered by port NAME rather than by index: a settings file outlives a board being moved
+    /// to another slot, and an index then points at a different port.
+    /// </summary>
+    private readonly ObservableCollection<TxPortRow> _txPorts = new();
+
+    /// <summary>The ports the running transmitter actually opened, for the ON AIR marks.</summary>
+    private IReadOnlyCollection<int>? _portsOnAir;
+
+    /// <summary>The ports switched on, in card order. What a transmitter is handed.</summary>
+    private IReadOnlyList<int> ChosenTxPorts =>
+        _txPorts.Where(r => r.On).OrderBy(r => r.Index).Select(r => r.Index).ToList();
+
     private void PopulateTxPorts()
     {
         bool wasLoading = _loading;
         _loading = true;
 
         BoardInfo? board = SelectedTxBoard;
-        TxPortBox.ItemsSource = board?.TxPorts;
 
-        if (board is not null)
-        {
-            TxPortBox.SelectedItem =
-                board.TxPorts.FirstOrDefault(p => p.Name == _settings.PlaybackPort) ?? board.TxPorts.FirstOrDefault();
+        // Whatever was on before, so re-scanning or changing board keeps the choice wherever the
+        // same ports still exist.
+        var wanted = new HashSet<string>(
+            _txPorts.Where(r => r.On).Select(r => r.Name), StringComparer.OrdinalIgnoreCase);
 
-            TxInfoText.Text = board.TxCount == 0
-                ? "This board has no TX channels - it cannot transmit."
-                : $"{board.BoardTypeName} - available: {string.Join(", ", board.TxPorts.Select(p => p.Name))}";
+        if (wanted.Count == 0)
+            foreach (string name in (_settings.PlaybackPorts ?? "")
+                         .Split('|', StringSplitOptions.RemoveEmptyEntries))
+                wanted.Add(name.Trim());
 
-            TxInfoText.Foreground = board.TxCount == 0 ? Brush("Warn") : Brush("IpDim");
-        }
-        else
-        {
-            TxInfoText.Text = "No board selected.";
-        }
+        // The single port older settings remember, so an upgrade does not arrive with nothing on.
+        if (wanted.Count == 0 && _settings.PlaybackPort.Length > 0) wanted.Add(_settings.PlaybackPort);
 
-        TxPortBox.IsEnabled = board is { TxCount: > 0 };
+        _txPorts.Clear();
+
+        foreach (ChannelPort port in board?.TxPorts ?? Array.Empty<ChannelPort>())
+            _txPorts.Add(new TxPortRow { Port = port, On = wanted.Contains(port.Name) });
+
+        // Ports available but none chosen: the first, so an operator who never touches this still
+        // has a transmitter.
+        if (_txPorts.Count > 0 && _txPorts.All(r => !r.On)) _txPorts[0].On = true;
+
+        TxPortsEmpty.Visibility = _txPorts.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        ShowTxPortSummary();
+        ShowPortsOnAir();
+
         _loading = wasLoading;
+    }
+
+    private void ShowTxPortSummary()
+    {
+        BoardInfo? board = SelectedTxBoard;
+
+        TxInfoText.Text = board is null
+            ? "No board selected."
+            : board.TxCount == 0
+                ? "This board has no TX channels - it cannot transmit."
+                : ChosenTxPorts.Count switch
+                {
+                    0 => "No port switched on - nothing will transmit.",
+                    1 => $"{board.BoardTypeName} - one port on.",
+                    var n => $"{board.BoardTypeName} - {n} ports on, all carrying the same picture.",
+                };
+
+        TxInfoText.Foreground = board is null or { TxCount: 0 } || ChosenTxPorts.Count == 0
+            ? Brush("Warn")
+            : Brush("IpDim");
+    }
+
+    private void ShowPortsOnAir()
+    {
+        foreach (TxPortRow row in _txPorts) row.ShowAiring(_portsOnAir);
+
+        ShowPortsHeld();
+    }
+
+    /// <summary>
+    /// How this deck names itself when it holds ports, so its own are never shown as taken.
+    ///
+    /// The same string <see cref="Emerald.Video.DelayTransmitter"/> uses, because it is this
+    /// deck's transmitter doing the holding. If the two ever disagree the deck would grey out its
+    /// own ports mid-transmission.
+    /// </summary>
+    private string PortOwner => $"tidal lock (board {_settings.PlaybackBoardIndex})";
+
+    /// <summary>
+    /// Another module took or gave back a port. Raised from whichever thread that module runs on,
+    /// so it comes back to the dispatcher before touching the rows.
+    /// </summary>
+    private void OnPortsChanged() => Dispatcher.BeginInvoke(ShowPortsHeld);
+
+    /// <summary>
+    /// Marks the rows against what another module is using.
+    ///
+    /// A port the EDL is transmitting on cannot also carry this feed - a DELTACAST output takes
+    /// one owner - so the row says who has it and the toggle goes dead. Without this the operator
+    /// could switch it on, arm, and get a driver error some seconds later with the useful part
+    /// (that the EDL already had it) buried in a return code.
+    /// </summary>
+    private void ShowPortsHeld()
+    {
+        uint board = (uint)Math.Max(0, _settings.PlaybackBoardIndex);
+
+        foreach (TxPortRow row in _txPorts)
+            row.ShowHeldBy(SdiPorts.Shared.HeldByOther(new SdiPort(board, row.Index), PortOwner));
+
+        // A port switched on that has since been taken by something else would arm into a
+        // failure, so it is switched off and said out loud rather than left looking ready.
+        foreach (TxPortRow row in _txPorts.Where(r => r.On && r.HeldBy is not null).ToList())
+        {
+            bool wasLoading = _loading;
+            _loading = true;
+
+            row.On = false;
+
+            _loading = wasLoading;
+
+            Log($"TX{row.Index} switched off - {row.HeldBy} is using it.", Level.Warn);
+        }
+    }
+
+    /// <summary>
+    /// A port switched on or off.
+    ///
+    /// Said out loud, and said accurately: the ports are opened when the feed is armed, so one
+    /// switched on while something is already on air is wanted and not yet carrying anything. A
+    /// card does not grow another output under a running transmitter.
+    /// </summary>
+    private void TxPort_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+
+        ShowTxPortSummary();
+
+        _settings.PlaybackPorts = string.Join('|', _txPorts.Where(r => r.On).Select(r => r.Name));
+        _settings.Save();
+
+        string chosen = ChosenTxPorts.Count == 0
+            ? "none"
+            : string.Join(", ", ChosenTxPorts.Select(c => $"TX{c}"));
+
+        bool live = _delayTx is not null;
+
+        Log($"TX ports set to {chosen}." +
+            (live ? " What is on air keeps the ports it started with - re-arm to change them." : ""),
+            live ? Level.Warn : Level.Info);
     }
 
     private void PopulatePreviewPorts()
@@ -576,6 +538,15 @@ public partial class PlaybackWindow : Window
     private TimeSpan SelectedDelay =>
         DelayBox.SelectedItem is DelayOption option ? option.Delay : TidalLock.DefaultDelay;
 
+    /// <summary>A delay in words, for a sentence rather than a field.</summary>
+    private static string Describe(TimeSpan delay) => delay <= TimeSpan.Zero
+        ? "immediately"
+        : delay < TimeSpan.FromMinutes(1)
+            ? $"{delay.TotalSeconds:0} seconds"
+            : delay.TotalMinutes == 1
+                ? "one minute"
+                : $"{delay.TotalMinutes:0} minutes";
+
     /// <summary>
     /// The transmitter, if one is properly selected. Everything that reaches the card goes
     /// through this, so a missing board or port is reported once, here, in words.
@@ -583,11 +554,19 @@ public partial class PlaybackWindow : Window
     private bool TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)
     {
         board = SelectedTxBoard;
-        port = TxPortBox.SelectedItem as ChannelPort;
+
+        // The first port switched on, for anything that still wants one. The full set is
+        // ChosenTxPorts, and that is what a transmitter is actually handed.
+        port = _txPorts.FirstOrDefault(r => r.On)?.Port;
 
         if (board is null) { Log("No transmit board is selected.", Level.Warn); return false; }
         if (board.TxCount == 0) { Log($"{board.Model} has no TX channels.", Level.Warn); return false; }
-        if (port is null) { Log("No TX port is selected.", Level.Warn); return false; }
+
+        if (port is null)
+        {
+            Log("No TX port is switched on - switch at least one on to transmit.", Level.Warn);
+            return false;
+        }
 
         if (_playout?.FfmpegPath is null)
         {
@@ -675,9 +654,14 @@ public partial class PlaybackWindow : Window
         // indefinitely once the queue drains. It has to let go first.
         _playout?.StopAll();
 
+        // Every port switched on, carrying the one delayed picture. They are fixed for the life
+        // of this transmitter: a card does not grow another output under a running one, so a port
+        // switched on from here is wanted at the next arm rather than now.
+        IReadOnlyList<int> ports = ChosenTxPorts;
+
         try
         {
-            _delayTx = new DelayTransmitter(board!.Index, port!.Index, line, lockState.Delay,
+            _delayTx = new DelayTransmitter(board!.Index, ports, line, lockState.Delay,
                                             _settings.RecordingSegmentSeconds);
         }
         catch (DelayLineException ex)
@@ -685,6 +669,9 @@ public partial class PlaybackWindow : Window
             TidalLock.Shared.Fail(ex.Message);
             return;
         }
+
+        _portsOnAir = ports.ToArray();
+        ShowPortsOnAir();
 
         _delayTx.Status += OnDelayStatus;
         _delayTx.Start();
@@ -778,6 +765,11 @@ public partial class PlaybackWindow : Window
         // Which of the three steps is live. The one still to be done by the operator is lit;
         // arming and then waiting for a window that is not this one is the mistake worth
         // designing against.
+        // Says the delay actually chosen rather than a number baked into the markup. It read
+        // "one minute later" whatever was selected, which was wrong for three of the four
+        // options and is wrong for the default now.
+        Step3Text.Text = $"3.  On air {Describe(lockState.State == TidalLockState.Off ? SelectedDelay : lockState.Delay)} later";
+
         Step1Text.Foreground = Brush(lockState.State == TidalLockState.Off ? "IpMint" : "IpDim");
         Step2Text.Foreground = Brush(lockState.State == TidalLockState.Armed ? "IpMint" : "IpDim");
         Step3Text.Foreground = Brush(
@@ -897,6 +889,8 @@ public partial class PlaybackWindow : Window
         bool have = _timecode.TryGetCurrent(out Timecode now);
 
         ClockText.Text = have ? now.ToString() : "--:--:--:--";
+
+        ShowAirFrames();
         ClockDot.Fill = Brush(_timecode.State switch
         {
             TimecodeLinkState.Online => "IpMint",
@@ -999,20 +993,98 @@ public partial class PlaybackWindow : Window
     /// transitions from inside Core now — where going through <see cref="Log"/> would put the
     /// same sentence in the record twice.
     /// </summary>
-    private void Show(string message, Level level = Level.Info)
-    {
-        Brush brush = level switch
+    private void Show(string message, Level level = Level.Info) =>
+        Add("DECK", message, level switch
         {
             Level.Ok => Brush("Ok"),
             Level.Warn => Brush("Warn"),
             Level.Error => Brush("IpRed"),
             _ => Brush("IpText"),
-        };
+        });
 
-        _log.Add(new LogRow(DateTime.Now.ToString("HH:mm:ss"), message, brush));
-        while (_log.Count > 400) _log.RemoveAt(0);
+    /// <summary>
+    /// The sources this deck's log is about.
+    ///
+    /// Playback only, which is the point of it. The capture deck, the EDL and the ingest all
+    /// write into the same record and none of them is this operator's business while they are
+    /// watching a transmitter — the Monitor page is where everything together belongs. What does
+    /// belong here is the playout engine and tidal lock, because those two <i>are</i> playback
+    /// and the deck has only ever shown its own half of what they do.
+    /// </summary>
+    private static bool IsPlayback(LogSource source) =>
+        source is LogSource.Playback or LogSource.Playout or LogSource.TidalLock;
 
-        LogScroller.ScrollToEnd();
+    /// <summary>
+    /// A line from the record, filtered to playback and marshalled onto the UI thread.
+    ///
+    /// Raised on whichever thread wrote it — the playout thread, very often — so it cannot touch
+    /// the collection the panel is bound to without this.
+    /// </summary>
+    private void OnLogLine(LogLine line)
+    {
+        if (!IsPlayback(line.Source)) return;
+
+        // The deck's own lines arrive here as well as through Show, because Log writes them to
+        // the record. Taking them only from the record would be one path instead of two, but the
+        // record is written from a background thread and the panel would then lag the button the
+        // operator just pressed.
+        if (line.Source == LogSource.Playback) return;
+
+        Dispatcher.BeginInvoke(() => Add(line.SourceText, line.Message, line.Level switch
+        {
+            LogLevel.Ok => Brush("Ok"),
+            LogLevel.Warn => Brush("Warn"),
+            LogLevel.Error => Brush("IpRed"),
+            _ => Brush("IpText"),
+        }));
+    }
+
+    private void Add(string source, string message, Brush brush)
+    {
+        if (message.Length == 0) return;
+
+        _log.Add(new LogRow(DateTime.Now.ToString("HH:mm:ss"), source, message, brush));
+        while (_log.Count > 600) _log.RemoveAt(0);
+
+        if (FollowLogButton.IsChecked == true) LogScroller.ScrollToEnd();
+    }
+
+
+    /// <summary>
+    /// Frames out against frames recorded, which is the question asked of a delay: is it keeping
+    /// up?
+    ///
+    /// The difference between the two should be exactly the delay and nothing else. Anything
+    /// beyond it is a frame that was recorded and did not reach air, so it is named and it turns
+    /// red rather than being left for someone to subtract in their head.
+    /// </summary>
+    private void ShowAirFrames()
+    {
+        FrameLedger frames = PipelineState.Shared.Frames;
+        TidalLock tidal = TidalLock.Shared;
+
+        if (frames.Aired == 0 && tidal.State is TidalLockState.Off or TidalLockState.Armed)
+        {
+            AirFramesText.Text = "-";
+            AirFramesText.Foreground = Brush("IpDim");
+            return;
+        }
+
+        long delay = tidal.Line?.TargetFrames ?? 0;
+        long behind = Math.Max(0, frames.Recorded - frames.Aired - delay);
+
+        AirFramesText.Text =
+            $"{frames.Aired:N0} out of {frames.Recorded:N0}  ·  delay {delay:N0}" +
+            (behind > 0 ? $"  ·  {behind:N0} BEHIND" : "") +
+            (frames.Skipped > 0 ? $"  ·  {frames.Skipped:N0} SKIPPED" : "") +
+            (frames.Repeated > 0 ? $"  ·  {frames.Repeated:N0} repeated" : "") +
+            (frames.Resyncs > 0 ? $"  ·  {frames.Resyncs} resync" : "") +
+            (behind == 0 && frames.Skipped == 0 && frames.Repeated == 0 ? "  ·  no drops" : "");
+
+        AirFramesText.Foreground = Brush(
+            behind > 0 || frames.Skipped > 0 ? "IpRed"
+            : frames.Repeated > 0 ? "Warn"
+            : "IpTeal");
     }
 
     private void ClearLog_Click(object sender, RoutedEventArgs e) => _log.Clear();

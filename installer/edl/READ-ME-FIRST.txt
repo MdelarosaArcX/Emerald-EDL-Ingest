@@ -1,0 +1,141 @@
+===========================================================================
+ EMERALD EDL - installing on a fresh Windows machine
+===========================================================================
+
+This folder installs the EDL Generator ALONE. It is the install for a
+playout machine: one deck, one shortcut, nothing else on the box.
+
+If you want the capture deck, the Monitor, Live Edit and Ingest as well,
+use the full Emerald folder instead - this is not that.
+
+
+WHAT TO DO
+
+  1. Copy this whole folder onto the machine.
+  2. Right-click install.bat and choose "Run as administrator".
+  3. It asks where the media lives. Take the suggestion or type a path -
+     a local drive or a share, whichever this plant uses.
+  4. Start Menu > Emerald EDL.
+
+That is the install. There is nothing to download first.
+
+
+WHAT IS ALREADY IN THIS FOLDER
+
+  The .NET 8 runtime.  Published self-contained, so there is no runtime to
+  install and no internet needed. This is most of the 170 MB.
+
+  ffmpeg and ffprobe, if they were bundled when this folder was built. The
+  EDL looks for ffmpeg beside its own executable before anything on PATH,
+  so nothing needs configuring.
+
+
+WHY IT IS NOT A SMALLER DOWNLOAD
+
+  Honestly: because it is the same program. One executable holds every deck
+  and the shortcut decides which one opens - this one passes --edl. The EDL
+  also uses the same board, delay, media and timecode code as the rest, and
+  the runtime underneath it all is the same 170 MB either way.
+
+  So what makes this an EDL-only install is not a smaller payload. It is
+  that the machine gets one shortcut, its own entry in Add/Remove Programs,
+  its own program folder, and no monitoring port opened. An operator sitting
+  at it sees an EDL and nothing to go wrong with.
+
+
+WHAT IT CANNOT BRING WITH IT
+
+  THE DELTACAST DRIVER.  Playout goes through VideoMasterHD.dll, which lives
+  in C:\Windows\System32 and is put there by DELTACAST's own installer. It is
+  a kernel driver; no application installer may carry it.
+
+  Install it from DELTACAST before expecting to play to air. The install
+  script checks for it and tells you if it is not there.
+
+  Without it the EDL still opens and lists can be built, saved and checked.
+  Nothing will reach a transmitter.
+
+
+WHERE THINGS GO
+
+  Program        C:\Program Files\Emerald EDL
+  Media          wherever you chose during the install
+  Settings       %APPDATA%\Emerald\settings.json
+  Logs           %APPDATA%\Emerald\logs        (kept 14 days)
+
+  Reinstalling over a working machine does not touch the settings file, so
+  the board, port and media folder you have set up survive an upgrade.
+
+
+IF A FULL EMERALD IS ALSO ON THIS MACHINE
+
+  They coexist. Different folders, separate Add/Remove entries, and either
+  one can be removed without touching the other.
+
+  One thing to know: they share a single settings file. A board index or a
+  port changed in one is changed for both. On a single plant machine that is
+  usually exactly what you want - there is one card and one truth about it -
+  but it is worth knowing before you go looking for a setting that moved.
+
+  Also: they are the same executable name, so either one running stops the
+  other being installed, updated or removed. Close it first.
+
+
+NO MONITORING PORT
+
+  This install opens nothing in the firewall. The monitoring page is a
+  capture-side thing and an EDL machine serves none of it.
+
+  If this box should also serve monitoring to other machines, install the
+  full Emerald on it instead.
+
+
+UPDATING IT LATER
+
+  On the master, close Emerald and run publish-edl.bat. That rebuilds
+  dist\Emerald-EDL.
+
+  Then on THIS machine, close the EDL and do one of:
+
+    A. Copy the whole dist\Emerald-EDL folder over, then right-click
+       update.bat inside the copy and Run as administrator. With no argument
+       it updates from the folder it is sitting in.
+
+    B. Share dist\Emerald-EDL from the master and run, as administrator:
+
+         update.bat \\MASTER\Emerald-EDL
+
+       Nothing is copied by hand. This is the one for a scheduled task.
+
+  Either way install.bat from the new folder does the same job - it notices
+  an existing install and says "update" instead of "install".
+
+  It checks the build date before copying, so pointing it at the build you
+  are already running costs a few seconds and changes nothing.
+
+  Your media and your settings are untouched.
+
+  The EDL must be closed - it holds its own files open. If something is on
+  air, let it finish: closing the EDL mid-playout takes the transmitter with
+  it.
+
+
+UNINSTALLING
+
+  Settings > Apps > "Emerald EDL Generator", or run uninstall.bat as
+  administrator from C:\Program Files\Emerald EDL.
+
+  It never deletes media. It asks before deleting settings and logs - and if
+  a full Emerald is still installed it does not even ask, because that file
+  is its configuration too.
+
+
+IF SOMETHING IS WRONG
+
+  The install script ends with a list of what it found and what is missing.
+  Read that first - it names the two things that usually matter, the driver
+  and ffmpeg.
+
+  Once the EDL is running, its own log panel narrates every cue, load and
+  on-air moment, and it is all written down under %APPDATA%\Emerald\logs so
+  yesterday's problem is still readable today.

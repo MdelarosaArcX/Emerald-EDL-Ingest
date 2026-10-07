@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using Emerald.Core;
 using Emerald.Deltacast;
 using Emerald.Video;
@@ -60,6 +61,24 @@ public sealed class RxPreview : IDisposable
 
     private WriteableBitmap? _bitmap;
     private int _bitmapWidth, _bitmapHeight;
+
+    /// <summary>
+    /// How much smaller than the source this preview's picture is, per axis.
+    ///
+    /// 4 is a quarter-size image, which is all a 352-wide thumbnail can show. The playback deck
+    /// asks for less reduction because its monitor is the picture an operator judges the output
+    /// by, and a quarter-size image there is visibly soft.
+    ///
+    /// Takes effect the next time the receiver is locked, which is also when the buffers are
+    /// sized — set it before <see cref="Start"/>.
+    /// </summary>
+    public int Decimation { get; set; } = UyvyPreview.Decimation;
+
+    /// <summary>
+    /// Frames a second this preview converts. The default is above any broadcast rate, so every
+    /// frame is converted and the picture moves as smoothly as the wire.
+    /// </summary>
+    public int TargetFps { get; set; } = UyvyPreview.TargetFps;
 
     public RxPreview()
     {
@@ -283,18 +302,26 @@ public sealed class RxPreview : IDisposable
             ? null
             : new SdiAudioReader(SdiAudioReader.MaxChannels, format.FrameRate);
 
-        int outW = UyvyPreview.OutputWidth(format.Width);
-        int outH = UyvyPreview.OutputHeight(format.Height);
+        // Read once per lock, so changing the setting takes effect on the next re-detect rather
+        // than halfway through a frame.
+        int decimation = Decimation;
+
+        int outW = UyvyPreview.OutputWidth(format.Width, decimation);
+        int outH = UyvyPreview.OutputHeight(format.Height, decimation);
+
         // Two buffers, used alternately: the worker fills one while the UI thread is still
-        // reading the other. A fresh array per frame would be a half-megabyte large-object
-        // allocation twelve times a second for a thumbnail.
-        var buffers = new[] { UyvyPreview.CreateBuffer(format.Width, format.Height),
-                              UyvyPreview.CreateBuffer(format.Width, format.Height) };
+        // reading the other. A fresh array per frame would be a large-object allocation per
+        // frame, which at a full-size preview is 8 MB a time.
+        //
+        // Two is only enough because at most one frame is ever in flight to the UI - see
+        // Publish. With an unbounded dispatcher queue it was not: three frames queued meant the
+        // worker was overwriting the buffer the first one had not been read from yet.
+        var buffers = new[] { UyvyPreview.CreateBuffer(format.Width, format.Height, decimation),
+                              UyvyPreview.CreateBuffer(format.Width, format.Height, decimation) };
         int next = 0;
 
-        // Every frame must still be locked and released or the card's queue backs up, but
-        // only every Nth is worth converting and marshalling to the UI thread.
-        int convertEvery = UyvyPreview.ConvertEvery(format.FrameRate);
+        // Every frame must still be locked and released or the card's queue backs up.
+        int convertEvery = UyvyPreview.ConvertEvery(format.FrameRate, TargetFps);
         long slot = 0;
 
         // A lock timeout on its own means nothing — the source may just have paused. Several
@@ -338,32 +365,73 @@ public sealed class RxPreview : IDisposable
 
                 if (size < (uint)format.FrameBytes) continue;
 
-                UyvyPreview.ToBgra(buffer, format.Width, buffers[next], outW, outH);
+                UyvyPreview.ToBgra(buffer, format.Width, buffers[next], outW, outH, decimation);
             }
             finally
             {
                 VideoMasterHD.VHD_UnlockSlotHandle(slotHandle);
             }
 
-            Publish(buffers[next], outW, outH);
-            next ^= 1;
+            // Dropped rather than queued if the UI thread has not caught up. See Publish.
+            if (Publish(buffers[next], outW, outH)) next ^= 1;
         }
     }
 
-    private void Publish(byte[] rgb, int w, int h)
-    {
-        Application.Current?.Dispatcher.BeginInvoke(() =>
-        {
-            if (_bitmap is null || _bitmapWidth != w || _bitmapHeight != h)
-            {
-                _bitmap = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
-                _bitmapWidth = w;
-                _bitmapHeight = h;
-            }
+    /// <summary>1 while a frame is on its way to the UI thread and has not been drawn yet.</summary>
+    private int _inFlight;
 
-            _bitmap.WritePixels(new Int32Rect(0, 0, w, h), rgb, w * 4, 0);
-            FrameReady?.Invoke(_bitmap);
-        });
+    /// <summary>
+    /// Hands a converted frame to the UI thread, or drops it.
+    ///
+    /// <b>At most one frame is ever in flight, and this is the fix for the freezing.</b> Every
+    /// converted frame used to be posted with BeginInvoke unconditionally, onto a dispatcher
+    /// shared with two 25 ms timers, a growing log panel and whatever else the operator had
+    /// open. When that thread fell behind, the posts queued without limit: latency grew without
+    /// bound, so the picture lagged further and further behind the wire and then jumped — which
+    /// is what a freeze followed by a skip actually is.
+    ///
+    /// Worse, the two conversion buffers are reused in turn, which is only safe while one frame
+    /// is outstanding. With three queued, the worker was already overwriting the buffer the
+    /// oldest callback had yet to read, so a late frame could be drawn half old and half new.
+    ///
+    /// Dropping is the right answer for a monitor: the next frame is a fiftieth of a second
+    /// away and more current than the one being discarded. Nothing recorded or transmitted is
+    /// affected - this is the picture on the glass.
+    /// </summary>
+    /// <returns>True if the frame was taken, so the caller moves to the other buffer.</returns>
+    private bool Publish(byte[] rgb, int w, int h)
+    {
+        if (Interlocked.Exchange(ref _inFlight, 1) == 1) return false;
+
+        if (Application.Current?.Dispatcher is not { } dispatcher)
+        {
+            _inFlight = 0;
+            return false;
+        }
+
+        dispatcher.BeginInvoke(() =>
+        {
+            try
+            {
+                if (_bitmap is null || _bitmapWidth != w || _bitmapHeight != h)
+                {
+                    _bitmap = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
+                    _bitmapWidth = w;
+                    _bitmapHeight = h;
+                }
+
+                _bitmap.WritePixels(new Int32Rect(0, 0, w, h), rgb, w * 4, 0);
+                FrameReady?.Invoke(_bitmap);
+            }
+            finally
+            {
+                // In a finally: a handler that throws must not wedge the preview shut for the
+                // rest of the session.
+                Volatile.Write(ref _inFlight, 0);
+            }
+        }, DispatcherPriority.Render);
+
+        return true;
     }
 
     private void Report(string text, bool problem)

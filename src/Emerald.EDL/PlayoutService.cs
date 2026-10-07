@@ -58,7 +58,15 @@ public sealed record PlayoutRequest(
     Timecode Som,
     TimeSpan SeekOffset,
     PostPlay PostPlay,
-    IReadOnlyList<AudioTrack>? AudioTracks = null)
+    IReadOnlyList<AudioTrack>? AudioTracks = null,
+
+    /// <summary>
+    /// Every TX port this message goes out of, or null for just <see cref="TxChannel"/>.
+    ///
+    /// One board. Ports on different boards are genlocked separately, so one loop driving both
+    /// would be paced by the slower and the other would drift.
+    /// </summary>
+    IReadOnlyList<int>? TxChannels = null)
 {
     public bool HasVideo => VideoFiles is { Count: > 0 };
     public bool HasAudio => AudioTracks is { Count: > 0 };
@@ -295,7 +303,7 @@ public sealed class PlayoutService : IDisposable
 
     private void Run(CancellationToken ct)
     {
-        SdiOutput? output = null;
+        ISdiOutput? output = null;
         (uint board, int tx)? openFor = null;
         byte[]? lastFrame = null;
         PostPlay fill = PostPlay.BlackScreen;
@@ -336,7 +344,21 @@ public sealed class PlayoutService : IDisposable
                         Report(new PlayoutStatus(PlayoutState.Opening,
                             $"Opening TX{req.TxChannel} on board {req.BoardIndex} at {format.Name}..."));
 
-                        output = SdiOutput.Open(req.BoardIndex, req.TxChannel, format);
+                        // Said before the open, so the playback deck can grey out a port the EDL
+                        // is transmitting on instead of offering it. Re-claimed on each re-open
+                        // of the same ports, which the registry allows for one owner.
+                        SdiPorts.Shared.ReleaseAll(PortOwner);
+                        SdiPorts.Shared.TryHold(PortOwner,
+                            (req.TxChannels is { Count: > 1 } ports
+                                ? ports
+                                : new[] { req.TxChannel })
+                            .Select(c => new SdiPort(req.BoardIndex, c)).ToArray());
+
+                        // One port or several, through the same surface - the play loop does not
+                        // need to know which, and there is one read of the picture either way.
+                        output = req.TxChannels is { Count: > 1 } many
+                            ? SdiOutputFan.Open(req.BoardIndex, many, format)
+                            : SdiOutput.Open(req.BoardIndex, req.TxChannel, format);
                         openFor = (req.BoardIndex, req.TxChannel);
                         lastFrame = null;
                     }
@@ -364,9 +386,17 @@ public sealed class PlayoutService : IDisposable
         finally
         {
             output?.Dispose();
+
+            // However this ended, the ports go back - otherwise a playout that threw would leave
+            // them greyed out on the playback deck with nothing holding them.
+            SdiPorts.Shared.ReleaseAll(PortOwner);
+
             Report(new PlayoutStatus(PlayoutState.Stopped, "Output released."));
         }
     }
+
+    /// <summary>How the playout engine names itself in <see cref="SdiPorts"/>.</summary>
+    private const string PortOwner = "EDL playout";
 
     /// <summary>
     /// What a message is made of, by file name, for the cue line: the picture and every
@@ -413,7 +443,7 @@ public sealed class PlayoutService : IDisposable
         QueueChanged?.Invoke();
     }
 
-    private void PlayEntry(PlayoutEntry entry, SdiOutput output, ref byte[]? lastFrame, CancellationToken ct)
+    private void PlayEntry(PlayoutEntry entry, ISdiOutput output, ref byte[]? lastFrame, CancellationToken ct)
     {
         PlayoutRequest req = entry.Request;
         var format = output.Format;
@@ -483,9 +513,41 @@ public sealed class PlayoutService : IDisposable
                 ? $"STOP  {DescribeMedia(entry)} - stopped at frame {framesOut} " +
                   $"({new Timecode(framesOut, req.FrameRate)}) at station {Station()}."
                 : $"DONE  {DescribeMedia(entry)} - {framesOut} frames ({new Timecode(framesOut, req.FrameRate)}) " +
-                  $"put to air, ended at station {Station()}. Post play: {Describe(req.PostPlay)}.",
+                  $"put to air, {DropSummary(req.FrameRate)}, ended at station {Station()}. " +
+                  $"Post play: {Describe(req.PostPlay)}.",
             framesOut, target));
+
+        // Per message, so the next one is judged on its own behaviour rather than inheriting a
+        // stall from the one before.
+        _onAir = null;
+        _droppedSaid = 0;
+        _droppedWorst = 0;
     }
+
+    /// <summary>
+    /// Wall clock against frames pushed, for this message.
+    ///
+    /// Started at the first frame the card accepted. Null until then, which is also what makes
+    /// the drop count mean "frames that should have been on air", rather than including the time
+    /// spent opening a decoder.
+    /// </summary>
+    private System.Diagnostics.Stopwatch? _onAir;
+
+    /// <summary>The worst shortfall seen in this message, and how much of it has been said.</summary>
+    private long _droppedWorst;
+    private long _droppedSaid;
+
+    /// <summary>
+    /// What to say about drops on the closing line.
+    ///
+    /// Said on every message, including the clean ones. "no frames dropped" is the sentence an
+    /// operator wants after a transmission, and a line that is simply absent when all is well
+    /// cannot be told apart from the feature not working.
+    /// </summary>
+    private string DropSummary(int rate) =>
+        _droppedWorst <= 0
+            ? "no frames dropped"
+            : $"{_droppedWorst} frame(s) dropped at worst ({_droppedWorst / (double)Math.Max(1, rate):F2} s behind)";
 
     /// <summary>
     /// Advances every bed by one frame and lays them out as SDI channels.
@@ -567,7 +629,7 @@ public sealed class PlayoutService : IDisposable
         new(new short[Math.Min(beds.Count * 2, SdiOutput.MaxAudioChannels)][]);
 
     /// <summary>Video drives the loop: the playlist wraps to fill the duration.</summary>
-    private long PlayWithVideo(PlayoutEntry entry, SdiOutput output, List<AudioBed> beds,
+    private long PlayWithVideo(PlayoutEntry entry, ISdiOutput output, List<AudioBed> beds,
                                ref byte[]? lastFrame, CancellationToken ct)
     {
         PlayoutRequest req = entry.Request;
@@ -640,9 +702,36 @@ public sealed class PlayoutService : IDisposable
                     framesFromThisFile++;
                     entry.FramesOut = framesOut;
 
+                    // The clock starts at the first frame the card took, not at the open: the
+                    // decoder opening is not air time and counting it would report the open as
+                    // lost frames on every single file.
+                    _onAir ??= System.Diagnostics.Stopwatch.StartNew();
+
                     if (framesOut % req.FrameRate == 0)
                     {
                         QueueChanged?.Invoke();
+
+                        long dropped = PlayoutDrift.Dropped(_onAir.Elapsed, req.FrameRate, framesOut);
+
+                        _droppedWorst = Math.Max(_droppedWorst, dropped);
+
+                        // Only when it has got meaningfully worse, so a healthy transmitter says
+                        // nothing and a struggling one says so once per fifth of a second lost.
+                        if (PlayoutDrift.WorthSaying(dropped, _droppedSaid, req.FrameRate))
+                        {
+                            _droppedSaid = dropped;
+
+                            Report(new PlayoutStatus(PlayoutState.Playing,
+                                $"DROP  {dropped} frame(s) behind the clock " +
+                                $"({dropped / (double)req.FrameRate:F2} s) - " +
+                                $"{framesOut} on air against " +
+                                $"{PlayoutDrift.Expected(_onAir.Elapsed, req.FrameRate)} expected in " +
+                                $"{_onAir.Elapsed.TotalSeconds:F1} s. " +
+                                $"The card repeats or blacks a slot it has no new frame for.",
+                                framesOut, target, Path.GetFileName(file),
+                                CurrentFilePath: file, Event: "playout.drop"));
+                        }
+
                         Report(new PlayoutStatus(PlayoutState.Playing, "", framesOut, target, Path.GetFileName(file)));
                     }
                 }
@@ -698,7 +787,7 @@ public sealed class PlayoutService : IDisposable
     /// No video selected: hold black and carry the audio. With nothing decoding picture the
     /// duration is what ends it, and the card's slot queue still does the pacing.
     /// </summary>
-    private long PlayAudioOnly(PlayoutEntry entry, SdiOutput output, List<AudioBed> beds, CancellationToken ct)
+    private long PlayAudioOnly(PlayoutEntry entry, ISdiOutput output, List<AudioBed> beds, CancellationToken ct)
     {
         PlayoutRequest req = entry.Request;
         long? target = req.DurationFrames;
@@ -743,7 +832,7 @@ public sealed class PlayoutService : IDisposable
         Report(new PlayoutStatus(PlayoutState.Failed, detail, framesOut, target));
     }
 
-    private void WaitForCue(PlayoutEntry entry, SdiOutput output, PostPlay fill, byte[]? lastFrame, CancellationToken ct)
+    private void WaitForCue(PlayoutEntry entry, ISdiOutput output, PostPlay fill, byte[]? lastFrame, CancellationToken ct)
     {
         PlayoutRequest req = entry.Request;
         long waitFrames = FramesUntilCue(req);
@@ -779,7 +868,7 @@ public sealed class PlayoutService : IDisposable
     /// Holds the post-play fill on the output while the queue is empty. Returns false when
     /// the card gives up, which ends the engine.
     /// </summary>
-    private bool HoldFill(SdiOutput output, PostPlay fill, byte[]? lastFrame, CancellationToken ct)
+    private bool HoldFill(ISdiOutput output, PostPlay fill, byte[]? lastFrame, CancellationToken ct)
     {
         byte[] filler = FillFrame(output, fill, lastFrame);
 
@@ -802,7 +891,7 @@ public sealed class PlayoutService : IDisposable
         return true;
     }
 
-    private static byte[] FillFrame(SdiOutput output, PostPlay fill, byte[]? lastFrame) =>
+    private static byte[] FillFrame(ISdiOutput output, PostPlay fill, byte[]? lastFrame) =>
         fill == PostPlay.FreezeLastFrame && lastFrame is not null ? lastFrame : output.BlackFrame();
 
     public static string Describe(PostPlay postPlay) =>

@@ -140,6 +140,10 @@ public partial class MonitorWindow : Window
 
         _drain.Start();
         _strip.Start();
+
+        // On if it was left on. The toggle raises the handler, which does the starting.
+        if (_settings.MonitorApi) RemoteToggle.IsChecked = true;
+        if (RemoteToggle.IsChecked == true) StartRemote();
     }
 
     private void Window_Closing(object? sender, CancelEventArgs e)
@@ -153,6 +157,10 @@ public partial class MonitorWindow : Window
         ActivityLog.Shared.Line -= OnLine;
         PipelineState.Shared.Changed -= OnPipelineChanged;
         TidalLock.Shared.Changed -= OnTidalLockChanged;
+
+        // The port goes with the window. The setting remembers it was on, so it comes back.
+        _remote?.Dispose();
+        _remote = null;
     }
 
     // ------------------------------------------------------------------ the record
@@ -404,6 +412,80 @@ public partial class MonitorWindow : Window
         if (LogList.SelectedItem is not MonitorRow row || row.Id.Length == 0) return;
 
         IdBox.Text = row.Id;
+    }
+
+
+    // ------------------------------------------------------------------ remote monitoring
+
+    /// <summary>
+    /// The server that serves this page to other machines, while it is on.
+    ///
+    /// Owned by the window because the toggle is here, and stopped when the window closes: a
+    /// port left open by a page nobody is looking at is a port nobody knows is open.
+    /// </summary>
+    private MonitorServer? _remote;
+
+    private void Remote_Changed(object sender, RoutedEventArgs e)
+    {
+        if (RemoteToggle.IsChecked == true) StartRemote(); else StopRemote();
+    }
+
+    private void StartRemote()
+    {
+        _remote ??= new MonitorServer(ActivityLog.Shared, PipelineState.Shared, TidalLock.Shared,
+                                      () => _timecode.TryGetCurrent(out Timecode now) ? now : null,
+                                      Environment.MachineName);
+
+        int port = _settings.MonitorApiPort > 0 ? _settings.MonitorApiPort : MonitorServer.DefaultPort;
+
+        if (!_remote.TryStart(port, out string? problem))
+        {
+            RemoteToggle.IsChecked = false;
+
+            RemoteText.Text = problem;
+            RemoteText.Foreground = Brush("Bad");
+            RemoteText.Visibility = Visibility.Visible;
+
+            ActivityLog.Shared.Error(LogSource.App, $"Remote monitoring could not start: {problem}",
+                                     @event: "monitor.api.failed");
+            return;
+        }
+
+        _settings.MonitorApi = true;
+        _settings.MonitorApiPort = port;
+        _settings.Save();
+
+        ShowRemote();
+    }
+
+    private void StopRemote()
+    {
+        _remote?.Stop();
+
+        _settings.MonitorApi = false;
+        _settings.Save();
+
+        RemoteText.Visibility = Visibility.Collapsed;
+    }
+
+    private void ShowRemote()
+    {
+        if (_remote is not { Running: true } server)
+        {
+            RemoteText.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        // Every address the machine has, because the operator on the other PC has to be told
+        // which one to type and only they know which network they are on.
+        RemoteText.Text =
+            "Remote monitoring is on - open this in a browser on another machine:   " +
+            string.Join("    ", server.Addresses) +
+            "\nIf it cannot be reached, Windows is blocking the port. Once, in an administrator " +
+            $"command prompt:   {MonitorFeed.FirewallCommand(server.Port)}";
+
+        RemoteText.Foreground = Brush("Tc");
+        RemoteText.Visibility = Visibility.Visible;
     }
 
     // ------------------------------------------------------------------ the strip

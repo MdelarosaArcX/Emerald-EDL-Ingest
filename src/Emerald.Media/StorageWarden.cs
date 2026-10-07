@@ -74,7 +74,7 @@ public static class StorageWarden
 
             long total = 0;
 
-            foreach (string path in Directory.EnumerateFiles(folder))
+            foreach (string path in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
             {
                 try { total += new FileInfo(path).Length; }
                 catch (IOException) { }
@@ -147,7 +147,7 @@ public static class StorageWarden
             {
                 if (!Directory.Exists(folder)) return;
 
-                foreach (string path in Directory.EnumerateFiles(folder))
+                foreach (string path in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
                 {
                     if (!MediaScanner.IsPlayable(path)) continue;
 
