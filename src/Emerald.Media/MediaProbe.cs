@@ -96,10 +96,54 @@ public static class MediaProbe
     }
 
     /// <summary>
+    /// Probes already made, of files that have stopped changing. A closed segment never changes,
+    /// and the store is listed again every time one closes - every ten seconds at the shortest
+    /// segment length - so without this every file in it went through ffprobe again each time:
+    /// hundreds of processes for one new file. Keyed on length and write time as well as path, as
+    /// <see cref="MediaCodec"/>'s is, so a file replaced under the same name is read again.
+    ///
+    /// Only an answer with a duration is kept. A segment still being written has none yet, and it
+    /// must be asked again once the recorder has closed it.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, MediaInfo> Probed = new();
+
+    /// <summary>Beyond this the cache is started again: files pruned from the store leave entries behind.</summary>
+    private const int ProbedMost = 20_000;
+
+    /// <summary>
     /// Reads duration, start timecode and stream layout. Returns null when ffprobe is
     /// missing or the file cannot be read; callers fall back to treating SOM as elapsed.
     /// </summary>
     public static MediaInfo? Probe(string? ffprobePath, string mediaPath, int frameRate)
+    {
+        if (ffprobePath is null) return null;
+
+        string key;
+
+        try
+        {
+            var file = new FileInfo(mediaPath);
+            if (!file.Exists) return null;
+
+            key = $"{mediaPath}|{file.Length}|{file.LastWriteTimeUtc.Ticks}|{frameRate}";
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+
+        if (Probed.TryGetValue(key, out MediaInfo? known)) return known;
+
+        MediaInfo? info = ProbeUncached(ffprobePath, mediaPath, frameRate);
+
+        if (info is { Duration.Ticks: > 0 })
+        {
+            if (Probed.Count >= ProbedMost) Probed.Clear();
+            Probed[key] = info;
+        }
+
+        return info;
+    }
+
+    private static MediaInfo? ProbeUncached(string? ffprobePath, string mediaPath, int frameRate)
     {
         if (ffprobePath is null || !File.Exists(mediaPath)) return null;
 

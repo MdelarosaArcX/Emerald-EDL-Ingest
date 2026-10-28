@@ -83,6 +83,33 @@ public sealed class PlayoutEntry
     public long FramesOut { get; set; }
     public string Detail { get; set; } = "";
 
+    /// <summary>
+    /// Frames that should have been on air by now and were not, for this message.
+    ///
+    /// Carried on the entry rather than kept inside the engine so the queue can show it as it
+    /// happens: a count that only appeared in the closing line would be a figure the operator
+    /// learns about after the transmission it describes.
+    /// </summary>
+    public long FramesDropped { get; set; }
+
+    /// <summary>How many separate stalls those dropped frames came from.</summary>
+    public long DropEvents { get; set; }
+
+    /// <summary>How many frames this message is meant to put to air, when it has an end.</summary>
+    public long? TargetFrames => Request.DurationFrames;
+
+    /// <summary>Frames still to go, or null for an open-ended message.</summary>
+    public long? FramesLeft => TargetFrames is { } t ? Math.Max(0, t - FramesOut) : null;
+
+    /// <summary>
+    /// The frame count, as a count. The timecode beside it says the same thing in the units a
+    /// plant speaks; this is the one an edit and a drop are measured in, and working one out
+    /// from the other in your head is the arithmetic this saves.
+    /// </summary>
+    public string FrameLabel => TargetFrames is { } target
+        ? $"f {FramesOut:N0}/{target:N0}"
+        : $"f {FramesOut:N0}";
+
     public Timecode Stop => Request.DurationFrames is { } d
         ? Request.Start.AddWrapping(d)
         : Request.Start;
@@ -520,8 +547,7 @@ public sealed class PlayoutService : IDisposable
         // Per message, so the next one is judged on its own behaviour rather than inheriting a
         // stall from the one before.
         _onAir = null;
-        _droppedSaid = 0;
-        _droppedWorst = 0;
+        _drops.Reset();
     }
 
     /// <summary>
@@ -533,21 +559,25 @@ public sealed class PlayoutService : IDisposable
     /// </summary>
     private System.Diagnostics.Stopwatch? _onAir;
 
-    /// <summary>The worst shortfall seen in this message, and how much of it has been said.</summary>
-    private long _droppedWorst;
-    private long _droppedSaid;
+    /// <summary>
+    /// The running total of frames lost in this message.
+    ///
+    /// Only ever increases within a message: it is the high-water mark against the clock, so a
+    /// transmitter that catches up a little does not have its losses forgiven - those frames did
+    /// not go out, and the closing line should still say so.
+    /// </summary>
+    private readonly DropLedger _drops = new();
 
     /// <summary>
-    /// What to say about drops on the closing line.
+    /// How often the frame count is written to the record while a message is on air.
     ///
-    /// Said on every message, including the clean ones. "no frames dropped" is the sentence an
-    /// operator wants after a transmission, and a line that is simply absent when all is well
-    /// cannot be told apart from the feature not working.
+    /// Ten seconds is a compromise: often enough to place any other event in the record against
+    /// a frame count, rare enough that a long message does not bury everything else under
+    /// progress lines.
     /// </summary>
-    private string DropSummary(int rate) =>
-        _droppedWorst <= 0
-            ? "no frames dropped"
-            : $"{_droppedWorst} frame(s) dropped at worst ({_droppedWorst / (double)Math.Max(1, rate):F2} s behind)";
+    private const int ProgressSeconds = 10;
+
+    private string DropSummary(int rate) => _drops.Summary(rate);
 
     /// <summary>
     /// Advances every bed by one frame and lays them out as SDI channels.
@@ -707,30 +737,62 @@ public sealed class PlayoutService : IDisposable
                     // lost frames on every single file.
                     _onAir ??= System.Diagnostics.Stopwatch.StartNew();
 
+                    // Checked every frame, not once a second.
+                    //
+                    // A stall is over in a fraction of a second, so a per-second check could only
+                    // ever say "at some point in the last second, this much was lost" - and if a
+                    // stall began and ended between two checks, the whole of it was attributed to
+                    // whichever second happened to notice. Every frame costs a Stopwatch read and
+                    // a subtraction, which is nothing beside pushing a 4 MB frame to the card,
+                    // and it buys the exact station time each stall began at.
+                    long dropped = PlayoutDrift.Dropped(_onAir.Elapsed, req.FrameRate, framesOut);
+
+                    if (_drops.Record(dropped) is var lost && lost > 0)
+                    {
+                        entry.FramesDropped = _drops.Total;
+                        entry.DropEvents = _drops.Stalls;
+
+                        // Every stall, with how many frames it cost and the station time it
+                        // happened at. One line per stall rather than per frame: fifty frames
+                        // lost in one go is one event, and fifty identical lines a tenth of a
+                        // second apart would bury the rest of the record.
+                        Report(new PlayoutStatus(PlayoutState.Playing,
+                            $"DROP  {lost} frame(s) lost at station {Station()} " +
+                            $"({lost / (double)req.FrameRate:F2} s) - {dropped} behind the clock " +
+                            $"in total for this message. {framesOut} on air against " +
+                            $"{PlayoutDrift.Expected(_onAir.Elapsed, req.FrameRate)} expected in " +
+                            $"{_onAir.Elapsed.TotalSeconds:F1} s. " +
+                            $"The card repeats or blacks a slot it has no new frame for.",
+                            framesOut, target, Path.GetFileName(file),
+                            CurrentFilePath: file, Event: "playout.drop"));
+
+                        QueueChanged?.Invoke();
+                    }
+
                     if (framesOut % req.FrameRate == 0)
                     {
                         QueueChanged?.Invoke();
 
-                        long dropped = PlayoutDrift.Dropped(_onAir.Elapsed, req.FrameRate, framesOut);
-
-                        _droppedWorst = Math.Max(_droppedWorst, dropped);
-
-                        // Only when it has got meaningfully worse, so a healthy transmitter says
-                        // nothing and a struggling one says so once per fifth of a second lost.
-                        if (PlayoutDrift.WorthSaying(dropped, _droppedSaid, req.FrameRate))
-                        {
-                            _droppedSaid = dropped;
-
+                        // The frame count, into the record, while it is going out.
+                        //
+                        // The per-second report below carries no message and is marked transient,
+                        // so it moves the deck's readout and is never written down - which left
+                        // the record with the start of a transmission, the end of it, and nothing
+                        // in between. "How far in was it when that happened" was unanswerable
+                        // afterwards from anything but a drop line.
+                        //
+                        // Every ten seconds rather than every second: a three-minute message is
+                        // eighteen lines instead of a hundred and eighty, and still fine enough
+                        // to place any event in the record against a frame count.
+                        if (framesOut % (req.FrameRate * ProgressSeconds) == 0)
                             Report(new PlayoutStatus(PlayoutState.Playing,
-                                $"DROP  {dropped} frame(s) behind the clock " +
-                                $"({dropped / (double)req.FrameRate:F2} s) - " +
-                                $"{framesOut} on air against " +
-                                $"{PlayoutDrift.Expected(_onAir.Elapsed, req.FrameRate)} expected in " +
-                                $"{_onAir.Elapsed.TotalSeconds:F1} s. " +
-                                $"The card repeats or blacks a slot it has no new frame for.",
+                                $"FRAMES {framesOut:N0}" +
+                                (target is { } goal ? $" of {goal:N0}" : "") +
+                                $" on air ({new Timecode(framesOut, req.FrameRate)}) at station " +
+                                $"{Station()} - {Path.GetFileName(file)}, " +
+                                $"{_drops.Summary(req.FrameRate)}.",
                                 framesOut, target, Path.GetFileName(file),
-                                CurrentFilePath: file, Event: "playout.drop"));
-                        }
+                                CurrentFilePath: file, Event: "playout.frames"));
 
                         Report(new PlayoutStatus(PlayoutState.Playing, "", framesOut, target, Path.GetFileName(file)));
                     }

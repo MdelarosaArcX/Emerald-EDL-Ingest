@@ -24,6 +24,12 @@ internal sealed record Placed(CapturedClip Clip, long StartFrame, long Frames)
 
     /// <summary>True while the recorder still has it open, so it cannot be played yet.</summary>
     public bool Pending => Clip.StillBeingWritten;
+
+    /// <summary>
+    /// The recording this segment belongs to - its per-recording folder - or null for a flat
+    /// old-style file. Worked out once, because the frame readout asks it every frame.
+    /// </summary>
+    public string? Folder { get; } = MediaLibrary.RecordingFolder(Clip.Path);
 }
 
 /// <summary>
@@ -61,7 +67,24 @@ public partial class LiveEditWindow : Window
     private readonly TimecodeService _timecode = TimecodeLink.Service;
 
     private readonly int _rate;
-    private readonly long _dayFrames;
+
+    /// <summary>Frames in twenty-four hours, which is what a timecode wraps at.</summary>
+    private readonly long _oneDay;
+
+    /// <summary>
+    /// How long this ruler is, in frames from the day's midnight. A day, unless a recording
+    /// that rolled on it runs on past midnight - then as far as that recording goes, so it is
+    /// one continuous run on one ruler rather than cut in two at 00:00 with the second half on
+    /// another day. Set by <see cref="Place"/>.
+    /// </summary>
+    private long _dayFrames;
+
+    /// <summary>
+    /// Where a moment sits on this ruler: frames from the ruler day's midnight. Not wrapped,
+    /// so ten past midnight the next day is a day's frames plus ten minutes, after 23:59.
+    /// </summary>
+    private long FrameOn(DateTime at) =>
+        (long)Math.Round((at - _day.Date).TotalSeconds * _rate);
 
     private readonly IReadOnlyList<ZoomLevel> _ladder;
     private int _zoom;
@@ -80,11 +103,20 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private string? _primaryFolder;
 
+    /// <summary>Every recording on the ruler, by folder: where it starts and how many frames it holds.</summary>
+    private Dictionary<string, (long Start, long Frames)> _recordings = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// What to do once the next listing has been laid out - set when the ruler moves to a new
+    /// day mid-playback, so the playing (or the following of air) carries on on the new one.
+    /// </summary>
+    private Action? _afterPlaced;
+
     /// <summary>The segments of the recording in question, which is the subject of the counts.</summary>
     private IEnumerable<Placed> Primary =>
         _primaryFolder is null
             ? _placed
-            : _placed.Where(p => MediaLibrary.RecordingFolder(p.Clip.Path) == _primaryFolder);
+            : _placed.Where(p => string.Equals(p.Folder, _primaryFolder, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>The day on the ruler. The store can hold several, and one ruler holds one.</summary>
     private DateTime _day = DateTime.Today;
@@ -121,6 +153,24 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private bool _open;
 
+    /// <summary>The player on screen. Everything that plays, seeks or reads a position uses this.</summary>
+    private MediaElement Player => _active;
+
+    private MediaElement _active = null!;
+
+    /// <summary>
+    /// The other player: invisible, muted, and holding whatever the playhead reaches next,
+    /// already open and parked on the frame it will start from. See <see cref="PreloadNext"/>.
+    /// </summary>
+    private MediaElement _standby = null!;
+
+    /// <summary>What the standby has been given, and the offset into it, in frames.</summary>
+    private Uri? _standbyUri;
+    private long _standbyOffset;
+
+    /// <summary>True once the standby has opened its source and been parked on its frame.</summary>
+    private bool _standbyReady;
+
     private long Span => _ladder[_zoom].SpanFrames;
 
     /// <summary>
@@ -152,25 +202,73 @@ public partial class LiveEditWindow : Window
     /// Span directly in a dozen places, which is exactly how a view ends up with the playhead
     /// computed against one window and the blocks against another.
     /// </summary>
-    private long ViewStart => _infinite && RecordingExtent > 0 ? RecordingStartFrame : _scroll;
+    /// <summary>
+    /// Where the transmitter sits across the window while the timeline is running: a fifth of
+    /// the way in.
+    ///
+    /// Left of it is what has gone out, right of it is what is still in hand — so the operator
+    /// sees a little of the past and most of the delay, which is the part they can still act on.
+    /// </summary>
+    private const double OnAirAnchor = 0.2;
 
-    private long ViewSpan
+    /// <summary>
+    /// True when the timeline is held still and the marker moves across it.
+    ///
+    /// The running state is the other way round: the marker is pinned and the recording slides
+    /// leftward underneath it, which is how a transmission is watched — the thing you are looking
+    /// at stays where it is on the glass. Freezing is for working on a particular stretch, where
+    /// a view that kept sliding out from under the pointer would be unusable.
+    /// </summary>
+    private bool _frozen;
+
+    /// <summary>
+    /// Whether the view is currently following the transmitter.
+    ///
+    /// Needs something to follow: with tidal lock off there is no on-air frame, so there is no
+    /// anchor and the view falls back to the scroll position whatever the toggle says.
+    /// </summary>
+    private bool Following => !_frozen && OnAirFrame() is not null;
+
+    /// <summary>
+    /// Where the view starts relative to the on-air frame, once the timeline has been unfrozen
+    /// somewhere other than the usual anchor; null for the usual anchor.
+    ///
+    /// Unfreezing used to snap the view to the transmitter - a delay behind the recorder, so
+    /// usually the first segments of the recording - and lose the place being worked on. Pinning
+    /// the view to the playhead instead kept the place but stopped the timeline: a paused
+    /// playhead does not move, so neither did anything else. Held at a fixed distance from air,
+    /// the view stays on the same stretch and still runs with the clock. Playing along with air
+    /// puts it back on the usual anchor.
+    /// </summary>
+    private long? _airOffset;
+
+    private long ViewStart
     {
         get
         {
-            if (!_infinite) return Span;
+            // Running with the transmitter: at the anchor, or wherever it was unfrozen. Deliberately
+            // not clamped to the day: clamping would slide the marker off its anchor near midnight,
+            // and the whole point is that it does not move.
+            if (!_frozen && OnAirFrame() is { } onAir)
+                return onAir + (_airOffset ?? -(long)(ViewSpan * OnAirAnchor));
 
-            long extent = RecordingExtent;
-
-            // A pad of a fiftieth so the first and last blocks are not flush against the edges
-            // of the canvas, which reads as "cut off" rather than "this is all of it".
-            return extent <= 0 ? Span : extent + Math.Max(1, extent / 50);
+            return _scroll;
         }
     }
 
+    /// <summary>
+    /// How much of the clock is on screen: the zoom rung - except in the single-bar view, where
+    /// it is never more than the delay. That view is for watching the delay, so the widest it
+    /// opens out to is exactly the stretch between air and the recorder.
+    /// </summary>
+    private long ViewSpan => !_infinite && BarCap is { } cap ? Math.Min(Span, cap) : Span;
+
+    /// <summary>The widest the single-bar view may open, or null when nothing on air sets one.</summary>
+    private long? BarCap => DelayCounterFrames() is { } delay && delay > 0 ? delay : null;
+
     /// <summary>Keeps the window somewhere sensible after a zoom, and never past the end of the day.</summary>
     private void ClampScroll() =>
-        _scroll = Math.Clamp(_scroll, 0, Math.Max(0, _dayFrames - Span));
+        _scroll = Math.Clamp(_scroll, 0, Math.Max(0, _dayFrames - ViewSpan));
 
     /// <summary>
     /// Brings the playhead into view if it is not, and otherwise leaves the window alone.
@@ -181,9 +279,9 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private void EnsureVisible(long at)
     {
-        if (Span >= _dayFrames) { _scroll = 0; return; }
+        if (ViewSpan >= _dayFrames) { _scroll = 0; return; }
 
-        if (at < _scroll || at >= _scroll + Span) _scroll = at - Span / 2;
+        if (at < _scroll || at >= _scroll + ViewSpan) _scroll = at - ViewSpan / 2;
 
         ClampScroll();
     }
@@ -194,9 +292,9 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private void ShowScroll()
     {
-        // Nothing to scroll in the infinite view either: the whole recording is fitted to the
-        // canvas by definition, so a scrollbar there would be a control that cannot move.
-        bool needed = !_infinite && Span < _dayFrames;
+        // Both views scroll: the clock is a day long in either, and the single bar only narrows
+        // how much of it is on screen at once.
+        bool needed = ViewSpan < _dayFrames;
 
         TimeScroll.Visibility = needed ? Visibility.Visible : Visibility.Collapsed;
         if (!needed) return;
@@ -213,11 +311,20 @@ public partial class LiveEditWindow : Window
         TimeScroll.ViewportSize = Math.Max(Span, _dayFrames / 50.0);
         TimeScroll.LargeChange = Span;
         TimeScroll.SmallChange = Math.Max(1, Span / 20);
-        TimeScroll.Value = _scroll;
+
+        // Where the view actually is, which while the timeline is running is the transmitter's
+        // anchor rather than the stored scroll. A thumb parked somewhere the view is not would
+        // be a control lying about its own state.
+        TimeScroll.Value = Math.Clamp(ViewStart, TimeScroll.Minimum, TimeScroll.Maximum);
     }
 
     private void TimeScroll_Scroll(object sender, System.Windows.Controls.Primitives.ScrollEventArgs e)
     {
+        // Scrolling by hand means looking at a particular stretch, so the timeline stops
+        // running - otherwise the view would be dragged straight back to the transmitter on the
+        // next tick and the scrollbar would appear not to work.
+        Freeze(true, "scrolling");
+
         _scroll = (long)Math.Round(e.NewValue);
         ClampScroll();
 
@@ -238,8 +345,12 @@ public partial class LiveEditWindow : Window
     {
         InitializeComponent();
 
+        _active = PlayerA;
+        _standby = PlayerB;
+
         _rate = _settings.CaptureFrameRate > 0 ? _settings.CaptureFrameRate : 25;
-        _dayFrames = TimelineZoom.DayFrames(_rate);
+        _oneDay = TimelineZoom.DayFrames(_rate);
+        _dayFrames = _oneDay;
 
         _ladder = TimelineZoom.Ladder(_rate);
         _zoom = TimelineZoom.DefaultIndex(_rate);
@@ -265,6 +376,14 @@ public partial class LiveEditWindow : Window
             _watch.Tick += (_, _) => CheckStore();
             _watch.Start();
 
+            // A loss is marked the moment it happens rather than at the next refresh, because
+            // the operator watching the timeline when it happens is the one it matters to.
+            // Raised from the capture and transmitter threads, so it hops to the dispatcher.
+            DropMarks.Shared.Changed += OnDropsChanged;
+
+            WireLive();
+            ShowUndo();
+
             Focus();
         };
 
@@ -274,9 +393,17 @@ public partial class LiveEditWindow : Window
 
     // ------------------------------------------------------------------ keeping up with the store
 
-    /// <summary>Looks for new segments. Cheap unless something has actually changed.</summary>
+    /// <summary>
+    /// Looks for new segments. Every two seconds, and cheap: the fingerprint is read off this
+    /// thread and only a change in it - a segment closing, which is a new file appearing -
+    /// lists the store. With ten-second segments that puts each on the timeline within a couple
+    /// of seconds of the recorder closing it.
+    /// </summary>
     private readonly DispatcherTimer _watch =
-        new(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(5) };
+        new(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(2) };
+
+    /// <summary>True while a fingerprint is being read, so two never overlap.</summary>
+    private bool _checking;
 
     /// <summary>What the store looked like last time, so an unchanged store costs nothing.</summary>
     private string _signature = "";
@@ -328,27 +455,79 @@ public partial class LiveEditWindow : Window
 
         if (_day.Date == today) return;
 
+        // A recording running past midnight carries on into a folder of the new day, so the new
+        // day's ruler is where it now is. Three things still hold the ruler back, briefly:
+        //
+        //  - the picture on air is still on this day. The delay plays out the last minutes before
+        //    midnight after it, and the mark stays with them; following air moves the ruler over
+        //    the moment the mark crosses (see Chase), and otherwise this does once it has.
+        //  - something is playing this day by hand. The end of its last segment carries the
+        //    playing over (see Player_Ended), rather than the ruler moving out from under it.
+        //  - a segment on this ruler is still open, which only a recording from before the
+        //    handover existed can do - it holds its whole run on this ruler instead.
+        if (OnAirFrame() is not null) return;
+        if (_playing && !_chasing) return;
+        if (_placed.Any(p => p.Pending)) return;
+
+        RollOver(today, chase: _chasing, playFrom: null);
+    }
+
+    /// <summary>
+    /// Moves the ruler on to another day, carrying on whatever was going on: following air
+    /// carries on following it, playing carries on playing from <paramref name="playFrom"/>, and
+    /// otherwise the playhead goes to what is on air, or the day's first segment.
+    /// </summary>
+    private void RollOver(DateTime day, bool chase, long? playFrom)
+    {
         ActivityLog.Shared.Info(LogSource.App,
-            $"Live Edit rolled over midnight: the timeline is now {today:ddd d MMM yyyy}.",
+            $"Live Edit rolled over midnight: the timeline is now {day:ddd d MMM yyyy}" +
+            (chase ? ", still following air." : playFrom is not null ? ", still playing." : "."),
             @event: "liveedit.day");
 
-        GoToDay(today, byHand: false);
+        _afterPlaced = () =>
+        {
+            if (chase)
+            {
+                PlayOnAir();
+                return;
+            }
+
+            if (playFrom is { } at)
+            {
+                Seek(at);
+                if (_loaded is not null || _onIngest is not null) PlayPause();
+                return;
+            }
+
+            Seek(OnAirFrame() ?? (_placed.Count > 0 ? _placed[0].StartFrame : 0));
+        };
+
+        GoToDay(day, byHand: false);
     }
 
     private void CheckStore()
     {
         FollowTheDate();
 
-        if (_listing) return;
+        if (_listing || _checking) return;
+        _checking = true;
 
         string folder = RecordingProfile.FolderFor(RecordingProfile.LowRes,
                                                   MediaLibrary.FolderFor(_settings));
 
-        string now = Signature(folder);
-        if (now == _signature) return;
+        // Off this thread. Walking hundreds of files every few seconds is small, but it is disk,
+        // and on this thread it is a stall in playback whenever the disk is busy recording.
+        Task.Run(() => Signature(folder))
+            .ContinueWith(t =>
+            {
+                _checking = false;
 
-        _signature = now;
-        LoadClips();
+                string now = t.IsFaulted ? "" : t.Result;
+                if (now == _signature || _listing) return;
+
+                _signature = now;
+                LoadClips();
+            }, TaskScheduler.FromCurrentSynchronizationContext());
     }
 
     /// <summary>
@@ -478,7 +657,7 @@ public partial class LiveEditWindow : Window
     {
         long assumed = Math.Max(1, _settings.RecordingSegmentSeconds) * (long)_rate;
 
-        // Every file of the day, from every recording folder.
+        // Every file of the day, from every recording folder - narrowed below to the one recording.
         //
         // The file view is a view of the store: what is on this machine, laid out on the clock.
         // It used to show one folder - the newest, or the one on air - to avoid drawing two
@@ -489,8 +668,23 @@ public partial class LiveEditWindow : Window
         // view whose job is to say what is there. The overlap is handled where it belongs
         // instead - in the drawing, where each recording gets a band of its own - and the
         // infinite view is the one that narrows to the recording going to air.
+        //
+        // And the rest of any recording that ran on past midnight. A recording is one thing
+        // however long it runs, and its segments after 00:00 carry the next day's date: taking
+        // only this day's dates cut it off at midnight, and the timeline simply stopped while the
+        // recorder went on. So a recording with anything on this day brings all of its later
+        // segments with it, and the ruler runs on past 24:00 to hold them.
+        var dayFolders = new HashSet<string>(
+            clips.Where(c => c.StartsAt is { } at && at.Date == _day.Date)
+                 .Select(c => MediaLibrary.RecordingFolder(c.Path))
+                 .OfType<string>(),
+            StringComparer.OrdinalIgnoreCase);
+
         List<CapturedClip> today = clips
-            .Where(c => c.StartsAt is { } at && at.Date == _day.Date)
+            .Where(c => c.StartsAt is { } at &&
+                        (at.Date == _day.Date ||
+                         at.Date > _day.Date &&
+                         MediaLibrary.RecordingFolder(c.Path) is { } folder && dayFolders.Contains(folder)))
             .ToList();
 
         // The folder that is on air, if any, and otherwise the newest.
@@ -505,8 +699,8 @@ public partial class LiveEditWindow : Window
         if (OnAirFrame() is { } onAir)
             onAirFolder = today
                 .Where(c => c.StartsAt is { } s &&
-                            TimelineZoom.FrameOfDay(s, _rate) <= onAir &&
-                            onAir < TimelineZoom.FrameOfDay(s, _rate) +
+                            FrameOn(s) <= onAir &&
+                            onAir < FrameOn(s) +
                                 (c.Info is { } i && i.Duration > TimeSpan.Zero
                                     ? (long)Math.Round(i.Duration.TotalSeconds * _rate)
                                     : assumed))
@@ -524,15 +718,17 @@ public partial class LiveEditWindow : Window
         // filter any more: everything is laid out, and this one is the subject.
         _primaryFolder = latest;
 
-        int folders = today
-            .Select(c => MediaLibrary.RecordingFolder(c.Path) ?? "")
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Count();
+        // Only that recording, on the timeline and in the Capture Media list. Other recordings
+        // of the day stay in the store; they are just not what is being worked on, and laid out
+        // with it they were segments in the way of the one going to air.
+        if (latest is not null)
+            today = today
+                .Where(c => string.Equals(MediaLibrary.RecordingFolder(c.Path), latest, StringComparison.OrdinalIgnoreCase))
+                .ToList();
 
         RecordingText.Text = latest is null
             ? today.Count > 0 ? "recordings from before folders were used" : ""
-            : (onAirFolder is not null ? $"recording {latest}  (on air)" : $"recording {latest}")
-              + (folders > 1 ? $"   +{folders - 1} more on the ruler" : "");
+            : onAirFolder is not null ? $"recording {latest}  (on air)" : $"recording {latest}";
 
         // Each clip already knows exactly when it starts: the store works it out folder by
         // folder, numbered segment after numbered segment from the moment the folder says the
@@ -541,14 +737,25 @@ public partial class LiveEditWindow : Window
         _placed = today
             .Select(c => new Placed(
                 c,
-                TimelineZoom.FrameOfDay(c.StartsAt!.Value, _rate),
+                FrameOn(c.StartsAt!.Value),
                 c.Info is { } info && info.Duration > TimeSpan.Zero
                     ? (long)Math.Round(info.Duration.TotalSeconds * _rate)
                     : assumed))
             .OrderBy(p => p.StartFrame)
             .ToList();
 
-        DayText.Text = _day.ToString("ddd d MMM yyyy");
+        // A day, or as far as a recording on it has run past midnight.
+        _dayFrames = Math.Max(_oneDay, _placed.Count > 0 ? _placed.Max(p => p.EndFrame) : 0);
+
+        // Each recording's own start and length, for the frame readout.
+        _recordings = _placed
+            .GroupBy(p => p.Folder ?? "", StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => (g.Min(p => p.StartFrame), g.Sum(p => p.Frames)),
+                          StringComparer.OrdinalIgnoreCase);
+
+        DayText.Text = _dayFrames > _oneDay
+            ? $"{_day:ddd d MMM yyyy}  →  {_day.AddDays((_dayFrames - 1) / _oneDay):ddd d MMM}"
+            : _day.ToString("ddd d MMM yyyy");
 
         // A refresh rebuilds every Placed, so the one the player is on is a different object
         // afterwards even though it is the same file. Re-bound by path rather than by identity,
@@ -557,6 +764,16 @@ public partial class LiveEditWindow : Window
         if (_loaded is { } was)
             _loaded = _placed.FirstOrDefault(p =>
                 string.Equals(p.Clip.Path, was.Clip.Path, StringComparison.OrdinalIgnoreCase));
+
+        // The ruler has just moved to a new day under something that was going on - playing, or
+        // following air. It carries on here, now that there is a day's media to carry on in.
+        if (_afterPlaced is { } then)
+        {
+            _afterPlaced = null;
+            _placedOnce = true;
+            then();
+            return;
+        }
 
         // A fresh window opens where the recording is, not at midnight: an hour-wide view of
         // 00:00 on a store full of this afternoon is a blank timeline and a puzzle.
@@ -599,9 +816,40 @@ public partial class LiveEditWindow : Window
         // never read, waiting for a fingerprint change that had already happened.
         _signature = "";
 
+        // Everything placed on the timeline keeps its moment. Frames count from the ruler day's
+        // midnight, so moving the day moves every placement by a day's worth the other way -
+        // otherwise an insert dropped at 23:58 would sit at 23:58 of the new day, and go to air
+        // twenty-four hours late, if at all.
+        long shift = (long)Math.Round((_day.Date - day.Date).TotalDays) * _oneDay;
+
+        if (shift != 0)
+            foreach (Overlay overlay in _overlays)
+            {
+                overlay.StartFrame += shift;
+
+                if (overlay.Plan is { } plan)
+                    overlay.Plan = plan with { StartFrame = plan.StartFrame + shift };
+            }
+
+        // The sound's levels and cuts keep their moment the same way.
+        if (shift != 0)
+        {
+            _audioEdits = _audioEdits.Select(a => a with { StartFrame = a.StartFrame + shift }).ToList();
+
+            long[] cuts = _audioCuts.Select(c => c + shift).ToArray();
+            _audioCuts.Clear();
+            _audioCuts.UnionWith(cuts);
+        }
+
+        _audioPiece = null;
+
+        // The states held for undo are in the old day's frames.
+        ForgetEdits();
+
         _day = day;
         _loaded = null;
         Player.Source = null;
+        DropStandby();
         _markIn = _markOut = null;
 
         LoadBookmarks();
@@ -640,11 +888,20 @@ public partial class LiveEditWindow : Window
             return;
         }
 
-        // A clip from another day moves the ruler to that day first.
+        // Already on this ruler - which includes the part of a recording past midnight - goes
+        // straight to it. Only a clip from somewhere else moves the ruler to its own day first.
+        if (_placed.FirstOrDefault(p => string.Equals(p.Clip.Path, clip.Path,
+                                                      StringComparison.OrdinalIgnoreCase)) is { } here)
+        {
+            Pause();
+            Seek(here.StartFrame);
+            return;
+        }
+
         if (at.Date != _day.Date) GoToDay(at.Date);
 
         Pause();
-        Seek(TimelineZoom.FrameOfDay(at, _rate));
+        Seek(FrameOn(at));
     }
 
     // ------------------------------------------------------------------ the player
@@ -681,17 +938,92 @@ public partial class LiveEditWindow : Window
     /// offset the day frame implies, so scrubbing across a segment boundary behaves as though
     /// the recording were one file — which, as far as the operator is concerned, it is.
     /// </summary>
+    /// <summary>
+    /// The ingest placements, as the timeline mapping wants them.
+    ///
+    /// Rebuilt from the overlay list on demand rather than kept in parallel, so there is one
+    /// store of placements and no chance of the two drifting.
+    /// </summary>
+    private List<IngestItem> IngestItems() => _overlays
+        .Where(o => o.Plan is not null)
+        .Select(o => new IngestItem(o.Path, o.Plan!.Value))
+        .ToList();
+
+    /// <summary>What the player currently has loaded from the ingest lane, if anything.</summary>
+    private string? _onIngest;
+
+    /// <summary>
+    /// Whether a block covers a frame of the ruler, as drawn.
+    ///
+    /// An ingest placement's own StartFrame is in captured frames; where it appears is that plus
+    /// the inserts before it. A hand-dropped layer was put at a ruler position to begin with and
+    /// is taken as it is.
+    /// </summary>
+    private bool HoldsOnRuler(Overlay overlay, long rulerFrame)
+    {
+        if (overlay.Plan is not { } plan) return overlay.Holds(rulerFrame);
+
+        long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, plan), IngestItems());
+
+        return rulerFrame >= at && rulerFrame < at + overlay.Frames;
+    }
+
     private void Seek(long dayFrame)
     {
         _at = Math.Clamp(dayFrame, 0, _dayFrames - 1);
 
-        Placed? want = ClipAt(_at);
+        // Does an ingest placement cover this frame? If so it plays instead of the recording,
+        // which is what all four modes have in common - they replace the original video and
+        // audio for as long as they run. The big screen is the output, so the item goes on it.
+        TimelineAt on = IngestTimeline.At(_at, IngestItems());
+
+        if (on.OnIngest) { SeekIngest(on); return; }
+
+        // Back on the recording: let go of whatever ingest item was loaded, and put the speed
+        // back - a fit-to-fill leaves the player running fast otherwise.
+        //
+        // The item stays on screen until whatever replaces it is ready. Clearing the source here
+        // is what put a black frame at the end of every ingest item: the recording it hands back
+        // to is usually already open in the standby, and the swap below is the cut.
+        bool leftIngest = _onIngest is not null;
+
+        if (leftIngest)
+        {
+            _onIngest = null;
+            _loaded = null;
+            _open = false;
+            Player.SpeedRatio = 1;
+        }
+
+        // The captured frame, not the ruler frame. Past an insert the two differ by its length,
+        // and looking the recording up by the ruler would show material from the wrong moment.
+        Placed? want = ClipAt(on.CapturedFrame);
+
+        // The segment the recorder still has open, shown from the delay line's frames where it
+        // holds them - which always takes in whatever is on air.
+        if (want is { Pending: true } && EnterHeld(on.CapturedFrame))
+        {
+            if (_loaded is not null || leftIngest) { Player.Stop(); Player.Source = null; _loaded = null; }
+            _open = false;
+
+            PreviewPlaceholder.Visibility = Visibility.Collapsed;
+
+            EnsureVisible(_at);
+            ShowScroll();
+
+            Draw();
+            DrawOnAir();
+            ShowPosition();
+            return;
+        }
 
         if (want is null || want.Pending)
         {
             // Nothing playable here: a gap between recordings, or the segment the recorder still
             // has open. Said rather than left as a blank picture with no explanation.
-            if (_loaded is not null) { Player.Stop(); Player.Source = null; _loaded = null; }
+            LeaveHeld();
+
+            if (_loaded is not null || leftIngest) { Player.Stop(); Player.Source = null; _loaded = null; }
 
             PreviewPlaceholder.Text = want is null
                 ? $"Nothing recorded at {Stamp(_at)}"
@@ -705,14 +1037,20 @@ public partial class LiveEditWindow : Window
             return;
         }
 
-        _wantOffset = want.OffsetOf(_at);
+        // Off the delay line and onto a file: the held picture covers the file opening.
+        LeaveHeld(now: false);
+
+        _wantOffset = want.OffsetOf(on.CapturedFrame);
+
+        bool swapped = false;
 
         if (!ReferenceEquals(_loaded, want))
         {
             _loaded = want;
             _open = false;
 
-            Player.Source = new Uri(want.Clip.Path);
+            swapped = Show(new Uri(want.Clip.Path));
+            Player.SpeedRatio = 1;
             PreviewPlaceholder.Visibility = Visibility.Collapsed;
 
             ActivityLog.Shared.Info(LogSource.App,
@@ -723,7 +1061,7 @@ public partial class LiveEditWindow : Window
 
         // Only if the media is actually open. Otherwise the offset waits for Player_Opened,
         // because a Position set against an unopened source is silently thrown away.
-        if (_open) ApplyOffset();
+        Settle(swapped);
 
         EnsureVisible(_at);
         ShowScroll();
@@ -731,6 +1069,300 @@ public partial class LiveEditWindow : Window
         Draw();
         DrawOnAir();
         ShowPosition();
+    }
+
+    /// <summary>
+    /// Puts an ingest placement on the big screen at the right point and the right speed.
+    ///
+    /// The same screen the recording uses, because that is what "replaces the original video and
+    /// audio" means — there is one output and this is covering it. The layer lanes below are a
+    /// different thing: those lay something over the monitor feed and keep it.
+    ///
+    /// <b>Speed</b> is the player's own SpeedRatio, which carries the audio with it. Only
+    /// fit-to-fill ever sets it to anything but 1, and it is put back the moment the playhead
+    /// leaves the placement.
+    /// </summary>
+    private void SeekIngest(TimelineAt on)
+    {
+        LeaveHeld(now: false);
+
+        _wantOffset = on.Offset;
+
+        bool swapped = false;
+
+        if (_onIngest != on.Path)
+        {
+            _onIngest = on.Path;
+            _loaded = null;              // the recording is not what is loaded
+            _open = false;
+
+            // Through the playable copy beside it, not the export itself.
+            //
+            // An export is cut from the DNxHD masters, and Media Foundation has no DNxHD
+            // decoder — but it does decode the AAC. So loading the export directly gave sound
+            // and a black screen, which is the worst of both: it looks broken and it sounds
+            // like it is working. The H.264 copy written beside every export is what plays.
+            string? playable = RangeExport.PlayablePathFor(on.Path!);
+
+            if (playable is null)
+            {
+                Player.Source = null;
+
+                PreviewPlaceholder.Text =
+                    $"{System.IO.Path.GetFileName(on.Path)}\n\n" +
+                    "no playable copy beside it, so it cannot be previewed here - it is DNxHD, " +
+                    "which this application cannot decode. Export the range again and one will " +
+                    "be written.";
+
+                PreviewPlaceholder.Visibility = Visibility.Visible;
+
+                ActivityLog.Shared.Warn(LogSource.App,
+                    $"INGEST {System.IO.Path.GetFileName(on.Path)} has no preview copy, so it " +
+                    "cannot be shown on the viewer.",
+                    @event: "liveedit.ingestnopreview", file: on.Path);
+            }
+            else
+            {
+                swapped = Show(new Uri(playable));
+                PreviewPlaceholder.Visibility = Visibility.Collapsed;
+
+                ActivityLog.Shared.Info(LogSource.App,
+                    $"INGEST ON {System.IO.Path.GetFileName(on.Path)} - covering the recording at " +
+                    $"{Stamp(_at)}" + (Math.Abs(on.Speed - 1) > 0.0001 ? $" at {on.Speed:0.###}x" : "") + ".",
+                    @event: "liveedit.ingestplaying", file: on.Path);
+            }
+        }
+
+        // Set every time rather than only on load: the ratio is the placement's, and a second
+        // placement of the same file at a different speed must not inherit the first's.
+        Player.SpeedRatio = on.Speed;
+
+        Settle(swapped);
+
+        EnsureVisible(_at);
+        ShowScroll();
+
+        Draw();
+        DrawOnAir();
+        ShowPosition();
+    }
+
+    // ------------------------------------------------------------------ the standby player
+
+    /// <summary>
+    /// How far ahead the standby looks for the next cut. Long enough for any file on this plant
+    /// to open and park, short enough that a click elsewhere on the timeline has not wasted much.
+    /// </summary>
+    private const int PreloadSeconds = 8;
+
+    /// <summary>
+    /// Puts a source on screen - by swapping to the standby if it already holds it, and only
+    /// otherwise by loading it into the player that is showing. True when it was a swap.
+    ///
+    /// A swap that the standby had not finished opening still goes ahead: it is part-way there,
+    /// which is better than starting again, and its MediaOpened then arrives as the screen's own
+    /// and is handled as one.
+    /// </summary>
+    private bool Show(Uri uri)
+    {
+        if (_standbyUri != uri || _standby.Source is null)
+        {
+            Player.Source = uri;
+            return false;
+        }
+
+        bool ready = _standbyReady;
+
+        MediaElement leaving = _active;
+
+        _active = _standby;
+        _standby = leaving;
+
+        _active.Opacity = 1;
+        leaving.Opacity = 0;
+
+        // Out of sight first, then stopped - so the stop's black frame is never on screen.
+        leaving.Stop();
+        leaving.Source = null;
+        leaving.IsMuted = true;
+        leaving.SpeedRatio = 1;
+
+        _swappedAt = _standbyOffset;
+        _standbyUri = null;
+        _standbyReady = false;
+
+        _open = ready;
+        _seekRetries = 0;
+
+        ApplyLevel();
+
+        return true;
+    }
+
+    /// <summary>The frame the standby was parked on when it was swapped to the screen.</summary>
+    private long _swappedAt;
+
+    /// <summary>
+    /// After a load: puts the player on the wanted frame, if it is open to be put anywhere.
+    ///
+    /// A swap to a player already parked on that frame needs no seek at all - and must not have
+    /// one, because a seek on the frame of a cut is a stall on exactly the frame the standby was
+    /// there to make seamless. It only needs to be started.
+    ///
+    /// "That frame" within a quarter of a second: the frame loop notices a crossing a tick or
+    /// two late, and the playhead is read back from the player anyway, so starting from where
+    /// the standby is parked loses nothing worth a stall.
+    /// </summary>
+    private void Settle(bool swapped)
+    {
+        if (!_open) return;
+
+        // Playing, a frame or two either way is lost in the motion. Parked, it is the frame the
+        // operator stepped to and is about to mark against, so it must be exactly that one - a
+        // seek within a file that is already open, which holds the picture rather than going black.
+        long slack = _playing ? Math.Max(1, _rate / 4) : 0;
+
+        if (!swapped || Math.Abs(_wantOffset - _swappedAt) > slack) ApplyOffset();
+
+        if (swapped && _playing) Player.Play();
+    }
+
+    private DateTime _preloadCheckedAt = DateTime.MinValue;
+
+    /// <summary>
+    /// While playing, opens whatever the playhead will reach next in the standby player.
+    ///
+    /// Four times a second rather than every frame: what comes next only changes when the
+    /// playhead crosses something, and finding it reads the disk for an ingest item's copy.
+    /// </summary>
+    private void PreloadNext()
+    {
+        DateTime now = DateTime.UtcNow;
+
+        if ((now - _preloadCheckedAt).TotalMilliseconds < 250) return;
+        _preloadCheckedAt = now;
+
+        Preload(Upcoming(+1));
+    }
+
+    /// <summary>
+    /// After a step with the arrows: opens the file on the far side of the nearest cut in the
+    /// direction of travel, so stepping off the start or end of a segment is a swap to a player
+    /// already parked on that frame rather than a black screen while the next file opens.
+    ///
+    /// Every press rather than paced - a held arrow walks a frame at a time, and the call is
+    /// nothing at all unless the playhead is within reach of a cut.
+    /// </summary>
+    private void PreloadToward(long direction)
+    {
+        if (direction != 0) Preload(Upcoming(Math.Sign(direction)));
+    }
+
+    private void Preload((Uri Uri, long Offset)? next)
+    {
+        if (next is not { } want) return;
+
+        if (_standbyUri == want.Uri)
+        {
+            // Already there. Moved only if the frame wanted on the far side changed.
+            if (_standbyReady && _standbyOffset != want.Offset) Park(want.Offset);
+            else _standbyOffset = want.Offset;
+            return;
+        }
+
+        _standbyUri = want.Uri;
+        _standbyOffset = want.Offset;
+        _standbyReady = false;
+
+        _standby.IsMuted = true;
+        _standby.SpeedRatio = 1;
+        _standby.Source = want.Uri;
+    }
+
+    /// <summary>
+    /// The next source the playhead reaches inside the look-ahead, going forwards or backwards,
+    /// and the frame into it it arrives at — or null when nothing changes before then.
+    ///
+    /// Only the places a source can change are tried: either end of every ingest placement, and
+    /// either end of the segment loaded. Everything else is the same file carrying on. Going
+    /// forwards the playhead arrives at the cut itself; going backwards, at the frame before it,
+    /// which is the last frame of whatever comes before.
+    /// </summary>
+    private (Uri Uri, long Offset)? Upcoming(int direction)
+    {
+        List<IngestItem> items = IngestItems();
+        long reach = PreloadSeconds * (long)_rate;
+
+        var cuts = new List<long>();
+
+        foreach (IngestItem item in items)
+        {
+            long start = IngestTimeline.RulerStart(item, items);
+            cuts.Add(start);
+            cuts.Add(start + item.Plan.Frames);
+        }
+
+        if (_loaded is { } loaded)
+        {
+            cuts.Add(IngestTimeline.RulerFrameOf(loaded.StartFrame, items));
+            cuts.Add(IngestTimeline.RulerFrameOf(loaded.EndFrame, items));
+        }
+
+        IEnumerable<long> ahead = direction > 0
+            ? cuts.Where(c => c > _at && c <= _at + reach).Distinct().OrderBy(c => c)
+            : cuts.Where(c => c <= _at && c > _at - reach && c > 0).Distinct().OrderByDescending(c => c)
+                  .Select(c => c - 1);
+
+        foreach (long frame in ahead)
+        {
+            if (SourceAt(frame, items) is { } next && next.Uri != Player.Source) return next;
+        }
+
+        return null;
+    }
+
+    /// <summary>What plays at a frame of the ruler, as the file and the frame into it.</summary>
+    private (Uri Uri, long Offset)? SourceAt(long rulerFrame, List<IngestItem> items)
+    {
+        TimelineAt on = IngestTimeline.At(rulerFrame, items);
+
+        if (on.OnIngest)
+            return RangeExport.PlayablePathFor(on.Path!) is { } playable
+                ? (new Uri(playable), on.Offset)
+                : null;
+
+        return ClipAt(on.CapturedFrame) is { Pending: false } clip
+            ? (new Uri(clip.Clip.Path), clip.OffsetOf(on.CapturedFrame))
+            : null;
+    }
+
+    /// <summary>
+    /// The standby has opened: parks it on its frame, decoded and held, so the swap shows a
+    /// picture straight away rather than the black of a player that has not drawn anything yet.
+    /// </summary>
+    private void StandbyOpened()
+    {
+        if (_standbyUri is null) return;
+
+        Park(_standbyOffset);
+        _standbyReady = true;
+    }
+
+    private void Park(long offset)
+    {
+        _standbyOffset = offset;
+        _standby.Position = TimeSpan.FromSeconds(offset / (double)_rate);
+        _standby.Play();
+        _standby.Pause();
+    }
+
+    /// <summary>Lets go of whatever the standby holds - a jump elsewhere, a new day, a failure.</summary>
+    private void DropStandby()
+    {
+        _standby.Stop();
+        _standby.Source = null;
+        _standbyUri = null;
+        _standbyReady = false;
     }
 
     /// <summary>
@@ -819,6 +1451,13 @@ public partial class LiveEditWindow : Window
 
     private void Player_Opened(object sender, RoutedEventArgs e)
     {
+        // The two players share these handlers, and only the one on screen drives the transport.
+        if (!ReferenceEquals(sender, _active))
+        {
+            if (ReferenceEquals(sender, _standby)) StandbyOpened();
+            return;
+        }
+
         // The first moment the position can be set on this source, and therefore the moment the
         // frame the operator clicked is actually reached rather than the start of the file.
         _open = true;
@@ -837,14 +1476,58 @@ public partial class LiveEditWindow : Window
     /// <summary>The end of one segment is the start of the next, so playout runs straight on.</summary>
     private void Player_Ended(object sender, RoutedEventArgs e)
     {
-        if (_loaded is not { } was) { Pause(); return; }
+        if (!ReferenceEquals(sender, _active)) return;
+        // An ingest placement running out: the recording takes over from the end of the
+        // placement, which is what every mode does once the item is spent. Without this the
+        // transport simply stopped at the end of an inserted item.
+        if (_onIngest is not null)
+        {
+            TimelineAt on = IngestTimeline.At(_at, IngestItems());
 
-        long next = was.EndFrame;
+            long after = on.OnIngest
+                ? _at + Math.Max(1, (long)Math.Round(
+                      (on.Speed <= 0 ? 1 : 1 / on.Speed)))   // nudge past it
+                : _at + 1;
 
-        if (ClipAt(next) is { Pending: false })
+            // Walk to the first frame the placement no longer covers, so the handover is exact
+            // rather than a guess that might land inside it again.
+            while (IngestTimeline.At(after, IngestItems()).Path == _onIngest &&
+                   after < _dayFrames - 1)
+                after++;
+
+            bool was = _playing;
+
+            Seek(after);
+
+            if (was && (_loaded is not null || _onIngest is not null)) Player.Play();
+            else Pause();
+
+            return;
+        }
+
+        if (_loaded is not { } ended) { Pause(); return; }
+
+        // The end of one segment is the start of the next, mapped onto the ruler so an insert
+        // before it does not send the playhead to the wrong place.
+        // Two coordinates, and they must not be mixed: the next segment is found by the
+        // recording's own frame, and the playhead is set by where that frame appears on the
+        // ruler. With no inserts they are the same number, which is exactly why mixing them
+        // would go unnoticed until somebody used insert.
+        long nextCaptured = ended.EndFrame;
+        long next = IngestTimeline.RulerFrameOf(nextCaptured, IngestItems());
+
+        if (ClipAt(nextCaptured) is { Pending: false })
         {
             Seek(next);
             if (_playing) Player.Play();
+            return;
+        }
+
+        // The end of the day, and the recording carried on past midnight into the next day's
+        // folder: so does the playing, from the same moment on the next day's ruler.
+        if (_playing && next >= _oneDay && _day.Date < DateTime.Today)
+        {
+            RollOver(_day.AddDays(1), chase: _chasing, playFrom: next - _oneDay);
             return;
         }
 
@@ -854,6 +1537,18 @@ public partial class LiveEditWindow : Window
 
     private void Player_Failed(object sender, ExceptionRoutedEventArgs e)
     {
+        // The standby failing costs nothing yet: the cut will load the file the ordinary way,
+        // and if it fails then, that is the failure worth saying.
+        //
+        // What it was given is kept, so the look-ahead does not try the same file again four
+        // times a second; with no source behind it, the cut does not swap to it.
+        if (!ReferenceEquals(sender, _active))
+        {
+            _standby.Source = null;
+            _standbyReady = false;
+            return;
+        }
+
         Pause();
 
         PreviewPlaceholder.Text = $"{_loaded?.Clip.Name}\n\ncould not be played";
@@ -868,6 +1563,9 @@ public partial class LiveEditWindow : Window
 
     private void PlayPause()
     {
+        // Playing means the timeline again.
+        LeaveRecordingView();
+
         if (_playing) { Pause(); return; }
 
         // Nothing under the playhead: go to the nearest thing that can be played and play that.
@@ -876,7 +1574,7 @@ public partial class LiveEditWindow : Window
         // that became the ordinary case - a fresh window has the playhead wherever it opened,
         // often in a gap, so the space bar did nothing at all and looked broken. Space means
         // "play", and the only honest answers are to play something or to say why not.
-        if (_loaded is null)
+        if (_loaded is null && _onIngest is null && !_held)
         {
             if (NearestPlayable(_at) is not { } target)
             {
@@ -891,25 +1589,74 @@ public partial class LiveEditWindow : Window
 
             // Seek loads the segment under the playhead. If it still could not, say so rather
             // than falling through and playing nothing.
-            if (_loaded is null) return;
+            if (_loaded is null && _onIngest is null && !_held) return;
         }
 
-        Player.Play();
+        // Put the player on the playhead before starting it.
+        //
+        // This is the fix for pressing space after clicking the timeline and hearing it start
+        // somewhere else. The position was set when the click was handled, but anything between
+        // then and now could have moved it - the paused Play/Pause pair that shows the parked
+        // frame, a verification retry, the end of a previous play. Re-applying costs nothing and
+        // makes "space plays from the indicator" true by construction rather than by assuming
+        // nothing interfered.
+        if (_open) ApplyOffset();
+
+        // Set here, from where this run actually begins: an out mark behind the playhead is not
+        // something this run can reach, so it is not a stop point for it.
+        _stopAt = _markOut is { } outAt && _at < outAt ? outAt : null;
+
+        // Held, the clock starts from here; there is no file in the player to start.
+        if (_held) { _heldFrom = _at; _heldClock.Restart(); }
+        else Player.Play();
+
         _playing = true;
         PlayButton.Content = "⏸";
 
         ActivityLog.Shared.Info(LogSource.App,
-            $"PLAY  {_loaded.Clip.Name} - from {Stamp(_at)} in Live Edit.",
-            @event: "liveedit.play", file: _loaded.Clip.Path);
+            $"PLAY  {(_onIngest is { } ingest ? System.IO.Path.GetFileName(ingest) : _loaded?.Clip.Name ?? "the segment still being recorded")}" +
+            $" - from {Stamp(_at)} in Live Edit.",
+            @event: "liveedit.play", file: _onIngest ?? _loaded?.Clip.Path);
+    }
+
+    /// <summary>
+    /// Where this run of playback stops, decided when it started.
+    ///
+    /// <b>Decided once, not tested continuously.</b> The out mark used to be checked every frame
+    /// as "is the playhead at or past it", which is true the moment the playhead is anywhere
+    /// past the mark — so with the playhead there, pressing play started the player and the very
+    /// next frame paused it and seeked back. The space bar looked jammed, and the only way out
+    /// was to clear the mark.
+    ///
+    /// An out mark means "stop when you reach it". Reaching it is a crossing, so it only applies
+    /// to a run that began before it; a run that began after it has nothing to reach and plays
+    /// on, which is also what makes play-from-the-indicator true with marks set.
+    /// </summary>
+    private long? _stopAt;
+
+    /// <summary>
+    /// Stops at the out mark if this run of playback was going to reach it. True when it did.
+    /// </summary>
+    private bool StoppedAtMarkOut()
+    {
+        if (_stopAt is not { } stop || _at < stop) return false;
+
+        Pause();
+        Seek(stop);
+
+        return true;
     }
 
     private void Pause()
     {
+        StopChasing();
+
         if (!_playing) return;
 
         Player.Pause();
         StopLayers();
         _playing = false;
+        _stopAt = null;
         PlayButton.Content = "▶";
 
         ActivityLog.Shared.Info(LogSource.App,
@@ -934,20 +1681,124 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private void OnTick()
     {
-        if (_playing && _loaded is { } loaded)
-        {
-            _at = loaded.StartFrame + (long)Math.Round(Player.Position.TotalSeconds * _rate);
+        ShowRecordingView();
+        SettleHeld();
+        ShowCountdown();
+        FollowAudioLevel();
 
-            if (_markOut is { } outAt && _at >= outAt)
+        // The segment still being recorded, playing from the delay line: the playhead runs on
+        // its own clock, there being no player to read a position from.
+        if (_held)
+        {
+            if (_playing && !AdvanceHeld()) return;
+        }
+
+        // The playhead is only moved from the player's position while the player has the source
+        // open, and that guard is the whole of this comment's reason for existing.
+        //
+        // A source swap takes a moment: between setting Source and MediaOpened arriving, Position
+        // reads either zero or - worse - whatever it was on the file before. Both branches below
+        // compute the playhead from it, so a tick landing in that window produced a frame number
+        // derived from the wrong media.
+        //
+        // At the end of an inserted item that was not a cosmetic glitch. Handing back to the
+        // recording swaps the source; a tick arriving before the new one opened read the ingest
+        // preview's own position, which put the playhead back inside the placement, and the
+        // check for "has the playhead run into a placement" then faithfully re-entered the item
+        // half way through. The item appeared to jump back to its middle instead of handing over.
+        //
+        // Skipping the update costs one frame of readout at a handover and nothing else: the
+        // markers, the scroll and the layers below all still run.
+        else if (_playing && !_open)
+        {
+            // Except for a placement that has nothing to play: an export whose preview copy is
+            // missing never opens, so waiting for it would stall the transport on that item for
+            // good. Stepped over instead, and the log already said why it could not be shown.
+            if (_onIngest is not null && Player.Source is null)
             {
-                Pause();
-                Seek(outAt);
+                long past = _at;
+
+                while (IngestTimeline.At(past, IngestItems()).Path == _onIngest &&
+                       past < _dayFrames - 1)
+                    past++;
+
+                Seek(past);
+
+                if (_loaded is not null || _onIngest is not null) Player.Play();
+                else Pause();
+
+                return;
+            }
+
+            FollowLayers();
+            DrawMarkers();
+
+            if (Following) { ScrollWithTheClock(); ShowScroll(); }
+            return;
+        }
+
+        // Playing an ingest placement: the ruler advances at its own rate, not the file's, so
+        // the position has to be divided back down by the speed. At double speed the file is
+        // two frames on for every one frame of timeline.
+        if (_playing && _onIngest is not null)
+        {
+            TimelineAt on = IngestTimeline.At(_at, IngestItems());
+
+            if (on.OnIngest)
+            {
+                double into = Player.Position.TotalSeconds * _rate / Math.Max(0.0001, on.Speed);
+
+                // Where the placement begins on the ruler, so the file's own offset maps back.
+                long startedAt = _at - (long)Math.Round(on.Offset / Math.Max(0.0001, on.Speed));
+
+                _at = startedAt + (long)Math.Round(into);
+
+                if (StoppedAtMarkOut()) return;
+
+                // Run off the end of the placement and the recording takes over again, which is
+                // a reload rather than a position change.
+                if (IngestTimeline.At(_at, IngestItems()).Path != on.Path) Seek(_at);
+            }
+            else Seek(_at);
+        }
+        else if (_playing && _loaded is { } loaded)
+        {
+            // Through the mapping, so an insert before the playhead is accounted for: the
+            // player's position is in captured frames and the ruler is not.
+            long captured = loaded.StartFrame + (long)Math.Round(Player.Position.TotalSeconds * _rate);
+
+            _at = captured + (_at - IngestTimeline.At(_at, IngestItems()).CapturedFrame);
+
+            if (StoppedAtMarkOut()) return;
+
+            // Has the player run into a deleted scene? Then the ruler frame it has reached shows
+            // the far side of the scene, not what the file is playing - so it goes there, the
+            // same jump the transmitter makes on air.
+            if (IngestTimeline.At(_at, IngestItems()) is { OnIngest: false } there && there.CapturedFrame != captured)
+            {
+                Seek(_at);
+                if (_playing) Player.Play();
+                return;
+            }
+
+            // Has the playhead just run into a placement?
+            //
+            // Nothing asked this before, which is why an ingest item played when the playhead
+            // was put inside it and not when the playhead arrived there on its own: the
+            // recording simply carried on underneath. Seek is what swaps the source, and it
+            // keeps playing because it was playing.
+            if (IngestTimeline.At(_at, IngestItems()).OnIngest)
+            {
+                Seek(_at);
+
+                if (_onIngest is not null) Player.Play();
                 return;
             }
 
             // Only when the playhead would otherwise leave the window. Scrolling the view is a
-            // rebuild, so it must not happen every frame.
-            if (_at < _scroll || _at >= _scroll + Span)
+            // rebuild, so it must not happen every frame. Not while following, where the view is
+            // the transmitter's and the playhead is a passenger on it.
+            if (!Following && (_at < _scroll || _at >= _scroll + ViewSpan))
             {
                 EnsureVisible(_at);
                 ShowScroll();
@@ -955,8 +1806,47 @@ public partial class LiveEditWindow : Window
             }
         }
 
+        if (Following) { ScrollWithTheClock(); ShowScroll(); }
+
         FollowLayers();
         DrawMarkers();
+
+        if (_chasing) Chase();
+
+        // The next cut, opened before the playhead gets there.
+        if (_playing) PreloadNext();
+    }
+
+    /// <summary>The view start the last redraw was built for, so the scroll can be paced.</summary>
+    private long _drawnFor = long.MinValue;
+    private DateTime _drawnAt = DateTime.MinValue;
+
+    /// <summary>
+    /// Redraws the timeline as it slides under the on-air marker.
+    ///
+    /// <b>Paced, not per frame.</b> A running timeline has to be rebuilt as it moves, and a full
+    /// Draw clears both canvases and lays out every tick, block, label, mark and bookmark. Doing
+    /// that twenty-five times a second on the dispatcher is exactly what made playback stutter
+    /// before, so it is done only when the view has actually moved a whole pixel, and at most
+    /// about twelve times a second.
+    ///
+    /// A pixel is the floor that matters: below that the redraw would produce an identical
+    /// picture, and at a day-wide zoom the view moves a pixel every few seconds.
+    /// </summary>
+    private void ScrollWithTheClock()
+    {
+        long start = ViewStart;
+
+        if (Math.Abs(start - _drawnFor) < FramesPerPixel()) return;
+
+        DateTime now = DateTime.UtcNow;
+
+        if ((now - _drawnAt).TotalMilliseconds < 80) return;
+
+        _drawnFor = start;
+        _drawnAt = now;
+
+        Draw();
     }
 
     /// <summary>
@@ -1012,8 +1902,18 @@ public partial class LiveEditWindow : Window
             return;
         }
 
-        long into = Math.Max(0, _at - RecordingStartFrame) + 1;
-        long total = RecordingFrames;
+        // Counted within the recording under the playhead, not across the day. A second recording
+        // started half an hour after an eight-hour one is a recording of its own and counts from
+        // its own first frame; adding it to the first, or counting it against the first's start,
+        // made the total meaningless the moment there were two. In a gap, or on an ingest item,
+        // the recording in question stands in.
+        string key = _loaded?.Folder ?? _primaryFolder ?? "";
+
+        (long start, long total) = _recordings.TryGetValue(key, out (long Start, long Frames) one)
+            ? one
+            : (RecordingStartFrame, RecordingFrames);
+
+        long into = Math.Max(0, _at - start) + 1;
 
         FramesText.Text = _loaded is { } loaded
             ? $"f {into:N0}/{total:N0}   clip {loaded.OffsetOf(_at) + 1:N0}/{loaded.Frames:N0}"
@@ -1027,13 +1927,80 @@ public partial class LiveEditWindow : Window
     /// cued against the clock rather than the recording running late, so there is no position on
     /// a timeline of captured media that would mean anything for it.
     /// </summary>
+    /// <summary>The last answer, and when it was taken. See <see cref="OnAirFrame"/>.</summary>
+    private long? _onAirCached;
+    private DateTime _onAirCachedAt = DateTime.MinValue;
+
+    /// <summary>
+    /// Where the transmitter is, on this ruler — memoised for a frame at a time.
+    ///
+    /// <b>Why it is cached.</b> This is now read by the view window itself, which every draw,
+    /// hit test and marker update goes through, so a single frame can ask for it a dozen times.
+    /// Each answer costs a call into the timecode service, which takes a lock shared with the
+    /// 500 ms poll and consumes its anti-backstep hold — the exact contention the deck's own
+    /// sampler was built to avoid. Thirty milliseconds is under one frame at any broadcast rate,
+    /// so nothing on screen can be stale by as much as a frame.
+    /// </summary>
     private long? OnAirFrame()
     {
+        DateTime now = DateTime.UtcNow;
+
+        if ((now - _onAirCachedAt).TotalMilliseconds < 30) return _onAirCached;
+
+        _onAirCachedAt = now;
+        _onAirCached = ReadOnAirFrame();
+
+        return _onAirCached;
+    }
+
+    private long? ReadOnAirFrame()
+    {
+        // Live Edit's own transmission, when it is the one going out. Its position is the
+        // measured one - the frame of the recording or of a cue's media it has just sent - and
+        // it is the only one that knows about inserts and cuts, so it wins over tidal lock's.
+        if (LiveAir.Shared.Active) return LiveOnAirFrame();
+
         TidalLock tidal = TidalLock.Shared;
 
         if (tidal.State is not (TidalLockState.OnAir or TidalLockState.Draining)) return null;
+
+        // Where the transmitter says it actually is, in preference to where the clock says it
+        // ought to be.
+        //
+        // The clock answer - now minus the delay - is right only while nothing goes wrong. Every
+        // frame the transmitter repeats because nothing new had arrived, and every frame it skips
+        // to hold the delay, moves the real position away from the calculated one permanently.
+        // After an hour of a struggling plant the marker can be seconds from the picture actually
+        // going out, which is worse than no marker: it is a wrong answer that looks authoritative.
+        //
+        // Taken as a time of day from the one place the playback deck takes its ON AIR readout
+        // from, so the two cannot disagree. Working it out here as this ruler's recording start
+        // plus the transmitter's frame count is what let them drift: that count is in the
+        // recording's frames, this ruler counts in its own, and wherever those two rates differ
+        // every minute on air added to the gap.
+        //
+        // With its date, so a recording that has run on past midnight has its mark after 23:59
+        // on this ruler rather than wrapped back to the start of it. Off this ruler altogether -
+        // a ruler on another day - there is no mark to draw here.
+        if (PipelineState.Shared.OnAirAt is { } airedAt)
+        {
+            long frame = FrameOn(airedAt);
+            return frame >= 0 && frame < _dayFrames ? frame : null;
+        }
+
+        if (PipelineState.Shared.OnAirTimeOfDay is { } aired)
+            return TimelineZoom.FrameOfDay(aired, _rate);
+
+        // A position with no start published to put it against. Placed against this ruler's own
+        // start for the recording instead, converted through time for the same reason as above.
+        if (PipelineState.Shared.AiredFrame is { } seq && Primary.Any() && tidal.Line is { FrameRate: > 0 } line)
+            return RecordingStartFrame + (long)Math.Round(seq * (double)_rate / line.FrameRate);
+
         if (!_timecode.TryGetCurrent(out Timecode now)) return null;
 
+        // Nothing published - the delay is not running, or this is an EDL playout rather than
+        // tidal lock. Fall back to the arithmetic, which is the best available then.
+        //
         // Through seconds rather than frames, because the station clock can run at a different
         // rate from the one this deck counts in and frames are not comparable across rates.
         return TimelineZoom.OnAirFrame(TimeSpan.FromSeconds(now.TotalSeconds), tidal.Delay, _rate);
@@ -1043,9 +2010,19 @@ public partial class LiveEditWindow : Window
     {
         double width = TrackCanvas.ActualWidth;
 
+        ShowDelay();
+
         if (OnAirFrame() is not { } onAir || width <= 1)
         {
             OnAirMarker.Visibility = Visibility.Collapsed;
+            NoTouchZone.Visibility = Visibility.Collapsed;
+
+            if (LiveText() is { } live)
+            {
+                OnAirText.Text = live;
+                OnAirText.Foreground = Brush("Warn");
+                return;
+            }
 
             // Said rather than left blank. An absent marker and a marker that has stopped look
             // identical, and the two reasons it can be absent are both things the operator can
@@ -1065,7 +2042,14 @@ public partial class LiveEditWindow : Window
 
         OnAirText.Foreground = Brush("Bad");
 
-        OnAirText.Text = $"ON AIR {Stamp(onAir)}";
+        // While playing along, how far the picture here is from the one going out - the number
+        // that says whether the two screens can be trusted to show the same thing.
+        OnAirText.Text = (LiveAir.Shared.State == LiveAirState.OnAir ? "LIVE " : "ON AIR ") +
+                         (_chasing
+                             ? $"{Stamp(onAir)}   PLAYING ALONG {Stamp(_at)} ({_at - onAir:+0;-0;0} f)"
+                             : Stamp(onAir));
+
+        DrawNoTouch(onAir, width);
 
         if (TimelineZoom.XOf(onAir, ViewStart, ViewSpan, width) is { } x)
         {
@@ -1085,8 +2069,125 @@ public partial class LiveEditWindow : Window
     {
         if (OnAirFrame() is not { } onAir) return;
 
+        // Going to air is going back to the view that follows it.
+        _airOffset = null;
+
         Pause();
         Seek(onAir);
+    }
+
+    // ------------------------------------------------------------------ playing along with air
+
+    /// <summary>
+    /// True while the player is locked to the on-air mark: playing what the transmitter is
+    /// sending, so this screen and the playback deck's monitor can be watched side by side.
+    ///
+    /// Ended by anything that pauses - space, an arrow, a click on the ruler - because each of
+    /// those is the operator taking the playhead back.
+    /// </summary>
+    private bool _chasing;
+
+    /// <summary>
+    /// How far the playhead may wander from the on-air mark before it is put back. Half a second:
+    /// two players running off two clocks part by a frame now and then, and re-seeking for that
+    /// would stall the picture far more often than it corrected anything visible.
+    /// </summary>
+    private long ChaseSlack => Math.Max(1, _rate / 2);
+
+    private void PlayOnAir_Click(object sender, RoutedEventArgs e) => PlayOnAir();
+
+    private void PlayOnAir()
+    {
+        LeaveRecordingView();
+
+        if (_chasing) { Pause(); return; }
+
+        if (OnAirFrame() is not { } onAir)
+        {
+            StoreText.Text = "Nothing is on air to play along with - tidal lock is not transmitting.";
+            return;
+        }
+
+        Pause();
+        Seek(onAir);
+
+        if (_loaded is null && _onIngest is null && !_held)
+        {
+            StoreText.Text = "The frame on air is not in a segment that can be played yet.";
+            return;
+        }
+
+        PlayPause();
+
+        _chasing = _playing;
+
+        // Locked to air, the view is the transmitter's again.
+        if (_chasing) _airOffset = null;
+        ShowChase();
+
+        if (_chasing)
+            ActivityLog.Shared.Info(LogSource.App,
+                $"PLAY ON AIR  Live Edit locked to the on-air mark at {Stamp(onAir)}.",
+                @event: "liveedit.playonair");
+    }
+
+    /// <summary>
+    /// Every frame while locked: puts the playhead back on the mark if it has wandered.
+    ///
+    /// Not while a source is opening - the position reads nothing useful then, and the
+    /// open itself lands the player where the last seek asked.
+    /// </summary>
+    private void Chase()
+    {
+        if (!_playing) { StopChasing(); return; }
+
+        if (OnAirFrame() is not { } onAir)
+        {
+            // Still on air, just not on this ruler any more: the delay has carried the mark past
+            // midnight into the new day's folder. Follow it there rather than stop.
+            if (PipelineState.Shared.OnAirAt is { } airedAt && airedAt.Date > _day.Date)
+            {
+                RollOver(airedAt.Date, chase: true, playFrom: null);
+                return;
+            }
+
+            // The same for Live Edit's own transmission: still going, just past the end of this
+            // ruler's day.
+            if (LiveAir.Shared.Active && LiveAir.Shared.Position is { RecordingFrame: >= 0 } live &&
+                _liveStartedAt is not null && RecordingToDay(live.RecordingFrame) >= _oneDay)
+            {
+                RollOver(_day.AddDays(1), chase: true, playFrom: null);
+                return;
+            }
+
+            Pause();
+            StoreText.Text = "Tidal lock stopped transmitting - Live Edit stopped playing along.";
+            return;
+        }
+
+        if (!_open && !_held) return;
+
+        if (Math.Abs(_at - onAir) > ChaseSlack)
+        {
+            Seek(onAir);
+            if (!_held) Player.Play();
+        }
+    }
+
+    private void StopChasing()
+    {
+        if (!_chasing) return;
+
+        _chasing = false;
+        ShowChase();
+        DrawOnAir();
+    }
+
+    private void ShowChase()
+    {
+        PlayOnAirButton.Content = _chasing ? "■ ON AIR" : "▶ ON AIR";
+        if (_chasing) PlayOnAirButton.Foreground = Brush("Bad");
+        else PlayOnAirButton.ClearValue(ForegroundProperty);
     }
 
 
@@ -1120,7 +2221,8 @@ public partial class LiveEditWindow : Window
         double level = LevelSlider.Value;
 
         Player.IsMuted = muted;
-        Player.Volume = level;
+        // At the level set on the sound under the playhead, so the preview sounds as air will.
+        Player.Volume = Math.Clamp(level * _previewGain, 0, 1);
 
         LevelText.Text = muted ? "muted"
             : level <= 0.0001 ? "-inf dB"
@@ -1138,25 +2240,67 @@ public partial class LiveEditWindow : Window
     // ------------------------------------------------------------------ the whole recording
 
     /// <summary>
-    /// Whether the timeline is the recording fitted to the screen, rather than the clock.
+    /// The infinite view: every segment as a block on the clock, zoomable out to the whole day.
     ///
-    /// The ordinary view is the clock: a block per segment, in its place, zoomable to a frame.
-    /// That is what an edit is made on. It is the wrong view for "how much is there" — thirty
-    /// two-minute blocks across an hour tell you about the segmenting and nothing about the
-    /// recording. So this collapses them into the one thing they actually are, and fits the view
-    /// to exactly that span: the first segment at the left edge, the last at the right, nothing
-    /// spent on the empty hours either side.
+    /// Off, the recording is one bar, and the view opens no wider than the delay (see
+    /// <see cref="ViewSpan"/>). That is the view for running air: the stretch between the
+    /// transmitter and the recorder is what can still be changed, and segment boundaries are a
+    /// detail of how the recorder writes files rather than anything about the programme. The
+    /// infinite view is for finding things across a long recording, where the blocks and their
+    /// names are what is being looked for.
     /// </summary>
-    private bool _infinite;
+    private bool _infinite = true;
+
+    private void Freeze_Changed(object sender, RoutedEventArgs e)
+    {
+        Freeze(FreezeButton.IsChecked == true, "the FREEZE button");
+    }
+
+    /// <summary>
+    /// Holds the timeline still, or lets it run again.
+    ///
+    /// On unfreezing, the view runs on with air from the stretch that is on screen.
+    /// It used to jump to the transmitter's anchor - a delay behind the recorder, so usually the
+    /// first segments of the recording - and lose the place the operator was working on.
+    /// </summary>
+    private void Freeze(bool frozen, string why)
+    {
+        if (_frozen == frozen) return;
+
+        _frozen = frozen;
+
+        // Kept in step whichever way this was reached — the button, a drag, the scrollbar or a
+        // zoom. A toggle that did not light up when a drag froze the timeline would leave the
+        // operator with no way to know why it had stopped moving.
+        FreezeButton.IsChecked = frozen;
+
+        // Where the view actually is, so freezing leaves it exactly where it looked rather than
+        // snapping back to wherever the scrollbar had been left.
+        if (frozen) _scroll = ViewStart;
+
+        // Running again from the stretch on screen, moving with air from there - not snapping
+        // back to the transmitter's anchor.
+        if (!frozen && OnAirFrame() is { } air) _airOffset = _chasing ? null : _scroll - air;
+
+        _drawnFor = long.MinValue;
+
+        ShowScroll();
+        Draw();
+        DrawOnAir();
+
+        ActivityLog.Shared.Info(LogSource.App,
+            frozen
+                ? $"Live Edit timeline frozen by {why} - the on-air marker now moves across it."
+                : $"Live Edit timeline running by {why} - the marker is pinned and the recording moves.",
+            @event: "liveedit.freeze");
+    }
 
     private void Infinite_Changed(object sender, RoutedEventArgs e)
     {
         _infinite = InfiniteButton.IsChecked == true;
 
-        // Nothing to set up. The view fits itself to the recording through ViewStart/ViewSpan for
-        // as long as this is on, and the zoom and scroll underneath are left exactly as they
-        // were - so turning it off puts the operator back where they were rather than at
-        // midnight on the widest rung, which is where the first version of this dumped them.
+        // Nothing to set up: the zoom and scroll are the same in both views, and only how much of
+        // them shows (ViewSpan) and what is drawn (Draw) depend on this.
 
         ShowZoom();
         ShowScroll();
@@ -1165,8 +2309,8 @@ public partial class LiveEditWindow : Window
 
         ActivityLog.Shared.Info(LogSource.App,
             _infinite
-                ? "Live Edit timeline set to infinite - the whole recording as one bar."
-                : "Live Edit timeline set to normal - a block per segment on the clock.",
+                ? "Live Edit timeline set to infinite - a block per segment on the clock, zoomable to the whole day."
+                : "Live Edit timeline set to one bar - the recording as one block, zoomed no wider than the delay.",
             @event: "liveedit.timeline");
     }
 
@@ -1190,12 +2334,15 @@ public partial class LiveEditWindow : Window
 
         if (of.Count == 0) return;
 
-        long from = of[0].StartFrame;
+        List<IngestItem> items = IngestItems();
+
+        // On the ruler, where inserts and deleted scenes have moved the recording to.
+        long from = IngestTimeline.RulerFrameOf(of[0].StartFrame, items);
 
         // The end of the last segment, not the sum of their lengths. Those differ the moment
         // there is a gap - a capture stopped and restarted - and the sum would draw a bar that
         // ended before the media did.
-        long recorded = of.Max(p => p.EndFrame);
+        long recorded = IngestTimeline.RulerFrameOf(of.Max(p => p.EndFrame), items);
 
         long? onAir = OnAirFrame();
 
@@ -1208,21 +2355,23 @@ public partial class LiveEditWindow : Window
 
         bool recording = Primary.Any(p => p.Pending);
 
-        // What has gone out, drawn solid.
+        // What has gone out, drawn solid - orange once there is a transmitter to have sent it,
+        // the same as the past segments in the other view.
         TrackCanvas.Children.Add(new Rectangle
         {
             Width = Math.Max(2, b - a),
             Height = height,
             RadiusX = 3,
             RadiusY = 3,
-            Fill = new SolidColorBrush(Color.FromRgb(0x23, 0x36, 0x4E)),
-            Stroke = Brush(recording ? "Warn" : "Accent"),
+            Fill = onAir is null ? new SolidColorBrush(Color.FromRgb(0x23, 0x36, 0x4E)) : AiredFill,
+            Stroke = Brush(onAir is not null || recording ? "Warn" : "Accent"),
             StrokeThickness = 1,
             Margin = new Thickness(a, 0, 0, 0),
         });
 
-        // And what is recorded but not yet transmitted - the delay - as an outline past it. This
-        // is the gap tidal lock is holding, and seeing its size is the point of the view.
+        // And what is recorded but not yet transmitted - the delay - as the one segment that can
+        // still be worked on. This is the gap the delay is holding, and seeing its size is the
+        // point of the view.
         if (onAir is not null && recorded > to)
         {
             double c = Math.Min(width, (recorded - start) / (double)span * width);
@@ -1234,10 +2383,9 @@ public partial class LiveEditWindow : Window
                     Height = height,
                     RadiusX = 3,
                     RadiusY = 3,
-                    Fill = new SolidColorBrush(Color.FromArgb(0x22, 0x3B, 0x82, 0xF6)),
-                    Stroke = Brush("Muted"),
+                    Fill = new SolidColorBrush(Color.FromRgb(0x23, 0x36, 0x4E)),
+                    Stroke = Brush(recording ? "Warn" : "Accent"),
                     StrokeThickness = 1,
-                    StrokeDashArray = new DoubleCollection { 3, 3 },
                     Margin = new Thickness(b, 0, 0, 0),
                 });
         }
@@ -1319,9 +2467,15 @@ public partial class LiveEditWindow : Window
         /// plan, because the four modes mean different things about what goes to air and the
         /// block has to say which was chosen.
         /// </summary>
-        public IngestPlan? Plan { get; init; }
+        public IngestPlan? Plan { get; set; }
 
-        public string Name => System.IO.Path.GetFileName(Path);
+        /// <summary>
+        /// Stable for the life of the placement, so the transmitter can tell a cue it has already
+        /// played from a new one - the list it is handed is rebuilt whole on every edit.
+        /// </summary>
+        public string Id { get; } = Guid.NewGuid().ToString("N");
+
+        public string Name => Plan is { Mode: IngestMode.Cut } ? "scene cut" : System.IO.Path.GetFileName(Path);
         public long EndFrame => StartFrame + Frames;
 
         public bool Holds(long dayFrame) => dayFrame >= StartFrame && dayFrame < EndFrame;
@@ -1338,16 +2492,23 @@ public partial class LiveEditWindow : Window
     private const double LaneHeight = 36;
 
     /// <summary>
-    /// The lane everything from the Ingest list goes on, below the two hand-drop lanes.
+    /// The lane everything from the Ingest list goes on.
     ///
-    /// One lane for all of it rather than one per item: these are the pieces being laid into
-    /// this recording, and seeing them together in time order is the point. It is not a drop
-    /// target for files from Explorer - an ingest placement carries a mode, and a file dragged
-    /// in from outside has not been through the dialog that chooses one.
+    /// <b>Not in the overlay canvas at all.</b> It has a canvas of its own, directly above the
+    /// segments and below the ruler, because it is the one track that changes what goes to air —
+    /// an item there replaces the recording under it. The two hand-drop lanes are monitor layers
+    /// and belong underneath. A sentinel rather than an index into the lane array for that
+    /// reason: there is no row in the overlay canvas for it to be.
+    ///
+    /// It is not a drop target for files from Explorer: an ingest placement carries a mode, and
+    /// a file dragged in from outside has not been through the dialog that chooses one.
     /// </summary>
-    private const int IngestLane = Lanes;
+    private const int IngestLane = -1;
 
-    private const int AllLanes = Lanes + 1;
+    /// <summary>The first lane a file can be dropped on by hand.</summary>
+    private const int FirstDropLane = 0;
+
+    private const int AllLanes = Lanes;
 
     private readonly List<Overlay> _overlays = new();
     private Overlay? _selected;
@@ -1364,7 +2525,7 @@ public partial class LiveEditWindow : Window
     /// rather than quietly sharing one and playing the wrong thing.
     /// </summary>
     private MediaElement? LanePlayer(int lane) =>
-        lane == 0 ? LayerA : lane == 1 ? LayerB : null;
+        lane == FirstDropLane ? LayerA : lane == FirstDropLane + 1 ? LayerB : null;
 
     /// <summary>What is playing on each lane right now, so it is not restarted every frame.</summary>
     private readonly Overlay?[] _onLane = new Overlay?[AllLanes];
@@ -1443,11 +2604,20 @@ public partial class LiveEditWindow : Window
 
         if (Dropped(e) is not { } path) return;
 
-        Point at = e.GetPosition(OverlayCanvas);
+        // The canvas the drop actually landed on, which is now one of three: the ingest lane,
+        // the segments, or the layer lanes. They are stacked in one grid so the horizontal
+        // coordinate means the same thing in all of them, but the vertical does not - taking Y
+        // from the overlay canvas for a drop on the track would give a negative lane.
+        var canvas = sender as IInputElement ?? OverlayCanvas;
 
-        int lane = Math.Clamp((int)(at.Y / LaneHeight), 0, Lanes - 1);
+        Point at = e.GetPosition(canvas);
+        double dropX = at.X;
 
-        long start = TimelineZoom.FrameAt(at.X, ViewStart, ViewSpan, OverlayCanvas.ActualWidth,
+        int lane = ReferenceEquals(sender, OverlayCanvas)
+            ? Math.Clamp((int)(at.Y / LaneHeight), FirstDropLane, AllLanes - 1)
+            : FirstDropLane;
+
+        long start = TimelineZoom.FrameAt(dropX, ViewStart, ViewSpan, TrackCanvas.ActualWidth,
                                           _dayFrames - 1);
 
         long frames = 0;
@@ -1475,7 +2645,21 @@ public partial class LiveEditWindow : Window
         // operator's behalf. Cancelling places nothing.
         if (IsIngestDrag(e))
         {
-            var ask = new IngestDropDialog(path, frames, start, _markIn, _markOut, _rate)
+            if (!Editable(start))
+            {
+                Refuse("NO EDIT ZONE - ingest media can only be placed ahead of the next ten seconds of air.");
+                return;
+            }
+
+            // In the recording's own frames, which is what a plan is in. On the ruler an insert
+            // earlier on has pushed everything along, so handing the dialog ruler frames placed
+            // the item - and later played it to air - that much late.
+            List<IngestItem> before = IngestItems();
+            long Captured(long ruler) => IngestTimeline.At(ruler, before).CapturedFrame;
+
+            var ask = new IngestDropDialog(path, frames, Captured(start),
+                                           _markIn is { } mIn ? Captured(mIn) : null,
+                                           _markOut is { } mOut ? Captured(mOut) : null, _rate)
             {
                 Owner = this,
             };
@@ -1483,6 +2667,24 @@ public partial class LiveEditWindow : Window
             if (ask.ShowDialog() != true) return;
 
             IngestPlan plan = ask.Plan;
+
+            // The two modes that take their place from the marks start at mark in, which can be
+            // somewhere other than where the pointer was.
+            long rulerStart = plan.Mode is IngestMode.FitToFill or IngestMode.Replace && _markIn is { } markedIn
+                ? markedIn
+                : start;
+
+            if (!Editable(rulerStart))
+            {
+                Refuse("NO EDIT ZONE - the marked range starts in the next ten seconds of air, or before it.");
+                return;
+            }
+
+            if (plan.Mode == IngestMode.Insert && !InsertFits(plan.Frames, out string? tooLong))
+            {
+                Refuse(tooLong!);
+                return;
+            }
 
             var placed = new Overlay
             {
@@ -1493,32 +2695,101 @@ public partial class LiveEditWindow : Window
                 Plan = plan,
             };
 
+            Remember($"placing {placed.Name}");
+
             _overlays.Add(placed);
             _selected = placed;
+            _audioPiece = null;
 
-            ActivityLog.Shared.Info(LogSource.App,
-                $"INGEST {placed.Name} - {plan.Mode} at {Stamp(plan.StartFrame)}, " +
-                IngestPlacement.Describe(plan, _rate) + ".",
-                @event: "liveedit.ingestplaced", file: path);
+            ActivityLog.Shared.Info(LogSource.LiveEdit,
+                $"EDL  {placed.Name} - {plan.Mode} at {Stamp(rulerStart)}, " +
+                IngestPlacement.Describe(plan, _rate) +
+                (LiveAir.Shared.State is not (LiveAirState.Off or LiveAirState.Failed)
+                    ? $"; goes to air in {(OnAirFrame() is { } air ? new Timecode(Math.Max(0, rulerStart - air), _rate).ToString() : "-")}."
+                    : "."),
+                @event: "liveedit.ingestplaced", correlation: placed.Id, file: path);
 
+            PushCues();
             Draw();
+            DrawOnAir();
             ShowLayer();
             return;
         }
 
         var overlay = new Overlay { Path = path, Lane = lane, StartFrame = start, Frames = frames };
 
+        Remember($"laying {overlay.Name} on layer {(char)('A' + lane - FirstDropLane)}");
+
         _overlays.Add(overlay);
         _selected = overlay;
+        _audioPiece = null;
 
         ActivityLog.Shared.Info(LogSource.App,
-            $"LAYER {overlay.Name} - on layer {(char)('A' + lane)} at {Stamp(start)}, " +
+            $"LAYER {overlay.Name} - on layer {(char)('A' + lane - FirstDropLane)} at {Stamp(start)}, " +
             $"{frames:N0} frames ({new Timecode(frames, _rate)}).",
             @event: "liveedit.layer", file: path,
-            detail: $"layer {(char)('A' + lane)}\nat {Stamp(start)}\nframes {frames}");
+            detail: $"layer {(char)('A' + lane - FirstDropLane)}\nat {Stamp(start)}\nframes {frames}");
 
         Draw();
         ShowLayer();
+    }
+
+    /// <summary>
+    /// Selects an ingest placement from its own lane.
+    ///
+    /// Separate from the overlay canvas's click because they are separate canvases now, and
+    /// because a click here must not move the playhead — the lane is a list of instructions, and
+    /// picking one up is not the same gesture as pointing at a time.
+    /// </summary>
+    private void Ingest_Click(object sender, MouseButtonEventArgs e)
+    {
+        LeaveRecordingView();
+
+        long frame = TimelineZoom.FrameAt(e.GetPosition(IngestCanvas).X, ViewStart, ViewSpan,
+                                          IngestCanvas.ActualWidth, _dayFrames - 1);
+
+        if (InNoTouchZone(frame))
+        {
+            Refuse("NO EDIT ZONE - the next ten seconds of air cannot be selected or changed.");
+            return;
+        }
+
+        // A deleted scene is a mark with no width, so it is picked up within a few pixels of it.
+        long near = FramesPerPixel() * 5;
+        List<IngestItem> items = IngestItems();
+
+        _audioPiece = null;
+        _selected = _overlays.FirstOrDefault(o => o.Plan is { Mode: IngestMode.Cut } plan &&
+                        Math.Abs(IngestTimeline.RulerStart(new IngestItem(o.Path, plan), items) - frame) <= near)
+                    ?? _overlays.FirstOrDefault(o => o.Plan is not null && HoldsOnRuler(o, frame));
+
+        // The playhead goes there too. This lane is part of the timeline, and a click on any
+        // part of a timeline means "look at this moment" - selecting the block without moving
+        // the playhead left the one gesture doing half its job.
+        Pause();
+        Seek(frame);
+
+        ShowLayer();
+        Focus();
+    }
+
+    /// <summary>
+    /// A click on the ruler seeks, like a click on any other part of the timeline.
+    ///
+    /// The ruler is the timecode, so it is the most obvious thing on screen to point at when you
+    /// want a particular time, and it was the one strip that did nothing. Middle-dragging it
+    /// still pans - that is a different button.
+    /// </summary>
+    private void Ruler_Click(object sender, MouseButtonEventArgs e)
+    {
+        LeaveRecordingView();
+
+        Pause();
+
+        Seek(TimelineZoom.FrameAt(e.GetPosition(RulerCanvas).X, ViewStart, ViewSpan,
+                                  RulerCanvas.ActualWidth, _dayFrames - 1));
+
+        Focus();
     }
 
     private void Overlay_Click(object sender, MouseButtonEventArgs e)
@@ -1533,7 +2804,18 @@ public partial class LiveEditWindow : Window
         long frame = TimelineZoom.FrameAt(at.X, ViewStart, ViewSpan, OverlayCanvas.ActualWidth,
                                           _dayFrames - 1);
 
-        _selected = _overlays.FirstOrDefault(o => o.Lane == lane && o.Holds(frame));
+        if (InNoTouchZone(frame))
+        {
+            Refuse("NO EDIT ZONE - the next ten seconds of air cannot be selected or changed.");
+            return;
+        }
+
+        // Against where each block is actually drawn. An ingest placement sits at its ruler
+        // position, which an insert before it has moved, so testing its planned start would
+        // select nothing where the operator clicked and something where they did not.
+        _audioPiece = null;
+        _selected = _overlays.FirstOrDefault(
+            o => o.Plan is null && o.Lane == lane && o.Holds(frame));
 
         Draw();
         ShowLayer();
@@ -1555,6 +2837,8 @@ public partial class LiveEditWindow : Window
     {
         if (_selected is not { } overlay) return;
 
+        Remember($"the level of {overlay.Name}", key: $"gain:{overlay.Id}");
+
         overlay.GainDb = Math.Clamp(overlay.GainDb + by, -60, 12);
 
         ApplyLaneLevels();
@@ -1564,13 +2848,15 @@ public partial class LiveEditWindow : Window
         ActivityLog.Shared.Info(LogSource.App,
             $"LAYER {overlay.Name} - set to {overlay.GainDb:+0.0;-0.0;0.0} dB " +
             $"({EffectiveGainDb(overlay):+0.0;-0.0;0.0} dB with layer " +
-            $"{(char)('A' + overlay.Lane)} at {_laneGainDb[overlay.Lane]:+0.0;-0.0;0.0} dB).",
+            $"{(char)('A' + overlay.Lane - FirstDropLane)} at {_laneGainDb[overlay.Lane]:+0.0;-0.0;0.0} dB).",
             @event: "liveedit.layerlevel", file: overlay.Path);
     }
 
     private void NudgeLaneGain(int lane, double by)
     {
         if (lane < 0 || lane >= Lanes) return;
+
+        Remember($"the level of layer {(char)('A' + lane - FirstDropLane)}", key: $"lane:{lane}");
 
         _laneGainDb[lane] = Math.Clamp(_laneGainDb[lane] + by, -60, 12);
 
@@ -1583,11 +2869,42 @@ public partial class LiveEditWindow : Window
     {
         if (_selected is not { } overlay) return;
 
+        // What goes to air can only be changed ahead of the no touch zone. An item that has
+        // started, or is about to, stays: its media is open and the transmitter is committed.
+        if (overlay.Plan is { } placed)
+        {
+            long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, placed), IngestItems());
+
+            if (!Editable(at))
+            {
+                Refuse($"NO EDIT ZONE - {overlay.Name} has gone to air or is about to, so it cannot be deleted.");
+                return;
+            }
+        }
+
+        Remember(overlay.Plan is { Mode: IngestMode.Cut } ? "restoring a deleted scene" : $"removing {overlay.Name}");
+
         _overlays.Remove(overlay);
         _selected = null;
 
+        if (overlay.Plan is { } removed)
+        {
+            ActivityLog.Shared.Info(LogSource.LiveEdit,
+                removed.Mode == IngestMode.Cut
+                    ? $"EDL  deleted scene restored - {removed.Covers:N0} frames go back to air; the delay grows by that much."
+                    : $"EDL  {overlay.Name} taken off the timeline" +
+                      (removed.Mode == IngestMode.Insert ? $"; the delay shrinks by {new Timecode(removed.Frames, _rate)}." : "."),
+                @event: "liveedit.ingestremoved", correlation: overlay.Id, file: overlay.Path);
+
+            PushCues();
+            Draw();
+            DrawOnAir();
+            ShowLayer();
+            return;
+        }
+
         // It may be the one currently sounding.
-        for (int lane = 0; lane < Lanes; lane++)
+        for (int lane = FirstDropLane; lane < AllLanes; lane++)
             if (ReferenceEquals(_onLane[lane], overlay))
             {
                 LanePlayer(lane)?.Stop();
@@ -1595,7 +2912,7 @@ public partial class LiveEditWindow : Window
             }
 
         ActivityLog.Shared.Info(LogSource.App,
-            $"LAYER {overlay.Name} - taken off layer {(char)('A' + overlay.Lane)}.",
+            $"LAYER {overlay.Name} - taken off layer {(char)('A' + overlay.Lane - FirstDropLane)}.",
             @event: "liveedit.layerremoved", file: overlay.Path);
 
         Draw();
@@ -1607,7 +2924,7 @@ public partial class LiveEditWindow : Window
     {
         bool muted = MuteButton.IsChecked == true;
 
-        for (int lane = 0; lane < Lanes; lane++)
+        for (int lane = FirstDropLane; lane < AllLanes; lane++)
         {
             if (LanePlayer(lane) is not { } player) continue;
 
@@ -1621,6 +2938,12 @@ public partial class LiveEditWindow : Window
 
     private void ShowLayer()
     {
+        if (_selected is null && _audioPiece is { } piece)
+        {
+            ShowAudioPiece(piece);
+            return;
+        }
+
         if (_selected is not { } overlay)
         {
             // Nothing said while the layers are empty. The prompt that used to sit here was
@@ -1646,7 +2969,7 @@ public partial class LiveEditWindow : Window
         }
 
         LayerText.Text =
-            $"{overlay.Name}  layer {(char)('A' + overlay.Lane)}  " +
+            $"{overlay.Name}  layer {(char)('A' + overlay.Lane - FirstDropLane)}  " +
             $"{overlay.GainDb:+0.0;-0.0;0.0} dB" +
             (_laneGainDb[overlay.Lane] != 0
                 ? $" (+ layer {_laneGainDb[overlay.Lane]:+0.0;-0.0;0.0} = " +
@@ -1669,7 +2992,7 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private void FollowLayers()
     {
-        for (int lane = 0; lane < Lanes; lane++)
+        for (int lane = FirstDropLane; lane < AllLanes; lane++)
         {
             Overlay? want = _playing
                 ? _overlays.FirstOrDefault(o => o.Lane == lane && o.Holds(_at))
@@ -1699,7 +3022,7 @@ public partial class LiveEditWindow : Window
 
     private void StopLayers()
     {
-        for (int lane = 0; lane < Lanes; lane++)
+        for (int lane = FirstDropLane; lane < AllLanes; lane++)
         {
             LanePlayer(lane)?.Stop();
             _onLane[lane] = null;
@@ -1720,6 +3043,7 @@ public partial class LiveEditWindow : Window
     {
         Pause();
         Seek(_at + direction * _ladder[_zoom].StepFrames);
+        PreloadToward(direction);
     }
 
     // --------------------------------------------------------- picking a single frame
@@ -1740,6 +3064,7 @@ public partial class LiveEditWindow : Window
     {
         Pause();
         Seek(_at + frames);
+        PreloadToward(frames);
     }
 
     /// <summary>
@@ -1861,6 +3186,10 @@ public partial class LiveEditWindow : Window
 
     private void Zoom(int by)
     {
+        // The single-bar view opens no wider than the delay: once a rung already shows all of
+        // it, a wider one would only show the same thing.
+        if (by < 0 && !_infinite && BarCap is { } cap && Span >= cap) return;
+
         int was = _zoom;
         _zoom = TimelineZoom.Step(_zoom, by, _rate);
 
@@ -1881,14 +3210,15 @@ public partial class LiveEditWindow : Window
     {
         ZoomLevel level = _ladder[_zoom];
 
-        ZoomText.Text = level.Name;
+        // Capped by the delay in the single-bar view, and said so - a rung name that promised an
+        // hour while showing three minutes would be wrong.
+        ZoomText.Text = !_infinite && BarCap is { } cap && level.SpanFrames > cap
+            ? $"delay {new Timecode(cap, _rate)}"
+            : level.Name;
 
-        // What the keys step by is no longer written in the transport bar. The arrows are one
-        // frame at every zoom now, so there was nothing left for a per-zoom readout to tell
-        // anyone; the shift step is on the key hint at the top of the window.
         InfiniteButton.ToolTip = _infinite
-            ? "Infinite view: the capture up to the on-air point. Click for every file on the clock."
-            : $"Infinite view: the capture up to the on-air point. Shift+arrows step {level.StepName}.";
+            ? "Infinite: every segment on the clock, zoomable out to the whole day. Click for the recording as one bar."
+            : "One bar: the recording as one block, zoomed out no further than the delay. Click for every segment on the clock.";
     }
 
     // ------------------------------------------------------------------ keys
@@ -1904,9 +3234,26 @@ public partial class LiveEditWindow : Window
     {
         if (Keyboard.FocusedElement is TextBox) return;
 
+        if (e.Key is Key.Left or Key.Right or Key.Home or Key.End or Key.A or Key.Up or Key.Down)
+            LeaveRecordingView();
+
+        // A piece of the audio lane picked up, and no block: the level and delete keys are its.
+        bool onAudio = _selected is null && _audioPiece is not null;
+
         switch (e.Key)
         {
+            case Key.Z when Keyboard.Modifiers == ModifierKeys.Control: Undo(); break;
+            case Key.Y when Keyboard.Modifiers == ModifierKeys.Control: Redo(); break;
+            case Key.Z when Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift): Redo(); break;
+
+            // Cuts the sound at the playhead, as a razor would.
+            case Key.C when Keyboard.Modifiers == ModifierKeys.None: CutAudio(); break;
+
             case Key.Space: PlayPause(); break;
+
+            // The recording as it comes in, and back. Any key that moves the playhead also goes
+            // back, above: it is the timeline being asked for.
+            case Key.R: ToggleRecordingView(); break;
 
             // Shift travels by a step of the current zoom - a minute at the hour view - for
             // getting across a recording rather than along it.
@@ -1933,9 +3280,14 @@ public partial class LiveEditWindow : Window
             case Key.I: Mark(inPoint: true); break;
             case Key.O: Mark(inPoint: false); break;
 
+            case Key.A when Keyboard.Modifiers == ModifierKeys.Shift: PlayOnAir(); break;
             case Key.A: GoToOnAir(); break;
 
             case Key.B: EditBookmark(); break;
+
+            // Between bookmarks, which at a frame a press would otherwise be a long walk.
+            case Key.Up: StepBookmark(-1); break;
+            case Key.Down: StepBookmark(+1); break;
 
             case Key.M:
                 MuteButton.IsChecked = MuteButton.IsChecked != true;
@@ -1943,15 +3295,18 @@ public partial class LiveEditWindow : Window
                 break;
 
             // The selected layer item: a decibel at a time, and off.
+            case Key.OemOpenBrackets when onAudio: NudgeAudio(-1); break;
+            case Key.OemCloseBrackets when onAudio: NudgeAudio(+1); break;
+
             case Key.OemOpenBrackets: NudgeSelectedGain(-1); break;
             case Key.OemCloseBrackets: NudgeSelectedGain(+1); break;
             case Key.Delete or Key.Back: DeleteSelected(); break;
 
             // The lanes themselves, with shift held.
-            case Key.D1 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(0, -1); break;
-            case Key.D2 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(0, +1); break;
-            case Key.D3 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(1, -1); break;
-            case Key.D4 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(1, +1); break;
+            case Key.D1 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(FirstDropLane, -1); break;
+            case Key.D2 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(FirstDropLane, +1); break;
+            case Key.D3 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(FirstDropLane + 1, -1); break;
+            case Key.D4 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(FirstDropLane + 1, +1); break;
 
             default: return;
         }
@@ -1997,7 +3352,10 @@ public partial class LiveEditWindow : Window
     private void Pan_Down(object sender, MouseButtonEventArgs e)
     {
         if (e.ChangedButton != MouseButton.Middle) return;
-        if (_infinite || Span >= _dayFrames) return;
+        if (ViewSpan >= _dayFrames) return;
+
+        // Dragging the view is the same intent as scrolling it: hold still and let me look.
+        Freeze(true, "dragging the timeline");
 
         _panning = true;
         _panFrom = e.GetPosition(TrackCanvas);
@@ -2068,15 +3426,36 @@ public partial class LiveEditWindow : Window
 
     private void Timeline_Click(object sender, MouseButtonEventArgs e)
     {
-        // A click on the timeline moves the playhead, and only that.
-        //
-        // Clicking a bookmark used to open it, which made the one thing an operator does most
-        // here - put the playhead somewhere - conditional on what happened to be under the
-        // pointer. At a day-wide zoom a bookmark is a few pixels wide and they are easy to hit
-        // by accident, so a click meant to place the playhead opened a dialog instead. The
-        // bookmarks are managed from the Bookmark button, where nothing else is competing for
-        // the same gesture.
+        LeaveRecordingView();
+
         Pause();
+
+        // What was clicked, as well as where. The playhead moves either way - that is the
+        // gesture and it must not become conditional on what happened to be under the pointer -
+        // but a bookmark or a segment also puts its details on screen, and anything else takes
+        // them off again.
+        long under = TimelineZoom.FrameAt(e.GetPosition(TrackCanvas).X, ViewStart, ViewSpan,
+                                          TrackCanvas.ActualWidth, _dayFrames - 1);
+
+        if (InNoTouchZone(under))
+        {
+            HideDetails();
+            Refuse("NO EDIT ZONE - the next ten seconds of air cannot be selected or changed.");
+            return;
+        }
+
+        double where = e.GetPosition(TrackCanvas).X;
+
+        if (_bookmarks.Nearest(under, FramesPerPixel() * 5) is { } hit)
+            ShowDetails($"Bookmark  {Stamp(hit.Frame)}",
+                        (hit.Note.Length > 0 ? hit.Note : "(no note)") +
+                        $"\n\nframe {hit.Frame:N0} of the day" +
+                        "\n\nUse the Bookmark button to change or remove it.",
+                        where);
+        else if (_placed.FirstOrDefault(p => p.Holds(under)) is { } segment)
+            ShowDetails(segment.Clip.DisplayName, SegmentDetails(segment), where);
+        else
+            HideDetails();
 
         Seek(TimelineZoom.FrameAt(e.GetPosition(TrackCanvas).X, ViewStart, ViewSpan,
                                   TrackCanvas.ActualWidth, _dayFrames - 1));
@@ -2094,7 +3473,153 @@ public partial class LiveEditWindow : Window
     }
 
     /// <summary>A frame of the day, as station timecode.</summary>
-    private string Stamp(long dayFrame) => new Timecode(dayFrame, _rate).ToString();
+    /// <summary>A frame of the ruler as a timecode - wrapped at midnight, the way the clock reads.</summary>
+    private string Stamp(long dayFrame) =>
+        new Timecode((dayFrame % _oneDay + _oneDay) % _oneDay, _rate).ToString();
+
+    // ------------------------------------------------------- details of what was clicked
+
+    /// <summary>
+    /// Puts the details card on screen beside what was clicked.
+    ///
+    /// Kept inside the canvas: a card hanging off the right-hand edge would be clipped, and the
+    /// operator clicked near the edge precisely because that is where the thing they want is.
+    /// </summary>
+    private void ShowDetails(string heading, string body, double nearX)
+    {
+        DetailsHeading.Text = heading;
+        DetailsBody.Text = body;
+
+        DetailsCard.Visibility = Visibility.Visible;
+
+        // Measured before placing, because the width depends on the text and the text is only
+        // just set.
+        DetailsCard.UpdateLayout();
+
+        double width = DetailsCard.ActualWidth > 0 ? DetailsCard.ActualWidth : 260;
+        double room = TrackCanvas.ActualWidth;
+
+        double left = nearX + 12 + width > room
+            ? Math.Max(0, nearX - 12 - width)
+            : nearX + 12;
+
+        DetailsCard.Margin = new Thickness(left, 6, 0, 0);
+    }
+
+    private void HideDetails() => DetailsCard.Visibility = Visibility.Collapsed;
+
+    /// <summary>
+    /// Keeps the open details card on whatever the playhead is over.
+    ///
+    /// <b>Only when it is already open.</b> Clicking opens it and clicking empty timeline closes
+    /// it; the arrow keys move what it is about, they do not summon it. A card that appeared
+    /// because somebody nudged a frame would be a panel opening itself over the timeline.
+    ///
+    /// This is what makes two bookmarks a few frames apart readable: step onto one, step onto
+    /// the next, and the card follows — rather than having to click each in turn at a zoom where
+    /// they are three pixels apart.
+    /// </summary>
+    private void FollowDetails()
+    {
+        if (DetailsCard.Visibility != Visibility.Visible) return;
+
+        double width = TrackCanvas.ActualWidth;
+
+        if (width <= 1) return;
+
+        // Where the playhead is on screen, so the card sits beside what it is describing rather
+        // than staying where the last click happened.
+        double at = TimelineZoom.XOf(_at, ViewStart, ViewSpan, width) ?? 0;
+
+        if (_bookmarks.Nearest(_at, FramesPerPixel() * 5) is { } hit)
+        {
+            ShowDetails($"Bookmark  {Stamp(hit.Frame)}",
+                        (hit.Note.Length > 0 ? hit.Note : "(no note)") +
+                        $"\n\nframe {hit.Frame:N0} of the day" +
+                        "\n\nUp and Down step between bookmarks.",
+                        at);
+            return;
+        }
+
+        if (_placed.FirstOrDefault(p => p.Holds(_at)) is { } segment)
+        {
+            ShowDetails(segment.Clip.DisplayName, SegmentDetails(segment), at);
+            return;
+        }
+
+        ShowDetails($"Nothing at {Stamp(_at)}",
+                    "No recording and no bookmark here.\n\nUp and Down step between bookmarks.",
+                    at);
+    }
+
+    /// <summary>
+    /// Goes to the next or previous bookmark.
+    ///
+    /// Up and Down, because stepping a frame at a time to reach the next one is twenty-five
+    /// presses a second of recording, and the arrow keys are already the thing an operator's
+    /// hand is on. The details card follows, so this reads them in turn.
+    /// </summary>
+    private void StepBookmark(int direction)
+    {
+        Bookmark? target = direction > 0
+            ? _bookmarks.All.Where(m => m.Frame > _at).OrderBy(m => m.Frame).Cast<Bookmark?>().FirstOrDefault()
+            : _bookmarks.All.Where(m => m.Frame < _at).OrderByDescending(m => m.Frame).Cast<Bookmark?>().FirstOrDefault();
+
+        if (target is not { } mark)
+        {
+            StoreText.Text = _bookmarks.Count == 0
+                ? "No bookmarks on this day. Press B to add one."
+                : direction > 0 ? "No bookmark after this one." : "No bookmark before this one.";
+            return;
+        }
+
+        Pause();
+        Seek(mark.Frame);
+
+        // Opened rather than only followed: stepping to a bookmark is asking what it says.
+        double width = TrackCanvas.ActualWidth;
+
+        ShowDetails($"Bookmark  {Stamp(mark.Frame)}",
+                    (mark.Note.Length > 0 ? mark.Note : "(no note)") +
+                    $"\n\nframe {mark.Frame:N0} of the day" +
+                    "\n\nUp and Down step between bookmarks.",
+                    width > 1 ? TimelineZoom.XOf(_at, ViewStart, ViewSpan, width) ?? 0 : 0);
+    }
+
+    private void DetailsClose_Click(object sender, RoutedEventArgs e) => HideDetails();
+
+    /// <summary>
+    /// What is worth knowing about a segment: where it sits, how long it is, what it is encoded
+    /// as, and where it is on the disk.
+    ///
+    /// The path last and in full, because the question behind clicking a segment is often "which
+    /// file is this" — and a name alone does not answer it on a store with a folder per
+    /// recording.
+    /// </summary>
+    private string SegmentDetails(Placed segment)
+    {
+        CapturedClip clip = segment.Clip;
+
+        var lines = new List<string>
+        {
+            $"{Stamp(segment.StartFrame)} - {Stamp(segment.EndFrame)}",
+            $"{segment.Frames:N0} frames{(segment.Pending ? " (assumed - still recording)" : "")}",
+            clip.DurationText == "-" ? "length not read" : $"length {clip.DurationText}",
+            clip.FormatText,
+            clip.SizeText,
+            clip.MasterText,
+        };
+
+        if (MediaLibrary.RecordingFolder(clip.Path) is { } folder)
+            lines.Add($"recording {folder}");
+
+        lines.Add("");
+        lines.Add(clip.Path);
+
+        if (clip.MasterPath is { } master) lines.Add(master);
+
+        return string.Join("\n", lines);
+    }
 
     /// <summary>
     /// A ruler interval that suits a span: the one belonging to the tightest rung that would
@@ -2103,7 +3628,7 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private long TickFor(long span, ZoomLevel current)
     {
-        if (!_infinite) return current.TickFrames;
+        if (span == current.SpanFrames) return current.TickFrames;
 
         foreach (ZoomLevel rung in _ladder.OrderBy(r => r.SpanFrames))
             if (rung.SpanFrames >= span) return rung.TickFrames;
@@ -2115,7 +3640,7 @@ public partial class LiveEditWindow : Window
     {
         PositionText.Text = Stamp(_at);
 
-        PlayButton.IsEnabled = _loaded is not null;
+        PlayButton.IsEnabled = _loaded is not null || _onIngest is not null;
         MarkInButton.IsEnabled = MarkOutButton.IsEnabled = true;
 
         // The marks read off the timeline, where they are drawn and labelled. What a readout here
@@ -2126,8 +3651,14 @@ public partial class LiveEditWindow : Window
             ? $"Export {Stamp(a)} to {Stamp(b)}  ({new Timecode(b - a, _rate)}, {b - a:N0} frames)"
             : "Mark in and out on the timeline first";
 
+        // An open details card follows the playhead, so the arrow keys read along the timeline
+        // rather than only the mouse. Not while playing: the card would rewrite itself
+        // twenty-five times a second and be unreadable.
+        if (!_playing) FollowDetails();
+
         // There is nothing to export until both marks are set the right way round.
         ExportButton.IsEnabled = _markIn is { } mIn && _markOut is { } mOut && mOut > mIn;
+        DeleteSceneButton.IsEnabled = ExportButton.IsEnabled;
 
         ShowGoTo();
     }
@@ -2139,6 +3670,15 @@ public partial class LiveEditWindow : Window
     /// every five minutes is twelve labels and a handful of blocks whether the store holds an
     /// hour or a week.
     /// </summary>
+    /// <summary>What has already gone to air: a dark orange, the warning colour, behind the Warn outline.</summary>
+    private static readonly Brush AiredFill = Frozen(new SolidColorBrush(Color.FromRgb(0x5C, 0x3A, 0x10)));
+
+    private static Brush Frozen(Brush brush)
+    {
+        brush.Freeze();
+        return brush;
+    }
+
     private void Draw()
     {
         RulerCanvas.Children.Clear();
@@ -2184,7 +3724,10 @@ public partial class LiveEditWindow : Window
 
         double height = Math.Max(24, TrackCanvas.ActualHeight - 24);
 
-        if (_infinite) DrawOneBar(width, start, span, height);
+        if (!_infinite) DrawOneBar(width, start, span, height);
+
+        // Where air is, for colouring what has already gone out.
+        long? airedTo = OnAirFrame();
 
         // One row for every segment, whichever recording it came from.
         //
@@ -2194,7 +3737,7 @@ public partial class LiveEditWindow : Window
         // third of the height. The overlap it was guarding against is real but rare, and it is
         // handled by drawing order instead - the recording in question goes on last, so it is
         // the one on top and the one that is clickable where two cover the same minute.
-        IEnumerable<Placed> inOrder = _infinite
+        IEnumerable<Placed> inOrder = !_infinite
             ? Enumerable.Empty<Placed>()
             : _placed
                 .OrderBy(p => MediaLibrary.RecordingFolder(p.Clip.Path) == _primaryFolder)
@@ -2204,18 +3747,57 @@ public partial class LiveEditWindow : Window
         {
             // Anything wholly outside the window costs nothing to skip and would cost a visual
             // for every segment of a day otherwise.
-            if (placed.EndFrame < start || placed.StartFrame > start + span) continue;
-
-            double from = Math.Max(0, (placed.StartFrame - start) / (double)span * width);
-            double to = Math.Min(width, (placed.EndFrame - start) / (double)span * width);
+            // Cut at every insert that lands inside it.
+            //
+            // An insert goes in between rather than over, so a segment with something inserted
+            // part-way through is no longer one block on the ruler: it is the part before, then
+            // the inserted item, then the rest. Without this the block ran straight under the
+            // inserted item and claimed time that now belongs to something else. A segment with
+            // no insert in it is one piece at its own position, which is the ordinary case.
+            IReadOnlyList<IngestTimeline.Piece> pieces =
+                IngestTimeline.Split(placed.StartFrame, placed.Frames, IngestItems());
 
             bool current = ReferenceEquals(placed, _loaded);
+
+            // Which piece carries the name and the counts: the widest one on screen, since a
+            // ten-pixel sliver has no room for either.
+            int labelOn = -1;
+            double labelWidth = 0;
+
+            for (int i = 0; i < pieces.Count; i++)
+            {
+                double w = pieces[i].Frames / (double)span * width;
+
+                if (w > labelWidth) { labelWidth = w; labelOn = i; }
+            }
+
+            for (int i = 0; i < pieces.Count; i++)
+            {
+                IngestTimeline.Piece piece = pieces[i];
+
+                // Culled against the ruler, or a piece pushed into view by an insert would be
+                // skipped as out of range.
+                if (piece.RulerEnd < start || piece.RulerStart > start + span) continue;
+
+                DrawSegmentPiece(placed, piece, i == labelOn, current, width, start, span, height);
+            }
+        }
+
+        void DrawSegmentPiece(Placed placed, IngestTimeline.Piece piece, bool labelled,
+                              bool current, double width, long start, long span, double height)
+        {
+            double from = Math.Max(0, (piece.RulerStart - start) / (double)span * width);
+            double to = Math.Min(width, (piece.RulerEnd - start) / (double)span * width);
 
             // Whether this segment belongs to the recording in question. Where two recordings
             // cover the same minute the other one is dimmed, so the row reads as "this
             // recording, and something else also here" rather than as two equal claims.
             bool primary = _primaryFolder is null ||
                            MediaLibrary.RecordingFolder(placed.Clip.Path) == _primaryFolder;
+
+            // Already gone to air, wholly: orange, so what is past cannot be mistaken for what
+            // can still be changed.
+            bool aired = airedTo is { } air && piece.RulerEnd <= air;
 
             TrackCanvas.Children.Add(new Rectangle
             {
@@ -2228,16 +3810,38 @@ public partial class LiveEditWindow : Window
                 // the clock, it is where the recorder is, and it cannot be played yet.
                 Fill = placed.Pending
                     ? new SolidColorBrush(Color.FromArgb(0x30, 0xF5, 0x9E, 0x0B))
+                    : aired ? AiredFill
                     : new SolidColorBrush(Color.FromRgb(0x23, 0x36, 0x4E)),
 
-                Stroke = (Brush)FindResource(placed.Pending ? "Warn" : current ? "Ok" : "Accent"),
+                Stroke = (Brush)FindResource(placed.Pending || aired ? "Warn" : current ? "Ok" : "Accent"),
                 StrokeThickness = current ? 2 : 1,
                 Opacity = primary ? 1.0 : 0.5,
                 Margin = new Thickness(from, 0, 0, 0),
             });
 
-            // Only worth a name if there is room for one.
-            if (to - from > 60)
+            // The segment going out now: orange up to the transmitter, as it is drawn by the
+            // marker, and its ordinary colour after.
+            if (!aired && airedTo is { } partway && piece.RulerStart < partway && partway < piece.RulerEnd)
+            {
+                double split = Math.Min(to, (partway - start) / (double)span * width);
+
+                if (split > from)
+                    TrackCanvas.Children.Add(new Rectangle
+                    {
+                        Width = split - from,
+                        Height = height,
+                        RadiusX = 3,
+                        RadiusY = 3,
+                        Fill = AiredFill,
+                        Opacity = primary ? 1.0 : 0.5,
+                        IsHitTestVisible = false,
+                        Margin = new Thickness(from, 0, 0, 0),
+                    });
+            }
+
+            // Only on the piece that carries the label, and only if there is room: a segment cut
+            // by an insert would otherwise print its name twice, once on each half.
+            if (labelled && to - from > 60)
             {
                 var name = new TextBlock
                 {
@@ -2297,8 +3901,10 @@ public partial class LiveEditWindow : Window
         // which would put it at a time it is not.
         DrawMark(_markIn, "IN");
         DrawMark(_markOut, "OUT");
+        DrawMarkCard(width, start, span);
 
         DrawBookmarks(width, start, span, height);
+        DrawDrops(width, start, span, height);
 
         void DrawMark(long? at, string label)
         {
@@ -2329,9 +3935,13 @@ public partial class LiveEditWindow : Window
             TrackCanvas.Children.Add(tag);
         }
 
-        Playhead.Margin = new Thickness(TimelineZoom.XOf(_at, start, span, width) ?? 0, 0, 0, 0);
+        // Off the window, it is not drawn at all - at x 0 it read as the playhead having wrapped round
+        // to the left edge.
+        Playhead.Margin = new Thickness(TimelineZoom.XOf(_at, start, span, width) ?? -10, 0, 0, 0);
 
+        DrawIngest(width, start, span);
         DrawLayers(width, start, span);
+        DrawAudio(width, start, span);
     }
 
     /// <summary>
@@ -2360,8 +3970,8 @@ public partial class LiveEditWindow : Window
                 Text = lane == IngestLane
                     ? "INGEST"
                     : _laneGainDb[lane] == 0
-                        ? $"{(char)('A' + lane)}"
-                        : $"{(char)('A' + lane)}  {_laneGainDb[lane]:+0.0;-0.0;0.0} dB",
+                        ? $"{(char)('A' + lane - FirstDropLane)}"
+                        : $"{(char)('A' + lane - FirstDropLane)}  {_laneGainDb[lane]:+0.0;-0.0;0.0} dB",
 
                 Foreground = Brush(lane == IngestLane ? "Accent"
                                    : _laneGainDb[lane] == 0 ? "Muted" : "Tc"),
@@ -2383,78 +3993,37 @@ public partial class LiveEditWindow : Window
             }
         }
 
-        foreach (Overlay overlay in _overlays)
+        // The hand-drop lanes only. Ingest placements have their own canvas above the segments,
+        // drawn by DrawIngest.
+        foreach (Overlay overlay in _overlays.Where(o => o.Plan is null))
         {
-            if (overlay.EndFrame < start || overlay.StartFrame > start + span) continue;
+            long laneStart = overlay.StartFrame;
 
-            double from = Math.Max(0, (overlay.StartFrame - start) / (double)span * width);
-            double to = Math.Min(width, (overlay.EndFrame - start) / (double)span * width);
+            if (laneStart + overlay.Frames < start || laneStart > start + span) continue;
+
+            double from = Math.Max(0, (laneStart - start) / (double)span * width);
+            double to = Math.Min(width, (laneStart + overlay.Frames - start) / (double)span * width);
 
             bool chosen = ReferenceEquals(overlay, _selected);
 
-            bool ingest = overlay.Plan is not null;
-
-            var block = new Rectangle
+            OverlayCanvas.Children.Add(new Rectangle
             {
                 Width = Math.Max(2, to - from),
                 Height = LaneHeight - 6,
                 RadiusX = 3,
                 RadiusY = 3,
-
-                // Ingest placements are blue against the layers' green, because they are a
-                // different kind of thing: a layer is something laid over the monitor feed, and
-                // an ingest placement is an instruction about what goes to air.
-                Fill = new SolidColorBrush(ingest
-                    ? Color.FromArgb(0x55, 0x3B, 0x82, 0xF6)
-                    : Color.FromArgb(0x60, 0x22, 0xC5, 0x5E)),
-
-                Stroke = Brush(chosen ? "Tc" : ingest ? "Accent" : "Ok"),
+                Fill = new SolidColorBrush(Color.FromArgb(0x60, 0x22, 0xC5, 0x5E)),
+                Stroke = Brush(chosen ? "Tc" : "Ok"),
                 StrokeThickness = chosen ? 2 : 1,
-
-                // A stretched item is dashed: it is not playing at its recorded rate, and that
-                // is worth seeing without reading the label.
-                StrokeDashArray = overlay.Plan is { Stretched: true }
-                    ? new DoubleCollection { 3, 2 }
-                    : null,
-
                 Margin = new Thickness(from, overlay.Lane * LaneHeight + 3, 0, 0),
-                ToolTip = overlay.Plan is { } p
-                    ? $"{overlay.Name}\n{p.Mode}: {IngestPlacement.Describe(p, _rate)}"
-                    : overlay.Name,
-            };
-
-            OverlayCanvas.Children.Add(block);
-
-            // What an ingest placement covers but does not itself fill - a replace in a range
-            // longer than the media - drawn as an outline past the end of the block, because
-            // that stretch is the original carrying on and the range is what was marked.
-            if (overlay.Plan is { } plan && plan.Covers > plan.Frames)
-            {
-                double coversTo = Math.Min(width,
-                    (plan.StartFrame + plan.Covers - start) / (double)span * width);
-
-                if (coversTo > to)
-                    OverlayCanvas.Children.Add(new Rectangle
-                    {
-                        Width = coversTo - to,
-                        Height = LaneHeight - 6,
-                        Fill = Brushes.Transparent,
-                        Stroke = Brush("Muted"),
-                        StrokeThickness = 1,
-                        StrokeDashArray = new DoubleCollection { 2, 3 },
-                        Margin = new Thickness(to, overlay.Lane * LaneHeight + 3, 0, 0),
-                        ToolTip = "the rest of the marked range - the original plays on here",
-                    });
-            }
+                ToolTip = overlay.Name,
+            });
 
             if (to - from > 50)
             {
                 var name = new TextBlock
                 {
-                    Text = overlay.Plan is { } said
-                        ? $"{overlay.Name}   {said.Mode}" +
-                          (said.Stretched ? $" {said.Speed:0.###}x" : "")
-                        : $"{overlay.Name}   {EffectiveGainDb(overlay):+0.0;-0.0;0.0} dB",
+                    Text = $"{overlay.Name}   {EffectiveGainDb(overlay):+0.0;-0.0;0.0} dB",
 
                     Foreground = (Brush)FindResource("Text"),
                     FontSize = 9.5,
@@ -2470,10 +4039,184 @@ public partial class LiveEditWindow : Window
         }
     }
 
+    /// <summary>
+    /// The ingest lane: what has been laid into this recording, on its own track above the
+    /// segments.
+    ///
+    /// Blue against the layers' green, because they are different kinds of thing — a layer is
+    /// laid over the monitor feed and keeps it, an ingest placement is an instruction about what
+    /// replaces it. A stretched item is dashed, so a fit-to-fill reads as "not at its own speed"
+    /// without having to be clicked.
+    /// </summary>
+    private void DrawIngest(double width, long start, long span)
+    {
+        IngestCanvas.Children.Clear();
+
+        double height = Math.Max(10, IngestCanvas.ActualHeight - 6);
+
+        List<IngestItem> items = IngestItems();
+
+        var label = new TextBlock
+        {
+            Text = items.Count == 0 ? "INGEST" : $"INGEST  {items.Count}",
+            Foreground = Brush("Accent"),
+            FontFamily = new FontFamily("Consolas"),
+            FontSize = 9.5,
+        };
+
+        Canvas.SetLeft(label, 4);
+        Canvas.SetTop(label, 2);
+        IngestCanvas.Children.Add(label);
+
+        foreach (Overlay overlay in _overlays.Where(o => o.Plan is not null))
+        {
+            IngestPlan plan = overlay.Plan!.Value;
+
+            // Where it sits on the ruler, which inserts before it have pushed along.
+            long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, plan), items);
+
+            if (at + overlay.Frames < start || at > start + span) continue;
+
+            double from = Math.Max(0, (at - start) / (double)span * width);
+            double to = Math.Min(width, (at + overlay.Frames - start) / (double)span * width);
+
+            bool chosen = ReferenceEquals(overlay, _selected);
+
+            // A deleted scene takes no time on the ruler - the recording either side of it now
+            // meets - so it is a mark at the join, saying how much was taken out there.
+            if (plan.Mode == IngestMode.Cut)
+            {
+                IngestCanvas.Children.Add(new Rectangle
+                {
+                    Width = chosen ? 3 : 2,
+                    Height = height,
+                    Fill = Brush(chosen ? "Tc" : "Bad"),
+                    Margin = new Thickness(Math.Max(0, from - 1), 3, 0, 0),
+                    ToolTip = $"Scene deleted: {IngestPlacement.Describe(plan, _rate)}",
+                });
+
+                var tag = new TextBlock
+                {
+                    Text = $"✂ -{new Timecode(plan.Covers, _rate)}",
+                    Foreground = Brush(chosen ? "Tc" : "Bad"),
+                    FontSize = 9.5,
+                    FontFamily = new FontFamily("Consolas"),
+                    FontWeight = FontWeights.Bold,
+                };
+
+                Canvas.SetLeft(tag, from + 4);
+                Canvas.SetTop(tag, 11);
+                IngestCanvas.Children.Add(tag);
+                continue;
+            }
+
+            // Already gone to air: orange, as the recording under it is.
+            bool aired = OnAirFrame() is { } air && at + overlay.Frames <= air;
+
+            IngestCanvas.Children.Add(new Rectangle
+            {
+                Width = Math.Max(2, to - from),
+                Height = height,
+                RadiusX = 3,
+                RadiusY = 3,
+                Fill = aired ? AiredFill : new SolidColorBrush(Color.FromArgb(0x55, 0x3B, 0x82, 0xF6)),
+                Stroke = Brush(chosen ? "Tc" : aired ? "Warn" : "Accent"),
+                StrokeThickness = chosen ? 2 : 1,
+                StrokeDashArray = plan.Stretched ? new DoubleCollection { 3, 2 } : null,
+                Margin = new Thickness(from, 3, 0, 0),
+                ToolTip = $"{overlay.Name}\n{plan.Mode}: {IngestPlacement.Describe(plan, _rate)}",
+            });
+
+            // The part of a marked range this covers but does not fill - a replace shorter than
+            // its range - outlined, because that stretch is the original carrying on.
+            if (plan.Covers > plan.Frames)
+            {
+                double coversTo = Math.Min(width, (at + plan.Covers - start) / (double)span * width);
+
+                if (coversTo > to)
+                    IngestCanvas.Children.Add(new Rectangle
+                    {
+                        Width = coversTo - to,
+                        Height = height,
+                        Fill = Brushes.Transparent,
+                        Stroke = Brush("Muted"),
+                        StrokeThickness = 1,
+                        StrokeDashArray = new DoubleCollection { 2, 3 },
+                        Margin = new Thickness(to, 3, 0, 0),
+                        ToolTip = "the rest of the marked range - the original plays on here",
+                    });
+            }
+
+            if (to - from > 50)
+            {
+                var name = new TextBlock
+                {
+                    Text = $"{overlay.Name}   {plan.Mode}" +
+                           (plan.Stretched ? $" {plan.Speed:0.###}x" : ""),
+
+                    Foreground = (Brush)FindResource("Text"),
+                    FontSize = 9.5,
+                    FontFamily = new FontFamily("Consolas"),
+                    MaxWidth = Math.Max(20, to - from - 8),
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                };
+
+                Canvas.SetLeft(name, from + 5);
+                Canvas.SetTop(name, 11);
+                IngestCanvas.Children.Add(name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A drop was recorded somewhere in the plant. Only redraws when it is on the day being
+    /// looked at, so a window left open on last Tuesday is not rebuilt by tonight's losses.
+    /// </summary>
+    private void OnDropsChanged() => Dispatcher.BeginInvoke(() =>
+    {
+        if (DropMarks.Shared.On(_day).Count > 0) Draw();
+    }, DispatcherPriority.Background);
+
     private void LiveEditWindow_Closing(object? sender, CancelEventArgs e)
     {
+        // The transmission is this window's: the timeline it plays is here. Closing ends it, so
+        // that is asked rather than done quietly.
+        if (LiveAir.Shared.State is not (LiveAirState.Off or LiveAirState.Failed))
+        {
+            // Asked when the operator closes this window. Not when the whole application is
+            // going - the capture deck closing closes this too, and WPF will not show anything
+            // while a window is closing; that was a crash on the way out. Then it simply ends.
+            bool ask;
+
+            try
+            {
+                ask = MessageBox.Show(this,
+                        "Live Edit is live. Closing it ends the transmission - the TX goes to black.\n\nClose anyway?",
+                        "Live Edit is live", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK;
+            }
+            catch (InvalidOperationException)
+            {
+                ask = false;
+            }
+
+            if (ask)
+            {
+                e.Cancel = true;
+                return;
+            }
+
+            EndLive("Live Edit went off air - its window was closed.");
+        }
+
+        UnwireLive();
+        LeaveRecordingView();
+        _heldPicture.Dispose();
+
         _tick.Stop();
         _watch.Stop();
+
+        // A static event holds this window for the life of the process otherwise.
+        DropMarks.Shared.Changed -= OnDropsChanged;
 
         // Written on the way out as well as on every change, so a note typed and then forgotten
         // about is not lost by closing the window.
@@ -2486,6 +4229,8 @@ public partial class LiveEditWindow : Window
 
         Player.Stop();
         Player.Close();
+        _standby.Stop();
+        _standby.Close();
     }
 
     // ------------------------------------------------------------- the two media tabs
@@ -2607,7 +4352,7 @@ public partial class LiveEditWindow : Window
         // Played through the small H.264 copy written beside it. The export itself is DNxHD,
         // which Media Foundation cannot decode, so playing the export directly gave a blank
         // picture and no reason for it.
-        string? preview = RangeExport.PreviewFor(clip.Path);
+        string? preview = RangeExport.PlayablePathFor(clip.Path);
 
         if (preview is not null) ShowInMonitor(preview, clip.DisplayName, actual: clip.Path);
         else
@@ -2922,6 +4667,79 @@ public partial class LiveEditWindow : Window
     }
 
     /// <summary>
+    /// A small card with the marks' timecodes, and the range's length once both are set - over
+    /// the marked range, or at the right edge when the marks are off screen, so the numbers are
+    /// there whether or not the marks are in view.
+    /// </summary>
+    private void DrawMarkCard(double width, long start, long span)
+    {
+        if (_markIn is null && _markOut is null) return;
+
+        var lines = new StackPanel();
+
+        void Line(string label, string value, string brush)
+        {
+            var row = new StackPanel { Orientation = Orientation.Horizontal };
+
+            row.Children.Add(new TextBlock
+            {
+                Text = label,
+                Width = 30,
+                Foreground = Brush("Muted"),
+                FontFamily = new FontFamily("Consolas"),
+                FontSize = 10,
+            });
+
+            row.Children.Add(new TextBlock
+            {
+                Text = value,
+                Foreground = Brush(brush),
+                FontFamily = new FontFamily("Consolas"),
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+            });
+
+            lines.Children.Add(row);
+        }
+
+        Line("IN", _markIn is { } i ? Stamp(i) : "--:--:--:--", "Ok");
+        Line("OUT", _markOut is { } o ? Stamp(o) : "--:--:--:--", "Ok");
+
+        if (_markIn is { } a && _markOut is { } b && b > a)
+            Line("DUR", $"{new Timecode(b - a, _rate)}  ({b - a:N0} f)", "Tc");
+
+        var card = new Border
+        {
+            Child = lines,
+            Background = new SolidColorBrush(Color.FromArgb(0xE6, 0x10, 0x16, 0x1D)),
+            BorderBrush = Brush("Ok"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(7, 4, 7, 4),
+            IsHitTestVisible = false,
+        };
+
+        card.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+        double cardWidth = card.DesiredSize.Width;
+
+        // Over the middle of what is marked and on screen; at the right edge when none of it is.
+        double? x1 = _markIn is { } mi ? TimelineZoom.XOf(mi, start, span, width) : null;
+        double? x2 = _markOut is { } mo ? TimelineZoom.XOf(mo, start, span, width) : null;
+
+        double centre = (x1, x2) switch
+        {
+            ({ } p, { } q) => (p + q) / 2,
+            ({ } p, null) => p,
+            (null, { } q) => q,
+            _ => width,
+        };
+
+        Canvas.SetLeft(card, Math.Clamp(centre - cardWidth / 2, 2, Math.Max(2, width - cardWidth - 2)));
+        Canvas.SetTop(card, 4);
+        TrackCanvas.Children.Add(card);
+    }
+
+    /// <summary>
     /// The bookmarks in the window: an amber line each, named where there is room to name them.
     ///
     /// Amber because the two colours already on this timeline mean something that must not be
@@ -2942,13 +4760,30 @@ public partial class LiveEditWindow : Window
         // the rest are reachable on hover. Zooming in further spreads them out and they appear.
         bool named = span / Math.Max(1.0, width) < _rate;
 
-        double lastLabelRight = double.NegativeInfinity;
-
         var amber = Brush("Warn");
 
-        foreach (Bookmark mark in _bookmarks.Between(start, start + span))
+        // Every visible bookmark's position worked out first, because a label's width has to be
+        // decided from the room between it and the <i>next</i> one - which cannot be known while
+        // drawing them one at a time. That is what was wrong before: each label was measured at
+        // its natural width and simply skipped if it collided, so two close bookmarks showed one
+        // label and a gap, and a long note next to a short one still ran over it.
+        List<(Bookmark Mark, double X)> visible = _bookmarks
+            .Between(start, start + span)
+            .Select(m => (Mark: m, X: TimelineZoom.XOf(m.Frame, start, span, width)))
+            .Where(p => p.X is not null)
+            .Select(p => (p.Mark, X: p.X!.Value))
+            .OrderBy(p => p.X)
+            .ToList();
+
+        // Two rows to write on, alternating, so a pair closer together than one label is wide
+        // can still both be read. The row a label goes on is decided by whether the one before
+        // it on that row has finished.
+        double[] rowRight = { double.NegativeInfinity, double.NegativeInfinity };
+        double[] rowTop = { 42, 55 };
+
+        for (int i = 0; i < visible.Count; i++)
         {
-            if (TimelineZoom.XOf(mark.Frame, start, span, width) is not { } x) continue;
+            (Bookmark mark, double x) = visible[i];
 
             string tip = $"{Stamp(mark.Frame)}  -  {mark.Label}";
 
@@ -2974,34 +4809,114 @@ public partial class LiveEditWindow : Window
                 ToolTip = tip,
             });
 
-            if (!named || x < lastLabelRight) continue;
+            if (!named) continue;
 
-            // Measured so the next one knows where this ends. A fixed width would either waste
-            // room on "cut" or clip "the guest named a minor".
+            // The first row whose last label has ended before this one starts. Neither free
+            // means there is genuinely no room, and the note stays on the tooltip rather than
+            // being printed over a neighbour.
+            int row = x >= rowRight[0] ? 0 : x >= rowRight[1] ? 1 : -1;
+
+            if (row < 0) continue;
+
+            // How much room there is before the next bookmark that will want the same row -
+            // which is the next-but-one when both rows are in use. The label is capped to that,
+            // so a long note beside a close neighbour is truncated with an ellipsis instead of
+            // running across it.
+            double nextOnThisRow = double.PositiveInfinity;
+
+            for (int j = i + 1; j < visible.Count; j++)
+            {
+                // A following bookmark will take row 0 if it can, so the one that will collide
+                // with this row is the first one far enough right to land here again.
+                if (j - i > 2) break;
+
+                if ((j - i) % 2 == 1 && row == 0) continue;
+
+                nextOnThisRow = visible[j].X;
+                break;
+            }
+
+            double room = Math.Min(nextOnThisRow - x - 8, width - x - 8);
+
+            // Below this there is no room for even a few characters, so nothing is written.
+            if (room < 26) continue;
+
+            double cap = Math.Min(170, room);
+
             var label = new TextBlock
             {
                 Text = mark.Label,
                 Foreground = amber,
                 FontSize = 9.5,
                 FontFamily = new FontFamily("Consolas"),
-                MaxWidth = 170,
+                MaxWidth = cap,
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 ToolTip = tip,
             };
 
-            label.Measure(new Size(170, double.PositiveInfinity));
+            label.Measure(new Size(cap, double.PositiveInfinity));
 
-            double text = Math.Min(170, label.DesiredSize.Width);
+            double text = Math.Min(cap, label.DesiredSize.Width);
 
-            // Above the frame counts on the clip blocks, and flipped to the left of its line
-            // near the right edge so it is not clipped off the canvas.
-            bool flip = x + 5 + text > width;
-
-            Canvas.SetLeft(label, flip ? Math.Max(0, x - text - 4) : x + 5);
-            Canvas.SetTop(label, 42);
+            Canvas.SetLeft(label, x + 5);
+            Canvas.SetTop(label, rowTop[row]);
             TrackCanvas.Children.Add(label);
 
-            lastLabelRight = (flip ? x : x + 5 + text) + 6;
+            rowRight[row] = x + 5 + text + 6;
+        }
+    }
+
+    /// <summary>
+    /// Where frames were lost, marked in black.
+    ///
+    /// Black because the other three colours on this timeline are taken and each means something
+    /// an operator acts on — green is the range an export is cut from, amber is an editorial
+    /// note, red is where the transmitter is. A loss is none of those: it is a fact about the
+    /// material, and black against a dark timeline reads as an absence rather than as a thing to
+    /// do something about.
+    ///
+    /// Two kinds, drawn the same but labelled apart: frames the encoder never wrote, which is a
+    /// hole in the recording, and frames the transmitter repeated or skipped, which is not. The
+    /// tooltip says which, because "there is a drop here" is only half an answer.
+    /// </summary>
+    private void DrawDrops(double width, long start, long span, double height)
+    {
+        // Every day this ruler reaches into, so a drop after midnight on a recording that ran on
+        // past it is marked where it happened.
+        IEnumerable<DropMark> drops = Enumerable.Range(0, (int)((_dayFrames - 1) / _oneDay) + 1)
+            .SelectMany(d => DropMarks.Shared.On(_day.AddDays(d)));
+
+        foreach (DropMark drop in drops)
+        {
+            long frame = FrameOn(drop.At);
+
+            if (frame < start || frame > start + span) continue;
+
+            if (TimelineZoom.XOf(frame, start, span, width) is not { } x) continue;
+
+            string tip = $"{Stamp(frame)}  -  {drop.Label}";
+
+            // Drawn from the foot upwards rather than the full height, so a loss cannot be
+            // mistaken for a bookmark at a glance and does not hide the picture behind it.
+            TrackCanvas.Children.Add(new Rectangle
+            {
+                Width = 2,
+                Height = Math.Max(8, height / 3),
+                Fill = Brushes.Black,
+                Margin = new Thickness(x, height - Math.Max(8, height / 3), 0, 0),
+                ToolTip = tip,
+            });
+
+            // A two-pixel mark cannot be hovered deliberately, so a transparent strip over it
+            // carries the tooltip - transparent and not null, or it is not hit-testable at all.
+            TrackCanvas.Children.Add(new Rectangle
+            {
+                Width = 11,
+                Height = Math.Max(8, height / 3),
+                Fill = Brushes.Transparent,
+                Margin = new Thickness(Math.Max(0, x - 4.5), height - Math.Max(8, height / 3), 0, 0),
+                ToolTip = tip,
+            });
         }
     }
 

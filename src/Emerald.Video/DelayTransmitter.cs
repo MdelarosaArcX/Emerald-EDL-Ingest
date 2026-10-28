@@ -72,6 +72,9 @@ public sealed class DelayTransmitter : IDisposable
     private readonly VideoFormat _format;
     private readonly TimeSpan _delay;
 
+    /// <summary>The delay in frames - this transmitter's, whatever size the line it reads is.</summary>
+    private readonly long _targetFrames;
+
     private Thread? _worker;
     private CancellationTokenSource? _cts;
 
@@ -105,6 +108,7 @@ public sealed class DelayTransmitter : IDisposable
         _line = line;
         _format = format!;
         _delay = delay;
+        _targetFrames = (long)Math.Ceiling(delay.TotalSeconds * _format.FrameRate);
         _segmentFrames = segmentSeconds > 0 ? (long)segmentSeconds * _format.FrameRate : 0;
 
         _line.AddRef();
@@ -158,7 +162,13 @@ public sealed class DelayTransmitter : IDisposable
         int next = 0;
         DelayFrameBuffer? onAir = null;
 
-        long readSeq = 0;
+        // The target is this transmitter's own delay, not the line's size: a line the capture deck
+        // keeps filling for as long as it records can be far longer than the delay asked for.
+        long target = _targetFrames;
+
+        // Where the delay already is, when the line has been filling since before this was armed:
+        // straight on air, the delay behind the recorder, rather than black while it fills again.
+        long readSeq = Math.Max(0, _line.FramesWritten - target);
         long segmentOnAir = 0;
         bool firstPictureSaid = false;
         var phase = DelayPhase.Opening;
@@ -184,14 +194,14 @@ public sealed class DelayTransmitter : IDisposable
                 long written = _line.FramesWritten;
 
                 PaceAction action = DelayPacer.Decide(
-                    written, readSeq, _line.TargetFrames, _line.SlotCount,
+                    written, readSeq, target, _line.SlotCount,
                     _line.IsSealed, _line.SealedAt, _line.StalledMs, _format.FrameRate);
 
                 switch (action)
                 {
                     case PaceAction.Fill:
                         Announce(ref phase, DelayPhase.Filling,
-                            $"Filling the delay: {written} of {_line.TargetFrames} frames.", written);
+                            $"Filling the delay: {written} of {target} frames.", written);
 
                         if (!output.PushFrame(black)) return;
                         continue;
@@ -211,7 +221,7 @@ public sealed class DelayTransmitter : IDisposable
                         // have been overwritten. This is a visible cut, and the operator has
                         // to know the delay was re-established rather than maintained.
                         Counters.Resyncs++;
-                        readSeq = Math.Max(0, written - _line.TargetFrames);
+                        readSeq = Math.Max(0, written - target);
                         Announce(ref phase, DelayPhase.OnAir,
                             $"Fell behind the recorder and re-established the delay - " +
                             $"there is a cut in the output. ({Counters.Resyncs} so far.)", written);
@@ -263,9 +273,11 @@ public sealed class DelayTransmitter : IDisposable
                     return;
                 }
 
-                // The frame just sent is readSeq frames into the recording. What that means
+                // The frame just sent is this far into the recording - counted by the recorder,
+                // not by the line, which may have been opened part-way through. What that means
                 // for the operator is said here, before the counters move on.
-                AnnounceRecordingPosition(readSeq, ref segmentOnAir);
+                AnnounceRecordingPosition(into.RecordingFrame, ref segmentOnAir);
+                PipelineState.Shared.SetAiredFrame(into.RecordingFrame);
 
                 onAir = into;
                 next ^= 1;
@@ -285,7 +297,7 @@ public sealed class DelayTransmitter : IDisposable
                 // is said as what it is.
                 string onAirText = firstPictureSaid
                     ? "On air."
-                    : $"On air: the first picture of the recording is now on {Ports} of " +
+                    : $"On air: the recording is now going out on {Ports} of " +
                       $"board {_boardIndex}, {Describe(_delay)} behind the receiver. " +
                       "The playback deck's RX is showing it.";
 
@@ -302,7 +314,7 @@ public sealed class DelayTransmitter : IDisposable
                 if (Counters.FramesOut % _format.FrameRate == 0)
                 {
                     Report(phase, "", written);
-                    PublishCounts(readSeq, written);
+                    PublishCounts(into.RecordingFrame, written);
                 }
             }
         }
@@ -352,9 +364,12 @@ public sealed class DelayTransmitter : IDisposable
     /// the frame of the recording they happened at, rate-limited to one line every five
     /// seconds so a receiver that has gone away does not narrate every frame of its absence.
     /// </summary>
-    private void PublishCounts(long readSeq, long written)
+    private void PublishCounts(long recordingFrame, long written)
     {
-        PipelineState.Shared.SetAired(Counters.FramesOut, Counters.Repeats, Counters.Skips, Counters.Resyncs);
+        // Where the transmitter has actually got to in the recording - the number
+        // the on-air marker should be drawn from, rather than one worked out from the clock.
+        PipelineState.Shared.SetAired(Counters.FramesOut, Counters.Repeats, Counters.Skips,
+                                      Counters.Resyncs, onAirFrame: recordingFrame);
 
         long repeats = Counters.Repeats - _repeatsSaid;
         long skips = Counters.Skips - _skipsSaid;
@@ -366,16 +381,21 @@ public sealed class DelayTransmitter : IDisposable
         _repeatsSaid = Counters.Repeats;
         _skipsSaid = Counters.Skips;
 
-        var at = new Timecode(readSeq, _format.FrameRate);
+        // Marked on the timeline too. This kind is not a hole in the recording - the material is
+        // all there - but it is a moment when what went out was not quite what was recorded, and
+        // that is worth being able to point at.
+        DropMarks.Shared.Add(DateTime.Now, (int)(skips + repeats), DropKind.OnAir);
+
+        var at = new Timecode(recordingFrame, _format.FrameRate);
 
         ActivityLog.Shared.Warn(LogSource.TidalLock,
-            $"DROP  on air at frame {readSeq} of the recording ({at}): " +
+            $"DROP  on air at frame {recordingFrame} of the recording ({at}): " +
             (skips > 0 ? $"{skips} frame(s) skipped to hold the delay" : "") +
             (skips > 0 && repeats > 0 ? ", " : "") +
             (repeats > 0 ? $"{repeats} frame(s) repeated because nothing new had arrived" : "") +
             $". {Counters.FramesOut} out of {written} recorded so far; {Counters}.",
             @event: "delay.trouble",
-            detail: $"frame {readSeq}\nskipped now {skips}\nrepeated now {repeats}\n" +
+            detail: $"frame {recordingFrame}\nskipped now {skips}\nrepeated now {repeats}\n" +
                     $"skipped total {Counters.Skips}\nrepeated total {Counters.Repeats}\n" +
                     $"resyncs {Counters.Resyncs}\naired {Counters.FramesOut}\nrecorded {written}");
     }
@@ -502,7 +522,7 @@ public sealed class DelayTransmitter : IDisposable
                 @event: $"delay.{phase.ToString().ToLowerInvariant()}");
         }
 
-        Status?.Invoke(new DelayStatus(phase, message, buffered, _line.TargetFrames, Counters.FramesOut));
+        Status?.Invoke(new DelayStatus(phase, message, buffered, _targetFrames, Counters.FramesOut));
     }
 
     public void Dispose() => Stop();

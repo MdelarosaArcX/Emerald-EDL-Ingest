@@ -88,7 +88,13 @@ public sealed class AudioSource : IDisposable
     /// the same file. Left at -1, ffmpeg picks the file's own preferred track, which is what
     /// a standalone audio file wants.
     /// </summary>
-    public static AudioSource Open(string ffmpegPath, string mediaPath, int frameRate, int streamIndex = -1)
+    /// <param name="seek">
+    /// Where in the file to start, for a cue that begins part-way into its media. Unlike the
+    /// offset this class otherwise works with, this one is fixed for the life of the source.
+    /// </param>
+    /// <param name="speed">The rate to play at, 1 being the file's own - fit-to-fill's stretch.</param>
+    public static AudioSource Open(string ffmpegPath, string mediaPath, int frameRate, int streamIndex = -1,
+                                   TimeSpan? seek = null, double speed = 1)
     {
         // Every rate the app outputs divides 48000 exactly, so a frame is a whole number of
         // samples and audio cannot drift against picture.
@@ -105,7 +111,30 @@ public sealed class AudioSource : IDisposable
         info.ArgumentList.Add("-hide_banner");
         info.ArgumentList.Add("-loglevel"); info.ArgumentList.Add("error");
         info.ArgumentList.Add("-nostdin");
+
+        if (seek is { TotalSeconds: > 0 } start)
+        {
+            info.ArgumentList.Add("-ss");
+            info.ArgumentList.Add(start.TotalSeconds.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
+        }
+
         info.ArgumentList.Add("-i"); info.ArgumentList.Add(mediaPath);
+
+        // atempo takes 0.5 to 2 in one step, so a stretch outside that is a chain of them. It
+        // changes the speed without changing the pitch, which is what a fit-to-fill wants: the
+        // item is the same programme, a little faster.
+        if (Math.Abs(speed - 1) > 0.0001 && speed > 0)
+        {
+            var steps = new List<string>();
+            double left = speed;
+
+            while (left > 2) { steps.Add("atempo=2"); left /= 2; }
+            while (left < 0.5) { steps.Add("atempo=0.5"); left /= 0.5; }
+
+            steps.Add($"atempo={left.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)}");
+
+            info.ArgumentList.Add("-af"); info.ArgumentList.Add(string.Join(",", steps));
+        }
 
         // -map before -vn: naming the stream explicitly overrides ffmpeg's default choice,
         // which is the loudest/most-channels track and not necessarily the one wanted.

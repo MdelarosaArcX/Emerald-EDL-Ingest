@@ -81,6 +81,14 @@ public partial class ShellWindow : Window
     /// <summary>The pair count last acted on, so the added tracks are renumbered when it moves.</summary>
     private int _pairsSeen = -1;
 
+    /// <summary>
+    /// The pair count as the record should see it: only once it has stopped moving.
+    ///
+    /// Two seconds, which is longer than any flicker caused by a pause in the audio and far
+    /// shorter than the time it takes an operator to notice a language has gone.
+    /// </summary>
+    private readonly Settled<int> _pairsReported = new(TimeSpan.FromSeconds(2));
+
     /// <summary>The application's one clock. This window joins it; it never owns it.</summary>
     private readonly TimecodeService _timecode = TimecodeLink.Service;
     private readonly ObservableCollection<ClipItem> _clips = new();
@@ -118,6 +126,9 @@ public partial class ShellWindow : Window
     // Recorder
     private bool _recording;
     private DateTime _recordStartedUtc;
+
+    /// <summary>When this recording rolled, local time, as its folder is named.</summary>
+    private DateTime _recordRolledAt;
     private TimeSpan? _recordLimit;
 
     // Bumped whenever the strip is rebuilt, so thumbnails from a previous pass are dropped
@@ -145,13 +156,21 @@ public partial class ShellWindow : Window
 
         _capture.Message += OnCaptureMessage;
         _capture.PreviewFrame += OnCapturePreviewFrame;
+
+        // The same picture, for Live Edit's big screen. Its number is the frame being shown:
+        // the count goes up only after the preview of that frame has been handed out.
+        _capture.PreviewFrame += (bgra, width, height) =>
+            RecordingPicture.Shared.Offer(bgra, width, height, _capture.FramesRecorded);
+
         _capture.Audio += _audio.Push;
         _capture.Finished += OnCaptureFinished;
         _capture.FormatDetected += OnCaptureFormat;
+        _capture.Rolled += OnCaptureRolled;
 
         // Armed and disarmed on the playback deck, acted on here - this is the side that
         // holds the receiver and therefore the only side that can open a delay line.
         TidalLock.Shared.Changed += OnTidalLockChanged;
+        LiveAir.Shared.Changed += OnLiveAirChanged;
 
         ClipStrip.ItemsSource = _clips;
         AudioTrackRows.ItemsSource = _audioPairs;
@@ -169,6 +188,7 @@ public partial class ShellWindow : Window
         VideoBitrateCombo.ItemsSource = RecordingProfile.ProxyBitrates;
         AudioBitrateCombo.ItemsSource = RecordingProfile.AudioBitrates;
         SampleRateCombo.ItemsSource = RecordingProfile.SampleRates;
+        SegmentCombo.ItemsSource = RecordingProfile.SegmentLengths;
         StorageLimitCombo.ItemsSource = StorageLimits;
 
         _clock.Tick += OnClockTick;
@@ -476,6 +496,7 @@ public partial class ShellWindow : Window
         Select(VideoBitrateCombo, RecordingProfile.ProxyBitrates, profile.ProxyBitrateKbps);
         Select(AudioBitrateCombo, RecordingProfile.AudioBitrates, profile.AudioBitrateKbps);
         Select(SampleRateCombo, RecordingProfile.SampleRates, profile.AudioSampleRate);
+        Select(SegmentCombo, RecordingProfile.SegmentLengths, profile.SegmentSeconds);
 
         _loading = wasLoading;
         ShowProfile(profile);
@@ -490,7 +511,7 @@ public partial class ShellWindow : Window
         ProxyBitrateKbps: Value(VideoBitrateCombo, RecordingProfile.Default.ProxyBitrateKbps),
         AudioBitrateKbps: Value(AudioBitrateCombo, RecordingProfile.Default.AudioBitrateKbps),
         AudioSampleRate: Value(SampleRateCombo, RecordingProfile.Default.AudioSampleRate),
-        SegmentSeconds: _settings.RecordingSegmentSeconds);
+        SegmentSeconds: Value(SegmentCombo, RecordingProfile.Default.SegmentSeconds));
 
     private static T Value<T>(ComboBox box, T fallback) =>
         box.SelectedItem is RecordingOption<T> option ? option.Value : fallback;
@@ -506,6 +527,15 @@ public partial class ShellWindow : Window
         RecordingProfile profile = CurrentProfile();
         profile.ApplyTo(_settings);
         _settings.CaptureFrameRate = SelectedRate();
+
+        // A segment length chosen here is a decision, and the settings migration that moves the
+        // old two-minute default to thirty seconds must leave it alone. Saved straight away,
+        // because Live Edit reads the settings file for it and should not wait for this deck to close.
+        if (ReferenceEquals(sender, SegmentCombo))
+        {
+            _settings.RecordingSegmentChosen = true;
+            _settings.Save();
+        }
 
         ShowProfile(profile);
 
@@ -527,7 +557,7 @@ public partial class ShellWindow : Window
         string proxy = profile.ProxyBitrateKbps > 0 ? $"{profile.ProxyBitrateKbps}k" : "auto";
 
         ProfileNote.Text =
-            $"{profile.SegmentSeconds / 60} min segments, written twice  ·  " +
+            $"{RecordingProfile.Label(RecordingProfile.SegmentLengths, profile.SegmentSeconds)} segments, written twice  ·  " +
             $"low\\ half-size {RecordingProfile.LowRes.VideoLabel} {proxy}  ·  " +
             $"high\\ {RecordingProfile.HighRes.VideoLabel}  ·  " +
             $"{RecordingProfile.AudioLabel} {profile.AudioBitrateKbps}k " +
@@ -1009,6 +1039,14 @@ public partial class ShellWindow : Window
         _recordLimit = ParseSetDuration(SelectedRate());
         _recordStartedUtc = DateTime.UtcNow;
 
+        // Read back from the folder name rather than kept from the clock, so it is exactly the
+        // moment Live Edit will place this recording at, to the same precision.
+        _recordRolledAt = RecordingSequence.FolderStartedAt(naming.Folder) ?? rolledAt;
+
+        // The last recording's start, until this one's receiver says what rate to count it in.
+        PipelineState.Shared.RecordingStart = null;
+        PipelineState.Shared.RecordingStartedAt = null;
+
         // Nothing to arrange here any more. OnCaptureFormat is always subscribed and opens
         // the line itself once the receiver reports what it locked to, whether tidal lock was
         // armed before this recording or part-way through it.
@@ -1037,6 +1075,9 @@ public partial class ShellWindow : Window
         // From here the store is watched for each segment as it is finished, and every one
         // is written down with its length and its size under this session.
         _segments = new SegmentWatch(folder, request.NamePrefix, _recordStartedUtc, naming.Folder);
+        _previousSegments = null;
+        _segmentRoot = folder;
+        _segmentPrefix = request.NamePrefix;
         _segmentSession = _capture.SessionId;
         _segmentRate = SelectedRate();
 
@@ -1070,6 +1111,20 @@ public partial class ShellWindow : Window
         if (!DelayFormats.TryMatch(format, out _, out string? why))
         {
             TidalLock.Shared.Fail(why!);
+            return;
+        }
+
+        // A start from the first segment is a delay settled now, against what is recorded.
+        if (TidalLock.Shared.Start != DelayStart.Fixed)
+            TidalLock.Shared.Resolve(ResolveStart(TidalLock.Shared.Start, TimeSpan.Zero, format.FrameRate, "Tidal lock"));
+
+        // The line that has been filling since the recording began, when it holds this delay:
+        // the transmitter starts a delay behind the recorder straight away, rather than sending
+        // black while a new line fills.
+        if (TakeReadyLine(TidalLock.Shared.Delay) is { } ready)
+        {
+            _delayLine = ready;
+            TidalLock.Shared.RecordingRolled(ready, LineStartedAt(ready));
             return;
         }
 
@@ -1120,6 +1175,15 @@ public partial class ShellWindow : Window
 
         _delayLine = null;
 
+        // The ready line is shared and outlives this lock: it is sealed when the recording stops
+        // (ReleaseReadyLine), not when a lock lets go of it. Only this lock's claim on it goes.
+        if (ReferenceEquals(line, _readyLine))
+        {
+            TidalLock.Shared.RecordingStopped();
+            _ = Task.Run(line.Release);
+            return;
+        }
+
         _capture.Frame -= line.Offer;
         _capture.ReportDelayDrops(null);
         line.Seal();
@@ -1147,6 +1211,266 @@ public partial class ShellWindow : Window
         });
     }
 
+    // ------------------------------------------------------------------ the ready line
+
+    /// <summary>
+    /// A delay line that fills for as long as the deck records, whether anything is armed or not.
+    ///
+    /// <b>Why.</b> A line made at the moment of arming starts empty, so tidal lock and Go Live
+    /// both used to send black for the whole delay before anything went to air - two minutes of
+    /// black for a two-minute delay, on a recording that had been running for an hour and had
+    /// those two minutes in hand all along. With this line already full, arming puts the picture
+    /// to air at once, a delay behind the recorder. Only a recording younger than the delay
+    /// still has to wait, because then the media genuinely is not there yet.
+    ///
+    /// <b>Shared.</b> The playback deck's lock and Live Edit's read it side by side, each its own
+    /// distance behind. It is reference counted: this deck holds one claim, each lock that takes
+    /// it another, each transmitter its own, and it is deleted when the last lets go.
+    /// </summary>
+    private DelayLine? _readyLine;
+
+    /// <summary>
+    /// Sizes to try, longest first: enough for the longest delay the playback deck offers or
+    /// for what Live Edit last went live with, room for inserts included - whichever is more -
+    /// and then smaller, for a disk that cannot hold that.
+    /// </summary>
+    private IEnumerable<TimeSpan> ReadySizes() =>
+        new[]
+        {
+            Math.Max(300, _settings.LiveDelaySeconds + _settings.LiveHeadroomSeconds),
+            300,
+            120,
+        }
+        .Distinct()
+        .OrderByDescending(s => s)
+        .Select(s => TimeSpan.FromSeconds(s));
+
+    private void OpenReadyLine(CaptureFormat format)
+    {
+        if (!_settings.KeepDelayReady || _readyLine is not null || !_capture.IsRunning) return;
+
+        // A format the transmitter cannot send is not worth keeping ready.
+        if (!DelayFormats.TryMatch(format, out _, out _)) return;
+
+        string? problem = null;
+
+        foreach (TimeSpan size in ReadySizes())
+        {
+            try
+            {
+                _readyLine = DelayLine.Create(App.TidalLockRingFolder(_settings), format, size);
+                break;
+            }
+            catch (DelayLineException ex)
+            {
+                problem = ex.Message;
+            }
+        }
+
+        if (_readyLine is not { } line)
+        {
+            ActivityLog.Shared.Warn(LogSource.Capture,
+                $"DELAY  no delay is being kept ready ({problem}) - tidal lock and Go Live will fill " +
+                "their delay from when they are armed.",
+                @event: "delay.readyfailed", correlation: _capture.SessionId);
+            return;
+        }
+
+        _capture.Frame += line.Offer;
+        _capture.ReportDelayDrops(() => line.Dropped);
+        RecordingPicture.Shared.Line = line;
+
+        ActivityLog.Shared.Info(LogSource.Capture,
+            $"DELAY  the last {TidalLock.Describe(TimeSpan.FromSeconds(line.TargetFrames / (double)line.FrameRate))} " +
+            "of the recording is kept ready, so tidal lock and Go Live go to air as soon as they are armed.",
+            @event: "delay.ready", correlation: _capture.SessionId, file: line.Path);
+    }
+
+    /// <summary>
+    /// The ready line, with a claim taken on it for a lock - when there is one and it holds
+    /// <paramref name="needs"/>. Null otherwise, and the lock makes a line of its own.
+    /// </summary>
+    private DelayLine? TakeReadyLine(TimeSpan needs)
+    {
+        if (_readyLine is not { } ready || ready.IsSealed) return null;
+
+        long frames = (long)Math.Ceiling(needs.TotalSeconds * ready.FrameRate);
+        if (ready.TargetFrames < frames) return null;
+
+        ready.AddRef();
+        return ready;
+    }
+
+    /// <summary>
+    /// The delay that starts a transmission at the recording's first frame - now, or once the
+    /// first segment is recorded - worked out against the ready line, which is the one line that
+    /// holds the recording from its beginning.
+    ///
+    /// Without it, the line a lock makes for itself begins when it is armed, so "the first
+    /// frame" can only mean that moment: from the first segment is then no delay, and when it is
+    /// ready is a segment's length.
+    /// </summary>
+    /// <param name="headroom">Room a line must keep spare for inserts; it shortens how far back it reaches.</param>
+    private TimeSpan ResolveStart(DelayStart start, TimeSpan headroom, int rate, string who)
+    {
+        DelayLine? ready = _readyLine is { IsSealed: false } r ? r : null;
+
+        long written = ready?.FramesWritten ?? 0;
+        long segment = (long)Math.Max(1, _settings.RecordingSegmentSeconds) * rate;
+        long reach = ready is null
+            ? long.MaxValue
+            : ready.TargetFrames - (long)Math.Ceiling(headroom.TotalSeconds * rate);
+
+        long frames = TidalLock.FramesFor(start, 0, written, segment, reach);
+        var delay = new Timecode(frames, rate);
+
+        string said = written > reach
+            ? $"{who} starts {delay} behind - the first segment is no longer held (only the last " +
+              $"{new Timecode(reach, rate)} is), so it starts from the oldest frame there is."
+            : written >= segment || start == DelayStart.FromFirstSegment
+                ? $"{who} starts from the first segment of the recording, {delay} behind the recorder."
+                : $"{who} starts from the first segment once it is recorded - on air in " +
+                  $"{new Timecode(Math.Max(0, frames - written), rate)}, {delay} behind.";
+
+        ActivityLog.Shared.Info(LogSource.Capture, said, @event: "delay.fromstart", correlation: _capture.SessionId);
+
+        return TimeSpan.FromSeconds(frames / (double)rate);
+    }
+
+    /// <summary>The station time the line's first frame was taken at, for the lock's log line.</summary>
+    private Timecode? LineStartedAt(DelayLine line) =>
+        _timecode.TryGetCurrent(out Timecode now) ? now.AddWrapping(-line.FramesWritten) : null;
+
+    /// <summary>The recording has stopped: no more frames, so whatever is reading it plays out and finishes.</summary>
+    private void ReleaseReadyLine()
+    {
+        if (_readyLine is not { } line) return;
+
+        _readyLine = null;
+        RecordingPicture.Shared.Line = null;
+
+        _capture.Frame -= line.Offer;
+        _capture.ReportDelayDrops(null);
+        line.Seal();
+
+        _ = Task.Run(() =>
+        {
+            try { line.Release(); }
+            catch (Exception ex)
+            {
+                ActivityLog.Shared.Warn(LogSource.Capture,
+                    $"The ready delay line did not close cleanly: {ex.Message}", @event: "delay.releasefailed");
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------ Live Edit's line
+
+    /// <summary>
+    /// The delay line Live Edit goes live from - a second line, beside tidal lock's rather than
+    /// instead of it, so the playback deck's delay and Live Edit's never share a ring or a state.
+    /// </summary>
+    private DelayLine? _liveLine;
+
+    private void OnLiveAirChanged(LiveAir air)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            switch (air.State)
+            {
+                case LiveAirState.Armed when _liveLine is null:
+                    TryOpenLiveLine();
+                    break;
+
+                case LiveAirState.Off or LiveAirState.Failed:
+                    ReleaseLiveLine();
+                    break;
+            }
+        });
+    }
+
+    /// <summary>
+    /// Opens Live Edit's line if it has asked for one and there is a recording to feed it.
+    /// Idempotent, and called from both directions - going live and then recording, or recording
+    /// and then going live.
+    /// </summary>
+    private void TryOpenLiveLine()
+    {
+        if (LiveAir.Shared.State != LiveAirState.Armed) return;
+        if (_liveLine is not null) return;
+        if (!_capture.IsRunning || _captureFormat is not { } format) return;
+
+        if (!DelayFormats.TryMatch(format, out _, out string? why))
+        {
+            LiveAir.Shared.Fail(why!);
+            return;
+        }
+
+        if (LiveAir.Shared.Start != DelayStart.Fixed)
+            LiveAir.Shared.Resolve(ResolveStart(LiveAir.Shared.Start, LiveAir.Shared.Headroom, format.FrameRate, "Go Live"));
+
+        // Straight on air from the line that has been filling all along, when it has room for the
+        // delay and for the inserts to grow it into.
+        if (TakeReadyLine(LiveAir.Shared.Delay + LiveAir.Shared.Headroom) is { } ready)
+        {
+            _liveLine = ready;
+            LiveAir.Shared.RecordingRolled(ready, PipelineState.Shared.RecordingStartedAt);
+            return;
+        }
+
+        DelayLine line;
+
+        try
+        {
+            line = DelayLine.Create(App.TidalLockRingFolder(_settings), format,
+                                    LiveAir.Shared.Delay, LiveAir.Shared.Headroom);
+        }
+        catch (DelayLineException ex)
+        {
+            LiveAir.Shared.Fail(ex.Message);
+            return;
+        }
+
+        _liveLine = line;
+        _capture.Frame += line.Offer;
+
+        LiveAir.Shared.RecordingRolled(line, PipelineState.Shared.RecordingStartedAt);
+    }
+
+    /// <summary>
+    /// Lets go of Live Edit's line. Sealed, so the transmitter plays out what is in it, and
+    /// released off the UI thread for the same reason as tidal lock's - closing a ring is a
+    /// join and the deletion of a large file.
+    /// </summary>
+    private void ReleaseLiveLine()
+    {
+        if (_liveLine is not { } line) return;
+
+        _liveLine = null;
+
+        if (ReferenceEquals(line, _readyLine))
+        {
+            LiveAir.Shared.RecordingStopped();
+            _ = Task.Run(line.Release);
+            return;
+        }
+
+        _capture.Frame -= line.Offer;
+        line.Seal();
+
+        LiveAir.Shared.RecordingStopped();
+
+        _ = Task.Run(() =>
+        {
+            try { line.Release(); }
+            catch (Exception ex)
+            {
+                ActivityLog.Shared.Warn(LogSource.Capture,
+                    $"Live Edit's delay line did not close cleanly: {ex.Message}", @event: "liveair.releasefailed");
+            }
+        });
+    }
+
     private async void StopRecording()
     {
         if (!_recording && !_capture.IsRunning) return;
@@ -1169,6 +1493,8 @@ public partial class ShellWindow : Window
         await Task.Run(() => _capture.Stop());
 
         ReleaseDelayLine();
+        ReleaseLiveLine();
+        ReleaseReadyLine();
 
         UpdateRecordUi();
         RefreshClips();
@@ -1192,8 +1518,9 @@ public partial class ShellWindow : Window
         RecordText.Foreground = (Brush)FindResource(live ? "IpMint" : "IpText");
         StopRecordButton.Foreground = (Brush)FindResource(live ? "IpText" : "IpMuted");
 
-        // The receiver cannot be moved out from under a running recording.
-        BoardBox.IsEnabled = PortBox.IsEnabled = !live;
+        // The receiver cannot be moved out from under a running recording, and neither can the
+        // segment length: the encoder is told it once, when it starts.
+        BoardBox.IsEnabled = PortBox.IsEnabled = SegmentCombo.IsEnabled = !live;
     }
 
     private void OnCaptureMessage(string text, bool problem) =>
@@ -1212,6 +1539,8 @@ public partial class ShellWindow : Window
     /// </summary>
     private void OnCaptureFinished(CaptureResult result)
     {
+        RecordingPicture.Shared.Clear();
+
         string length = result.Format is { } format && format.FrameRate > 0
             ? new Timecode(result.Frames, format.FrameRate).ToString()
             : $"{result.Frames} frames";
@@ -1234,6 +1563,7 @@ public partial class ShellWindow : Window
         // is the one look that can see it. Then the watch is done with.
         AnnounceSegments();
         _segments = null;
+        _previousSegments = null;
         _segmentSession = null;
 
         _captureFormat = null;
@@ -1259,13 +1589,25 @@ public partial class ShellWindow : Window
     {
         _captureFormat = format;
 
+        // When this recording rolled, as its folder name says - the start Live Edit places every
+        // segment from - counted at the rate the receiver locked to, so a frame number from the
+        // recorder or the transmitter is added to it directly. Not a fresh reading of the
+        // station clock: two starts is how the playback deck and Live Edit came to disagree.
+        PipelineState.Shared.RecordingStart =
+            new Timecode(TimelineZoom.FrameOfDay(_recordRolledAt, format.FrameRate), format.FrameRate);
+        PipelineState.Shared.RecordingStartedAt = _recordRolledAt;
+
         ActivityLog.Shared.Info(LogSource.Capture,
             $"Receiver locked to {format.Name} ({format.Width}x{format.Height} @ {format.FrameRate}).",
             @event: "capture.format", correlation: _capture.SessionId);
 
         // Armed before the recording rolled: this is the moment there is finally a format to
         // size a ring from.
+        // The ready line first - the dispatcher keeps this order - so a lock armed before the
+        // recording rolled takes it rather than making a line of its own.
+        Dispatcher.BeginInvoke(() => OpenReadyLine(format));
         Dispatcher.BeginInvoke(TryOpenDelayLine);
+        Dispatcher.BeginInvoke(TryOpenLiveLine);
     }
 
     /// <summary>
@@ -1320,8 +1662,32 @@ public partial class ShellWindow : Window
     /// back the frames it is already reading, which is what keeps the monitor live across the
     /// handover instead of going dark for the length of the recording.
     /// </summary>
+    /// <summary>1 while a recorded frame is on its way to the UI thread and not yet drawn.</summary>
+    private int _tapInFlight;
+
+    /// <summary>
+    /// The confidence picture while a recording is running, taken from the recorder's own tap.
+    ///
+    /// <b>At most one frame is in flight, and that is the fix for the preview lagging once
+    /// recording starts.</b> Every frame used to be posted to the dispatcher unconditionally.
+    /// When the UI thread was busy — and during a recording it is: two timers, a growing log
+    /// panel, meters — the posts queued without limit, so the picture fell further and further
+    /// behind the receiver and then jumped. That is what a lagging, delayed preview is.
+    ///
+    /// It was also unsafe. There is one tap buffer, overwritten here on the capture thread,
+    /// while queued callbacks had yet to read it: a late frame could be drawn half old and half
+    /// new. With one frame outstanding the single buffer is sound again.
+    ///
+    /// Dropping is right for a monitor. The next frame is 40 ms away and more current than the
+    /// one discarded, and nothing recorded is affected — this is the picture on the glass.
+    ///
+    /// The idle preview went through the same fault and the same fix; this is the other half of
+    /// it, which only runs while recording and so was missed.
+    /// </summary>
     private void OnCapturePreviewFrame(byte[] bgra, int width, int height)
     {
+        if (Interlocked.Exchange(ref _tapInFlight, 1) == 1) return;
+
         // Copied here, on the capture thread, because the recorder reuses its buffers and the
         // write into the bitmap happens a hop later.
         byte[]? buffer = _tapBuffer;
@@ -1333,14 +1699,23 @@ public partial class ShellWindow : Window
 
         Dispatcher.BeginInvoke(() =>
         {
-            if (_tapBitmap is null || _tapBitmap.PixelWidth != width || _tapBitmap.PixelHeight != height)
-                _tapBitmap = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgra32, null);
+            try
+            {
+                if (_tapBitmap is null || _tapBitmap.PixelWidth != width || _tapBitmap.PixelHeight != height)
+                    _tapBitmap = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgra32, null);
 
-            _tapBitmap.WritePixels(new Int32Rect(0, 0, width, height), buffer, width * 4, 0);
+                _tapBitmap.WritePixels(new Int32Rect(0, 0, width, height), buffer, width * 4, 0);
 
-            PreviewImage.Source = _tapBitmap;
-            PreviewPlaceholder.Visibility = Visibility.Collapsed;
-        });
+                PreviewImage.Source = _tapBitmap;
+                PreviewPlaceholder.Visibility = Visibility.Collapsed;
+            }
+            finally
+            {
+                // In a finally: a throw here must not wedge the preview shut for the rest of
+                // the recording.
+                Volatile.Write(ref _tapInFlight, 0);
+            }
+        }, DispatcherPriority.Render);
     }
 
     private void Snapshot_Click(object sender, RoutedEventArgs e)
@@ -1550,6 +1925,37 @@ public partial class ShellWindow : Window
     /// </summary>
     private SegmentWatch? _segments;
 
+    /// <summary>The watch on the day before's folder, once a recording has run past midnight.</summary>
+    private SegmentWatch? _previousSegments;
+
+    /// <summary>The store and file prefix the recording's watch was made with, for the new day's.</summary>
+    private string? _segmentRoot;
+    private string? _segmentPrefix;
+
+    /// <summary>
+    /// The recording has run past midnight and carried on into a folder of the new day. Nothing
+    /// else about it has changed - it is the same recording, the same frame count, the same
+    /// delay - so only the segment watch moves, and the old one is kept for its last segment.
+    /// </summary>
+    private void OnCaptureRolled(RecordingNames names)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (_segments is null || _segmentRoot is not { } folder) return;
+
+            _previousSegments = _segments;
+            _segments = new SegmentWatch(folder, _segmentPrefix ?? "", _recordStartedUtc, names.Folder);
+
+            ActivityLog.Shared.Ok(LogSource.Capture,
+                $"NEW DAY  the recording carries on into folder {names.Folder}, segments from " +
+                $"{names.FirstFile(RecordingProfile.LowRes.Extension)}. Nothing stopped.",
+                @event: "capture.newday",
+                correlation: _capture.SessionId,
+                file: Path.Combine(RecordingProfile.FolderFor(RecordingProfile.LowRes, folder), names.Folder),
+                detail: $"folder {names.Folder}\nfirst number {names.Start}");
+        });
+    }
+
     /// <summary>The session the watch belongs to, so its lines are filed under the right recording.</summary>
     private string? _segmentSession;
 
@@ -1568,14 +1974,18 @@ public partial class ShellWindow : Window
     /// </summary>
     private void AnnounceSegments()
     {
-        if (_segments is not { } watch) return;
+        if (_segments is not { } current) return;
 
         int rate = _segmentRate;
         string? session = _segmentSession;
 
+        // The day before's folder too, after midnight: its last segment is finalised a moment
+        // after the handover, by an encoder closing down in the background.
+        SegmentWatch[] watches = _previousSegments is { } previous ? new[] { previous, current } : new[] { current };
+
         Task.Run(() =>
         {
-            foreach (CompletedSegment segment in watch.Poll())
+            foreach (CompletedSegment segment in watches.SelectMany(w => w.Poll()))
             {
                 string length = segment.Duration is { } d
                     ? new Timecode((long)Math.Round(d.TotalSeconds * rate), rate).ToString()
@@ -1770,25 +2180,43 @@ public partial class ShellWindow : Window
         // The added tracks are numbered after the embedded pairs, so they move when the feed
         // starts or stops carrying a language. The row count no longer changes with it, so the
         // pair count is what this watches.
+        // The rows follow the reading straight away - a panel that lagged two seconds behind the
+        // meters would be its own confusion - but the log does not.
         if (_audio.PairsPresent != _pairsSeen)
         {
-            int was = _pairsSeen;
             _pairsSeen = _audio.PairsPresent;
             RenumberCaptureAudio();
+        }
 
-            // What there is to choose from has changed. Written down because it is the thing
-            // that explains a selection: a language that was not there to pick five minutes
-            // ago, or one that has gone away under a pair still selected. Not on the first
-            // pass, which is the panel filling in rather than the feed changing.
-            if (was >= 0)
-                LogAudio(
-                    $"WIRE  audio pairs on the receiver: {_pairsSeen} of {SdiAudioReader.MaxPairs} " +
-                    $"carrying (was {was})" +
-                    (_recording ? $" - the recording keeps the {_capture.PairsRecording} it started with" : "") + ".",
-                    "capture.audio.detected",
-                    _pairsSeen == 0 ? LogLevel.Warn : LogLevel.Info,
-                    detail: $"pairs now {_pairsSeen}\npairs before {was}\n" +
-                            $"recording {(_recording ? _capture.PairsRecording : 0)}");
+        // What there is to choose from has changed, once it has stopped changing.
+        //
+        // Written down because it is the thing that explains a selection: a language that was
+        // not there to pick five minutes ago, or one that has gone away under a pair still
+        // selected. Written only when it has settled, because a receiver on the edge of
+        // carrying a pair oscillates - observed flapping between one and none twice a second,
+        // filling the capture log with two alternating lines and nothing else.
+        //
+        // The flapping is not hidden. It is the more useful fact of the two, so it is reported
+        // as a count on the line that follows it rather than as one line per edge.
+        int now = _audio.PairsPresent;
+        int before = _pairsReported.Current;
+
+        if (_pairsReported.Offer(now, DateTime.UtcNow))
+        {
+            int flaps = _pairsReported.TakeFlaps();
+
+            LogAudio(
+                $"WIRE  audio pairs on the receiver: {now} of {SdiAudioReader.MaxPairs} " +
+                $"carrying (was {before})" +
+                (_recording ? $" - the recording keeps the {_capture.PairsRecording} it started with" : "") + "." +
+                (flaps > 0
+                    ? $" The count flickered {flaps} time(s) before settling, which means the " +
+                      "receiver is on the edge of carrying that pair."
+                    : ""),
+                "capture.audio.detected",
+                now == 0 ? LogLevel.Warn : LogLevel.Info,
+                detail: $"pairs now {now}\npairs before {before}\nflaps before settling {flaps}\n" +
+                        $"recording {(_recording ? _capture.PairsRecording : 0)}");
         }
 
         bool listening = ListenButton.IsChecked == true;
@@ -1899,6 +2327,7 @@ public partial class ShellWindow : Window
     {
         ClockText.Text = _timecode.TryGetCurrent(out Timecode now) ? now.ToString() : "--:--:--:--";
 
+        ShowRecordingTimecode();
         DrawAudioMeters();
 
         if (_playing)
@@ -1913,6 +2342,29 @@ public partial class ShellWindow : Window
                 SetPlaying(false);
             }
         }
+    }
+
+    /// <summary>
+    /// The timecode being captured: the time of day of the frame the receiver is taking now,
+    /// counted from the recording's first frame rather than read off the clock, so it is the
+    /// recording's own position - and how long it has run.
+    /// </summary>
+    private void ShowRecordingTimecode()
+    {
+        if (!_recording)
+        {
+            RecTcPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        RecTcPanel.Visibility = Visibility.Visible;
+
+        long frames = _capture.FramesRecorded;
+        int rate = _captureFormat?.FrameRate ?? SelectedRate();
+
+        RecTcText.Text = PipelineState.TimecodeOf(PipelineState.Shared.RecordingStart,
+                                                  Math.Max(0, frames - 1))?.ToString() ?? "--:--:--:--";
+        RecElapsedText.Text = $"+{new Timecode(frames, rate)}";
     }
 
     private void OnTick(object? sender, EventArgs e)
@@ -1943,6 +2395,13 @@ public partial class ShellWindow : Window
         if (_recording && !_capture.IsRunning)
         {
             _recording = false;
+
+            // Nothing more is coming, so every delay line is sealed and what is in them plays
+            // out - the same as when the operator stops the recording.
+            ReleaseDelayLine();
+            ReleaseLiveLine();
+            ReleaseReadyLine();
+
             _airborneAudio = null;
             RefreshCaptureAudioState();
             PipelineState.Shared.ClearCapture();
@@ -2085,6 +2544,10 @@ public partial class ShellWindow : Window
         {
             window = create();
 
+            // Every module window, from one place. They live in other assemblies, so this is
+            // where the icon can reach them without each project carrying its own copy of it.
+            AppIcon.ApplyTo(window);
+
             T created = window;
             created.Closed += (_, _) =>
             {
@@ -2122,6 +2585,7 @@ public partial class ShellWindow : Window
         // The clock is the application's, not this window's. Only the subscription is ours.
         TimecodeLink.UrlChanged -= OnTimecodeUrlChanged;
         TidalLock.Shared.Changed -= OnTidalLockChanged;
+        LiveAir.Shared.Changed -= OnLiveAirChanged;
 
         // A static event holds this window for the life of the process otherwise, and every line
         // written after it closes would still run its handler.

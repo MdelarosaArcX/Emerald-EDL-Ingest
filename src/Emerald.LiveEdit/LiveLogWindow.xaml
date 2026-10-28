@@ -1,0 +1,110 @@
+<Window x:Class="Emerald.LiveEdit.LiveLogWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Live Edit - Logs" Width="760" Height="560" MinWidth="520" MinHeight="360"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
+        Background="{StaticResource Bg}">
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="2*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="3*"/>
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0">
+            <TextBlock Text="EDL" Foreground="{StaticResource Ok}" FontSize="13" FontWeight="Bold"/>
+            <TextBlock x:Name="LiveText" HorizontalAlignment="Right" FontFamily="Consolas" FontSize="11.5"
+                       FontWeight="Bold" Foreground="{StaticResource Muted}"/>
+        </Grid>
+
+        <TextBlock Grid.Row="1" Margin="0,4,0,6" FontSize="10.5" Foreground="{StaticResource Muted}"
+                   TextWrapping="Wrap"
+                   Text="Every ingest item and deleted scene on the timeline, in the order the recording reaches it, and when it goes to air."/>
+
+        <!-- The schedule. A list rather than a grid control so it carries the look of the rest of
+             the window; the columns are fixed widths, which a schedule this short can afford. -->
+        <Border Grid.Row="2" Background="{StaticResource PanelDeep}" BorderBrush="{StaticResource Line}"
+                BorderThickness="1" CornerRadius="5" Padding="8,6">
+            <DockPanel>
+                <Grid DockPanel.Dock="Top" Margin="0,0,0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="100"/>
+                        <ColumnDefinition Width="92"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="92"/>
+                        <ColumnDefinition Width="96"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="ON AIR AT" Foreground="{StaticResource Muted}" FontSize="9.5" FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="1" Text="IN" Foreground="{StaticResource Muted}" FontSize="9.5" FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="2" Text="ITEM" Foreground="{StaticResource Muted}" FontSize="9.5" FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="3" Text="LENGTH" Foreground="{StaticResource Muted}" FontSize="9.5" FontWeight="SemiBold"/>
+                    <TextBlock Grid.Column="4" Text="STATUS" Foreground="{StaticResource Muted}" FontSize="9.5" FontWeight="SemiBold"/>
+                </Grid>
+
+                <TextBlock x:Name="EdlEmpty" DockPanel.Dock="Top" Foreground="{StaticResource Muted}" FontSize="11"
+                           Text="Nothing scheduled. Drop ingest media on the timeline, or mark a range and delete the scene."/>
+
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <ItemsControl x:Name="EdlList">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="100"/>
+                                        <ColumnDefinition Width="92"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="92"/>
+                                        <ColumnDefinition Width="96"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{Binding At}" FontFamily="Consolas" FontSize="11"
+                                               Foreground="{StaticResource Tc}"/>
+                                    <TextBlock Grid.Column="1" Text="{Binding In}" FontFamily="Consolas" FontSize="11"
+                                               Foreground="{StaticResource Text}"/>
+                                    <TextBlock Grid.Column="2" Text="{Binding What}" FontSize="11"
+                                               Foreground="{StaticResource Text}" TextTrimming="CharacterEllipsis"
+                                               ToolTip="{Binding What}"/>
+                                    <TextBlock Grid.Column="3" Text="{Binding Length}" FontFamily="Consolas" FontSize="11"
+                                               Foreground="{StaticResource Muted}"/>
+                                    <TextBlock Grid.Column="4" Text="{Binding Status}" FontSize="11" FontWeight="SemiBold"
+                                               Foreground="{Binding StatusBrush}"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </DockPanel>
+        </Border>
+
+        <Grid Grid.Row="3" Margin="0,14,0,6">
+            <TextBlock Text="LOG" Foreground="{StaticResource Ok}" FontSize="13" FontWeight="Bold"/>
+            <Button Content="Clear" Style="{StaticResource GhostButton}" HorizontalAlignment="Right"
+                    Height="22" Padding="10,0" FontSize="10.5" Click="Clear_Click"
+                    ToolTip="Clear this view. The record on disk is kept."/>
+        </Grid>
+
+        <Border Grid.Row="4" Background="{StaticResource PanelDeep}" BorderBrush="{StaticResource Line}"
+                BorderThickness="1" CornerRadius="5" Padding="8,6">
+            <ScrollViewer x:Name="LogScroller" VerticalScrollBarVisibility="Auto">
+                <ItemsControl x:Name="LogList">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="0,1">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="{Binding Time}" FontFamily="Consolas" FontSize="10.5"
+                                           Foreground="{StaticResource Muted}" Margin="0,0,10,0"/>
+                                <TextBlock Grid.Column="1" Text="{Binding Message}" FontSize="11" TextWrapping="Wrap"
+                                           Foreground="{Binding Brush}"/>
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+        </Border>
+    </Grid>
+</Window>

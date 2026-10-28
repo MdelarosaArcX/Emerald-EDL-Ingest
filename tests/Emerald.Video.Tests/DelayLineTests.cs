@@ -59,6 +59,57 @@ public sealed class DelayLineTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Live Edit's line: room for inserts to grow the delay into, but the countdown is still only
+    /// the delay asked for - going live must not wait for the headroom to fill as well.
+    /// </summary>
+    [Fact]
+    public void Headroom_makes_the_ring_bigger_but_not_the_wait()
+    {
+        using DelayLine plain = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(1));
+        using DelayLine roomy = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(4));
+
+        Assert.Equal(plain.TargetFrames, roomy.TargetFrames);
+        Assert.Equal(plain.SlotCount + 4 * Tiny.FrameRate, roomy.SlotCount);
+    }
+
+    /// <summary>
+    /// A line armed part-way through a recording. Its own count starts at nought, but the
+    /// on-air marker is drawn from where the frame sits in the <i>recording</i> - and counting
+    /// from the line instead is what put the marker fifteen minutes behind after a re-arm.
+    /// </summary>
+    [Fact]
+    public void A_line_opened_mid_recording_still_knows_the_recording_frame()
+    {
+        using DelayLine line = Open();
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        const long armedAt = 22_500;   // fifteen minutes in, at 25
+
+        for (long i = 0; i < 10; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false, recordingFrame: armedAt + i);
+
+            Assert.Equal(DelayReadResult.Ok, line.TryRead(i, buffer));
+            Assert.Equal(i, buffer.Sequence);
+            Assert.Equal(armedAt + i, buffer.RecordingFrame);
+        }
+    }
+
+    [Fact]
+    public void Without_a_recording_frame_the_line_count_stands_in()
+    {
+        using DelayLine line = Open();
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        byte[] frame = Pattern(line.FrameBytes, 0);
+        line.Write(frame, frame.Length, null, 0, false);
+
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(0, buffer));
+        Assert.Equal(0, buffer.RecordingFrame);
+    }
+
     [Fact]
     public void Frames_are_still_intact_after_the_ring_has_wrapped()
     {
@@ -354,5 +405,84 @@ public sealed class DelayLineTests : IDisposable
     public void Dispose()
     {
         try { Directory.Delete(_folder, recursive: true); } catch { /* a temp folder */ }
+    }
+
+    // ------------------------------------------------------------------ by frame of the recording
+
+    /// <summary>
+    /// Live Edit shows the segment still being recorded from the line, by its frame of the
+    /// recording - so a frame is found by that number, not by the line's own count.
+    /// </summary>
+    [Fact]
+    public void A_frame_is_found_by_its_frame_of_the_recording()
+    {
+        using DelayLine line = Open();
+
+        const long armedAt = 22_500;
+        for (long i = 0; i < 20; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false, recordingFrame: armedAt + i);
+        }
+
+        Assert.Equal(5, line.SequenceOf(armedAt + 5));
+        Assert.Equal(19, line.SequenceOf(armedAt + 19));
+        Assert.Equal(-1, line.SequenceOf(armedAt + 20));     // not recorded yet
+        Assert.Equal(-1, line.SequenceOf(armedAt - 1));      // before the line began
+        Assert.Equal(armedAt + 7, line.RecordingFrameAt(7));
+    }
+
+    /// <summary>
+    /// A frame the line could not keep up with leaves a step in the numbering; frames either side
+    /// of it are still found exactly, and the missing one gives its neighbour.
+    /// </summary>
+    [Fact]
+    public void A_dropped_frame_does_not_throw_the_lookup_out()
+    {
+        using DelayLine line = Open();
+
+        long[] recorded = Enumerable.Range(0, 30).Select(i => (long)i).Where(i => i != 12).ToArray();
+        foreach (long r in recorded)
+        {
+            byte[] frame = Pattern(line.FrameBytes, r);
+            line.Write(frame, frame.Length, null, 0, false, recordingFrame: r);
+        }
+
+        Assert.Equal(11, line.SequenceOf(11));
+        Assert.Equal(12, line.SequenceOf(13));    // one slot earlier than its number, past the drop
+        Assert.Equal(28, line.SequenceOf(29));
+
+        long nearest = line.SequenceOf(12);
+        Assert.True(nearest is 11 or 12);
+    }
+
+    /// <summary>Lapped frames are not offered: the ring only reaches back so far.</summary>
+    [Fact]
+    public void A_frame_the_ring_has_gone_past_is_not_found()
+    {
+        using DelayLine line = Open();
+
+        long total = line.SlotCount + 20;
+        for (long i = 0; i < total; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false, recordingFrame: i);
+        }
+
+        Assert.Equal(-1, line.SequenceOf(5));
+        Assert.Equal(total - 1, line.SequenceOf(total - 1));
+    }
+
+    /// <summary>A reader that found the line somewhere shared takes no claim on one already let go.</summary>
+    [Fact]
+    public void A_claim_is_refused_once_the_line_has_been_let_go()
+    {
+        DelayLine line = Open();
+
+        Assert.True(line.TryAddRef());
+        line.Release();
+        line.Release();
+
+        Assert.False(line.TryAddRef());
     }
 }

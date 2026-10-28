@@ -1,5 +1,31 @@
 namespace Emerald.Core;
 
+/// <summary>
+/// Where a delayed transmission starts in the recording.
+///
+/// A fixed delay starts wherever the recording is, that far behind it. The other two start at
+/// the recording's first frame - the beginning of its first segment - so the programme goes out
+/// from its top rather than from some point a delay ago, and the delay is whatever that makes it.
+/// </summary>
+public enum DelayStart
+{
+    /// <summary>A fixed delay, starting that far behind the recorder.</summary>
+    Fixed,
+
+    /// <summary>
+    /// From the first frame of the recording, straight away: the delay is however long the
+    /// recording has been running when the transmission starts.
+    /// </summary>
+    FromFirstSegment,
+
+    /// <summary>
+    /// From the first frame of the recording, once its first segment has been recorded: the
+    /// delay is a segment's length - or, armed after that, however long it has been running,
+    /// which is starting from the first segment straight away.
+    /// </summary>
+    WhenFirstSegmentReady,
+}
+
 public enum TidalLockState
 {
     /// <summary>Not in use.</summary>
@@ -67,6 +93,9 @@ public sealed class TidalLock
     /// <summary>How far behind the receiver the transmitter runs.</summary>
     public TimeSpan Delay { get; private set; } = DefaultDelay;
 
+    /// <summary>Where the transmission starts in the recording. See <see cref="DelayStart"/>.</summary>
+    public DelayStart Start { get; private set; }
+
     /// <summary>The line itself, once the recorder has rolled and there is one.</summary>
     public IDelayLine? Line { get; private set; }
 
@@ -108,9 +137,19 @@ public sealed class TidalLock
     /// <summary>Frames the recorder has put into the line.</summary>
     public long FramesBuffered => Line?.FramesWritten ?? 0;
 
-    /// <summary>Frames still needed before the delay is full and the feed can start.</summary>
+    /// <summary>
+    /// The delay in frames, at the line's rate. This lock's own, and not the line's size: the
+    /// capture deck keeps one line filling for as long as it records, sized for the longest delay
+    /// anything might ask for, and every lock reading it reads its own distance behind.
+    /// </summary>
+    public long TargetFrames => Line is { } line ? DelayFrames(line.FrameRate) : 0;
+
+    /// <summary>
+    /// Frames still needed before the delay is full and the feed can start - none at all when
+    /// the line was already filling before this was armed, which is the ordinary case now.
+    /// </summary>
     public long FramesToAir =>
-        Line is { } line ? Math.Max(0, line.TargetFrames - line.FramesWritten) : 0;
+        Line is { } line ? Math.Max(0, TargetFrames - line.FramesWritten) : 0;
 
     /// <summary>
     /// How full the delay is, 0 to 1, for a progress bar.
@@ -121,8 +160,8 @@ public sealed class TidalLock
     /// </summary>
     public double FillFraction =>
         Line is not { } line ? 0
-        : line.TargetFrames <= 0 ? 1
-        : Math.Clamp(line.FramesWritten / (double)line.TargetFrames, 0, 1);
+        : TargetFrames <= 0 ? 1
+        : Math.Clamp(line.FramesWritten / (double)TargetFrames, 0, 1);
 
     /// <summary>How long until the feed reaches air, from the line's own frame rate.</summary>
     public TimeSpan TimeToAir =>
@@ -141,20 +180,69 @@ public sealed class TidalLock
     /// that is already running rather than waiting out another fill. Only a negative — which
     /// nothing can mean — falls back to the default.
     /// </summary>
-    public void Arm(TimeSpan delay)
+    public void Arm(TimeSpan delay, DelayStart start = DelayStart.Fixed)
     {
         lock (_gate)
         {
             Delay = delay < TimeSpan.Zero ? DefaultDelay : delay;
+            Start = start;
             _state = TidalLockState.Armed;
             Line = null;
             RecordingStarted = null;
             CueAt = null;
-            Detail = $"Armed - waiting for the capture deck to record. {Describe(Delay)} behind.";
+            Detail = $"Armed - waiting for the capture deck to record. {DescribeStart(start, Delay)}.";
         }
 
         Announce(TidalLockState.Armed, LogLevel.Ok);
     }
+
+    /// <summary>
+    /// Settles the delay for a lock that starts from the first segment, once the line it will
+    /// read is known: how far behind the recorder its first frame is, or a segment's length,
+    /// whichever the start asks for. Said before the line is handed over, so the transmitter is
+    /// made with the delay it will actually hold.
+    /// </summary>
+    public void Resolve(TimeSpan delay)
+    {
+        lock (_gate) Delay = delay < TimeSpan.Zero ? TimeSpan.Zero : delay;
+    }
+
+    /// <summary>
+    /// The delay, in frames, that starts a transmission where <paramref name="start"/> asks.
+    ///
+    /// A transmitter starts the delay behind the recorder - so a delay equal to everything
+    /// recorded so far starts it at the recording's first frame, and a delay of a segment's
+    /// length on a recording younger than that waits for the segment and then starts at its
+    /// first frame. That is the whole of "from the first segment": choosing the delay that puts
+    /// the start there.
+    /// </summary>
+    /// <param name="fixedFrames">The delay chosen, for <see cref="DelayStart.Fixed"/>.</param>
+    /// <param name="writtenFrames">Frames the line already holds, counted from its first.</param>
+    /// <param name="segmentFrames">A segment's length.</param>
+    /// <param name="reachFrames">
+    /// How far back the line can still reach. A recording longer than that has had its first
+    /// frames overwritten, and the start is the oldest frame still held.
+    /// </param>
+    public static long FramesFor(DelayStart start, long fixedFrames, long writtenFrames,
+                                 long segmentFrames, long reachFrames)
+    {
+        long reach = Math.Max(0, reachFrames);
+
+        return start switch
+        {
+            DelayStart.FromFirstSegment => Math.Min(Math.Max(0, writtenFrames), reach),
+            DelayStart.WhenFirstSegmentReady => Math.Min(Math.Max(segmentFrames, writtenFrames), reach),
+            _ => fixedFrames,
+        };
+    }
+
+    /// <summary>Where a lock starts, in words, for a log line or a status.</summary>
+    public static string DescribeStart(DelayStart start, TimeSpan delay) => start switch
+    {
+        DelayStart.FromFirstSegment => "from the first segment of the recording",
+        DelayStart.WhenFirstSegmentReady => "from the first segment, as soon as it is recorded",
+        _ => $"{Describe(delay)} behind",
+    };
 
     public void Disarm(string reason = "Tidal lock released.")
     {

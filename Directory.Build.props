@@ -1,0 +1,8 @@
+<Project>
+  <!-- One version for every part of Emerald, shown in the header of the capture deck and Live
+       Edit. Raise it here for a release; the installer's DisplayVersion should match. -->
+  <PropertyGroup>
+    <Version>1.0.0</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+</Project>

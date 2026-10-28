@@ -21,8 +21,15 @@
 
             <!-- ============================ header ============================ -->
             <Grid Grid.Row="0" Margin="20,0,18,0">
-                <TextBlock Text="Emerald IP" Foreground="{StaticResource IpMint}"
-                           FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Image Source="/Assets/emerald-mark.png" Width="26" Height="26" Margin="0,0,9,0"
+                           RenderOptions.BitmapScalingMode="HighQuality" VerticalAlignment="Center"/>
+                    <TextBlock Text="Emerald IP" Foreground="{StaticResource IpMint}"
+                               FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    <TextBlock Text="{x:Static core:EmeraldVersion.Text}" Foreground="{StaticResource Muted}"
+                               FontSize="11" Margin="8,4,0,0" VerticalAlignment="Center"
+                               FontFamily="Consolas" ToolTip="The version of Emerald running on this machine"/>
+                </StackPanel>
 
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center"
                             VerticalAlignment="Center" Margin="0,4,0,0">
@@ -100,10 +107,34 @@
                         </Grid.RowDefinitions>
 
                         <Grid Grid.Row="0" Margin="10,9,10,8">
-                            <TextBlock Text="CAPTURE ACTIVITY" Foreground="{StaticResource IpMuted}"
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+
+                            <TextBlock Grid.Column="0" Text="CAPTURE ACTIVITY" Foreground="{StaticResource IpMuted}"
                                        FontSize="9.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
 
-                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <!-- What is being captured, while recording: the timecode of the frame
+                                 the receiver is taking now, and how far into the recording that is. -->
+                            <StackPanel x:Name="RecTcPanel" Grid.Column="1" Orientation="Horizontal"
+                                        Visibility="Collapsed" VerticalAlignment="Center" Margin="16,0,12,0"
+                                        ToolTip="Timecode of the frame being captured, and how long this recording has run">
+                                <Ellipse Width="7" Height="7" Margin="0,0,6,0" Fill="{StaticResource IpRed}"
+                                         VerticalAlignment="Center"/>
+                                <TextBlock Text="REC" FontSize="9.5" FontWeight="SemiBold"
+                                           Foreground="{StaticResource IpRed}" VerticalAlignment="Center"
+                                           Margin="0,0,7,0"/>
+                                <TextBlock x:Name="RecTcText" Text="--:--:--:--" FontFamily="Consolas"
+                                           FontSize="13" FontWeight="Bold" Foreground="{StaticResource IpRed}"
+                                           VerticalAlignment="Center"/>
+                                <TextBlock x:Name="RecElapsedText" Text="" FontFamily="Consolas"
+                                           FontSize="11" Foreground="{StaticResource IpMuted}"
+                                           VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            </StackPanel>
+
+                            <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
                                 <ToggleButton x:Name="FollowCaptureLog" Content="FOLLOW"
                                               IsChecked="True"
                                               Style="{StaticResource IpSmallToggle}"
@@ -361,8 +392,15 @@
                             <Grid>
                                 <Image x:Name="PreviewImage" Stretch="Uniform" Margin="1"
                                        RenderOptions.BitmapScalingMode="HighQuality"/>
+                                <!-- The logo, while there is no picture: shown and hidden with the
+                                     placeholder line, so it is never over a live feed. -->
+                                <Image Source="/Assets/emerald-logo.png" Height="104" Opacity="0.6"
+                                       Margin="0,0,0,26" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       RenderOptions.BitmapScalingMode="HighQuality"
+                                       Visibility="{Binding Visibility, ElementName=PreviewPlaceholder}"/>
                                 <TextBlock x:Name="PreviewPlaceholder" Text="no signal"
-                                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                                           HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                           Margin="0,0,0,16"
                                            Foreground="{StaticResource IpDim}" FontSize="11.5"/>
                                 <Border VerticalAlignment="Top" HorizontalAlignment="Left" Margin="7"
                                         Background="#CC060A10" CornerRadius="3" Padding="7,3">
@@ -782,6 +820,7 @@
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
                                     </Grid.RowDefinitions>
 
                                     <TextBlock Grid.Row="0" Grid.Column="0" Text="Board"
@@ -840,9 +879,20 @@
                                              core:TimecodeMask.Enabled="True"
                                              ToolTip="Stop the recording after this long. Empty records until stopped."/>
 
-                                    <TextBlock Grid.Row="6" Grid.Column="0" Text="FPS"
+                                    <!-- How long each file the recorder writes is. Fixed for the
+                                         life of a recording - the encoder is told once - so it is
+                                         locked while one is running. -->
+                                    <TextBlock Grid.Row="6" Grid.Column="0" Text="Segment"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
-                                    <ComboBox x:Name="FpsCombo" Grid.Row="6" Grid.Column="1"
+                                    <ComboBox x:Name="SegmentCombo" Grid.Row="6" Grid.Column="1"
+                                              Style="{StaticResource IpMiniCombo}" Margin="0,3,0,0"
+                                              Width="96" HorizontalAlignment="Left"
+                                              SelectionChanged="Profile_Changed"
+                                              ToolTip="Length of each segment file. A shorter segment can be played and edited in Live Edit sooner; applies from the next recording."/>
+
+                                    <TextBlock Grid.Row="7" Grid.Column="0" Text="FPS"
+                                               Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
+                                    <ComboBox x:Name="FpsCombo" Grid.Row="7" Grid.Column="1"
                                               Style="{StaticResource IpMiniCombo}" Margin="0,3,0,0"
                                               Width="96" HorizontalAlignment="Left"
                                               SelectionChanged="Profile_Changed"
@@ -851,9 +901,9 @@
                                     <!-- Every recording writes both of these, from the one pass
                                          over the receiver. Fixed formats, so they are shown
                                          rather than offered. -->
-                                    <TextBlock Grid.Row="7" Grid.Column="0" Text="Low res"
+                                    <TextBlock Grid.Row="8" Grid.Column="0" Text="Low res"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
-                                    <Grid Grid.Row="7" Grid.Column="1" Margin="0,3,0,0">
+                                    <Grid Grid.Row="8" Grid.Column="1" Margin="0,3,0,0">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="4"/>
@@ -875,9 +925,9 @@
                                         </Border>
                                     </Grid>
 
-                                    <TextBlock Grid.Row="8" Grid.Column="0" Text="High res"
+                                    <TextBlock Grid.Row="9" Grid.Column="0" Text="High res"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
-                                    <Grid Grid.Row="8" Grid.Column="1" Margin="0,3,0,0">
+                                    <Grid Grid.Row="9" Grid.Column="1" Margin="0,3,0,0">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="4"/>
@@ -899,34 +949,34 @@
                                         </Border>
                                     </Grid>
 
-                                    <TextBlock Grid.Row="9" Grid.Column="0" Text="Video Bitrate"
+                                    <TextBlock Grid.Row="10" Grid.Column="0" Text="Video Bitrate"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
-                                    <ComboBox x:Name="VideoBitrateCombo" Grid.Row="9" Grid.Column="1"
+                                    <ComboBox x:Name="VideoBitrateCombo" Grid.Row="10" Grid.Column="1"
                                               Style="{StaticResource IpMiniCombo}" Margin="0,3,0,0"
                                               Width="126" HorizontalAlignment="Left"
                                               SelectionChanged="Profile_Changed"
                                               ToolTip="The low res proxy. Auto detect leaves rate control to the encoder; the DNxHD master is fixed at the 145 Mbps its tier is defined as."/>
 
-                                    <TextBlock Grid.Row="10" Grid.Column="0" Text="Audio Bitrate"
+                                    <TextBlock Grid.Row="11" Grid.Column="0" Text="Audio Bitrate"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
-                                    <ComboBox x:Name="AudioBitrateCombo" Grid.Row="10" Grid.Column="1"
+                                    <ComboBox x:Name="AudioBitrateCombo" Grid.Row="11" Grid.Column="1"
                                               Style="{StaticResource IpMiniCombo}" Margin="0,3,0,0"
                                               Width="126" HorizontalAlignment="Left"
                                               SelectionChanged="Profile_Changed"/>
 
-                                    <TextBlock Grid.Row="11" Grid.Column="0" Text="Audio Sample&#x0a;Frequency"
+                                    <TextBlock Grid.Row="12" Grid.Column="0" Text="Audio Sample&#x0a;Frequency"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"
                                                VerticalAlignment="Top"/>
-                                    <ComboBox x:Name="SampleRateCombo" Grid.Row="11" Grid.Column="1"
+                                    <ComboBox x:Name="SampleRateCombo" Grid.Row="12" Grid.Column="1"
                                               Style="{StaticResource IpMiniCombo}" Margin="0,3,0,0"
                                               Width="126" HorizontalAlignment="Left" VerticalAlignment="Top"
                                               SelectionChanged="Profile_Changed"
                                               ToolTip="SDI audio arrives at 48 kHz; anything else is resampled"/>
 
-                                    <TextBlock Grid.Row="12" Grid.Column="0" Text="Storage&#x0a;limit"
+                                    <TextBlock Grid.Row="13" Grid.Column="0" Text="Storage&#x0a;limit"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"
                                                VerticalAlignment="Top"/>
-                                    <StackPanel Grid.Row="12" Grid.Column="1" Margin="0,3,0,0">
+                                    <StackPanel Grid.Row="13" Grid.Column="1" Margin="0,3,0,0">
                                         <ComboBox x:Name="StorageLimitCombo"
                                                   Style="{StaticResource IpMiniCombo}"
                                                   Width="126" HorizontalAlignment="Left"

@@ -474,7 +474,7 @@ public partial class PlaybackWindow : Window
 
     // ------------------------------------------------------------------ tidal lock
 
-    private sealed record DelayOption(string Label, TimeSpan Delay)
+    private sealed record DelayOption(string Label, TimeSpan Delay, DelayStart Start = DelayStart.Fixed)
     {
         public override string ToString() => Label;
     }
@@ -487,6 +487,17 @@ public partial class PlaybackWindow : Window
         new("1 minute", TimeSpan.FromMinutes(1)),
         new("2 minutes", TimeSpan.FromMinutes(2)),
         new("5 minutes", TimeSpan.FromMinutes(5)),
+    };
+
+    /// <summary>
+    /// The two that start at the top of the recording rather than a set time behind it. The
+    /// delay they hold is settled when the capture deck hands over the line - see
+    /// <see cref="TidalLock.FramesFor"/> - so the time here is only what to show until then.
+    /// </summary>
+    private static readonly DelayOption[] FirstSegmentStarts =
+    {
+        new("From first segment", TimeSpan.Zero, DelayStart.FromFirstSegment),
+        new("When first segment is ready", TimeSpan.Zero, DelayStart.WhenFirstSegmentReady),
     };
 
     /// <summary>
@@ -509,9 +520,10 @@ public partial class PlaybackWindow : Window
 
         DelayOption? chosen = DelayBox.SelectedItem as DelayOption;
 
-        var options = new List<DelayOption>(RealDelays.Length + 1);
+        var options = new List<DelayOption>(RealDelays.Length + 3);
         if (recording) options.Add(NoDelay);
         options.AddRange(RealDelays);
+        options.AddRange(FirstSegmentStarts);
 
         DelayBox.ItemsSource = options;
 
@@ -534,6 +546,9 @@ public partial class PlaybackWindow : Window
         if (TidalLock.Shared.State == TidalLockState.Off) RenderDelayOptions();
     });
 
+
+    private DelayStart SelectedStart =>
+        DelayBox.SelectedItem is DelayOption option ? option.Start : DelayStart.Fixed;
 
     private TimeSpan SelectedDelay =>
         DelayBox.SelectedItem is DelayOption option ? option.Delay : TidalLock.DefaultDelay;
@@ -595,12 +610,12 @@ public partial class PlaybackWindow : Window
 
         if (!TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)) return;
 
-        TidalLock.Shared.Arm(SelectedDelay);
+        TidalLock.Shared.Arm(SelectedDelay, SelectedStart);
 
         // Said plainly, because arming on its own transmits nothing and the next step is in
         // the other window - which is exactly the thing an operator would wait in vain for.
         Log($"Tidal lock armed on {port!.Name} of board {board!.Index}, " +
-            $"{TidalLock.Describe(SelectedDelay)} behind.", Level.Ok);
+            $"{TidalLock.DescribeStart(SelectedStart, SelectedDelay)}.", Level.Ok);
         Log("Nothing goes to air yet. Press Record on the capture deck to start the countdown.",
             Level.Warn);
     }
@@ -768,7 +783,13 @@ public partial class PlaybackWindow : Window
         // Says the delay actually chosen rather than a number baked into the markup. It read
         // "one minute later" whatever was selected, which was wrong for three of the four
         // options and is wrong for the default now.
-        Step3Text.Text = $"3.  On air {Describe(lockState.State == TidalLockState.Off ? SelectedDelay : lockState.Delay)} later";
+        DelayStart start = lockState.State == TidalLockState.Off ? SelectedStart : lockState.Start;
+
+        Step3Text.Text = start == DelayStart.Fixed || lockState.State is not (TidalLockState.Off or TidalLockState.Armed)
+            ? $"3.  On air {Describe(lockState.State == TidalLockState.Off ? SelectedDelay : lockState.Delay)} later"
+            : start == DelayStart.FromFirstSegment
+                ? "3.  On air from the first segment"
+                : "3.  On air from the first segment, once it is recorded";
 
         Step1Text.Foreground = Brush(lockState.State == TidalLockState.Off ? "IpMint" : "IpDim");
         Step2Text.Foreground = Brush(lockState.State == TidalLockState.Armed ? "IpMint" : "IpDim");
@@ -890,6 +911,7 @@ public partial class PlaybackWindow : Window
 
         ClockText.Text = have ? now.ToString() : "--:--:--:--";
 
+        ShowOnAirTimecode();
         ShowAirFrames();
         ClockDot.Fill = Brush(_timecode.State switch
         {
@@ -920,7 +942,7 @@ public partial class PlaybackWindow : Window
                 // stays honest through a timecode outage and cannot reach zero before the
                 // frames to fill the delay have really arrived.
                 TimeSpan left = lockState.TimeToAir;
-                long target = lockState.Line?.TargetFrames ?? 0;
+                long target = lockState.TargetFrames;
 
                 LockPanel.Visibility = Visibility.Visible;
                 CountdownText.Foreground = Brush("IpMint");
@@ -1070,8 +1092,14 @@ public partial class PlaybackWindow : Window
             return;
         }
 
-        long delay = tidal.Line?.TargetFrames ?? 0;
-        long behind = Math.Max(0, frames.Recorded - frames.Aired - delay);
+        long delay = tidal.TargetFrames;
+        // From the frame of the recording actually on air, not from frames sent: the line can have
+        // been filling since the recording began, long before this transmitter started counting.
+        // A second of slack, because the recorded count is only published once a second.
+        long slack = TidalLock.Shared.Line?.FrameRate ?? 25;
+        long behind = PipelineState.Shared.AiredFrame is { } airedAt
+            ? Math.Max(0, frames.Recorded - (airedAt + 1) - delay - slack)
+            : 0;
 
         AirFramesText.Text =
             $"{frames.Aired:N0} out of {frames.Recorded:N0}  ·  delay {delay:N0}" +
@@ -1085,6 +1113,30 @@ public partial class PlaybackWindow : Window
             behind > 0 || frames.Skipped > 0 ? "IpRed"
             : frames.Repeated > 0 ? "Warn"
             : "IpTeal");
+    }
+
+    /// <summary>
+    /// The timecode on air: the time of day the picture going out now was captured at, and how
+    /// far into the recording it is. The same figure Live Edit draws its on-air mark from.
+    ///
+    /// From the frame the transmitter says it actually sent, not from the clock minus the delay,
+    /// so every repeat and skip is already in it - this is what went out, not what should have.
+    /// </summary>
+    private void ShowOnAirTimecode()
+    {
+        if (PipelineState.Shared.AiredFrame is not { } frame)
+        {
+            AirTcPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        AirTcPanel.Visibility = Visibility.Visible;
+
+        Timecode? start = PipelineState.Shared.RecordingStart;
+        int rate = start?.Rate ?? TidalLock.Shared.Line?.FrameRate ?? 25;
+
+        AirTcText.Text = PipelineState.TimecodeOf(start, frame)?.ToString() ?? "--:--:--:--";
+        AirElapsedText.Text = $"+{new Timecode(frame, Math.Max(1, rate))}";
     }
 
     private void ClearLog_Click(object sender, RoutedEventArgs e) => _log.Clear();

@@ -20,8 +20,10 @@
 
         <!-- What was dropped, how long it is, and where. An operator choosing between these
              four needs all three in front of them. -->
+        <!-- The marked range is on this line, and it decides which options are even available,
+             so it is worth reading before the choice below. -->
         <TextBlock x:Name="WhatText" Grid.Row="1" Margin="0,8,0,0"
-                   FontFamily="Consolas" FontSize="11.5"
+                   FontFamily="Consolas" FontSize="11.5" LineHeight="17"
                    Foreground="{StaticResource Tc}" TextWrapping="Wrap"/>
 
         <StackPanel Grid.Row="2" Margin="0,14,0,0">

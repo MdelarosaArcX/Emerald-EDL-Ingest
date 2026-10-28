@@ -1650,15 +1650,32 @@ public partial class EdlWindow : Window
         // A row that is waiting has its own live countdown beside the headline, so the
         // engine's "cues in ..." — written once when the wait began and never moved after —
         // is deliberately not shown. Anything else it has to say still is.
+        //
+        // Playing shows the position three ways, because they answer different questions: the
+        // timecode is what a plant speaks, the frame count is what a drop is measured in, and
+        // what is left is the one an operator watching a transmission actually wants.
         string progress = e.State == EntryState.Playing
-            ? $"  {new Timecode(e.FramesOut, e.Request.FrameRate)}"
+            ? $"  {new Timecode(e.FramesOut, e.Request.FrameRate)}   {e.FrameLabel}" +
+              (e.FramesLeft is { } left ? $"   {left:N0} left" : "")
             : e.State is EntryState.Queued or EntryState.Cued ? ""
             : e.Detail.Length > 0 ? $"  ({e.Detail})" : "";
 
+        // Drops, on the row, while it is happening. Only when there are any - a count of zero
+        // on every row would be noise, and its absence is already the good news.
+        string drops = e.FramesDropped > 0
+            ? $"   {e.FramesDropped:N0} dropped in {e.DropEvents:N0} stall(s)"
+            : "";
+
         return new QueueRow
         {
-            Headline = $"{label}  {e.Id}{progress}",
-            Timing = $"start {e.Request.Start}   dur {e.DurationLabel}   stop {e.StopLabel}   " +
+            Headline = $"{label}  {e.Id}{progress}{drops}",
+
+            // The duration in frames beside it in timecode, for the same reason the position
+            // carries both: a message's length is quoted as a timecode and cut as a number of
+            // frames, and converting between them by hand is how a message goes out a frame short.
+            Timing = $"start {e.Request.Start}   dur {e.DurationLabel}" +
+                     (e.TargetFrames is { } target ? $" ({target:N0}f)" : "") +
+                     $"   stop {e.StopLabel}   " +
                      $"TX{e.Request.TxChannel}   {PlayoutService.Describe(e.Request.PostPlay)}",
             Media = e.MediaLabel,
             Accent = Brush(brush),

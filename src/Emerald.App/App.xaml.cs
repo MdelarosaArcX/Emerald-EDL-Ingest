@@ -96,6 +96,18 @@ public partial class App : Application
 
         StartActivityLog();
 
+        // Before the first window exists: the render mode is the process's, and is read when
+        // the first one is created.
+        if (Settings.SoftwareRendering ||
+            Environment.GetEnvironmentVariable("EMERALD_SOFTWARE_RENDER") == "1")
+        {
+            System.Windows.Media.RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
+
+            ActivityLog.Shared.Info(LogSource.App,
+                "Drawing in software rather than on the graphics card, as the settings ask.",
+                @event: "app.softwarerender");
+        }
+
         StartListening();
         OpenModule(mode);
     }
@@ -168,6 +180,10 @@ public partial class App : Application
     private void Show(Window window)
     {
         MainWindow ??= window;
+
+        // Here as well as in the shell, because the --edl, --ingest and --monitor modes open
+        // their window directly without the shell ever being created.
+        AppIcon.ApplyTo(window);
 
         if (!window.IsLoaded && !window.IsVisible)
         {

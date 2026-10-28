@@ -30,11 +30,31 @@ public sealed class SpeakerOutput : IDisposable
     private const int BufferCount = 8;
 
     /// <summary>
-    /// Queue depth past which a frame is dropped instead of queued. The sound card being
-    /// slower than the receiver would otherwise grow the delay without limit until the
-    /// monitor was seconds behind the picture.
+    /// How far behind the picture the sound is allowed to get, in milliseconds.
+    ///
+    /// <b>This number is the lip-sync error.</b> The queue is the latency: a frame pushed when
+    /// three are already waiting is heard three frames later than it was received, while the
+    /// picture from that same slot is on the glass immediately. So the depth the queue settles
+    /// at is exactly how far out of step the monitor is.
+    ///
+    /// It settles at the cap, and that is why this used to drift. The receiver's audio clock and
+    /// the PC sound card's clock are independent — both nominally 48 kHz, both tens of parts per
+    /// million off it, and in different directions. If the card drains even slightly slower than
+    /// the receiver fills, the queue grows one frame every few minutes until it reaches the cap
+    /// and stays there. At the old cap of six frames that was 240 ms at 25 fps: audio in step at
+    /// the start and a quarter of a second late by the end, which is what an operator describes
+    /// as going off sync little by little.
+    ///
+    /// 80 ms is inside the range where a lip-sync error is hard to see, and leaves two frames in
+    /// flight at 25 — enough that a late slot does not gap the sound.
     /// </summary>
-    private const int MaxQueued = 6;
+    private const int MaxLatencyMs = 80;
+
+    /// <summary>
+    /// Queue depth past which a frame is dropped instead of queued, worked out from the frame
+    /// rate so the latency is the same wall-clock time whatever the rate.
+    /// </summary>
+    private int _maxQueued = 2;
 
     private const uint WhdrDone = 0x00000001;
     private const uint WhdrPrepared = 0x00000002;
@@ -59,6 +79,32 @@ public sealed class SpeakerOutput : IDisposable
     /// <summary>Frames dropped because the sound card fell behind. Diagnostic only.</summary>
     public long Dropped { get; private set; }
 
+    /// <summary>
+    /// How far behind the picture the sound currently is, in milliseconds.
+    ///
+    /// The queue depth in wall-clock time. Worth reading rather than inferring: it is the
+    /// monitor's lip-sync error, and a steady figure at the cap means the sound card is draining
+    /// slower than the receiver is filling - which is normal, and the reason the cap exists.
+    /// </summary>
+    public int LatencyMs
+    {
+        get
+        {
+            lock (_gate)
+            {
+                if (_device == IntPtr.Zero || _disposed || _bufferBytes <= 0) return 0;
+
+                int queued = 0;
+                for (int i = 0; i < _headers.Length; i++)
+                    if ((Marshal.ReadInt32(_headers[i], HdrFlags) & WhdrDone) == 0) queued++;
+
+                int msPerBuffer = _bufferBytes * 1000 / (SampleRate * Channels * BytesPerSample);
+
+                return queued * msPerBuffer;
+            }
+        }
+    }
+
     /// <summary>Whether the device opened. False means no sound card, or none available.</summary>
     public bool IsOpen => _device != IntPtr.Zero;
 
@@ -79,8 +125,14 @@ public sealed class SpeakerOutput : IDisposable
 
     private void Start(int frameRate)
     {
-        int samplesPerFrame = SampleRate / Math.Max(1, frameRate);
+        int rate = Math.Max(1, frameRate);
+        int samplesPerFrame = SampleRate / rate;
         _bufferBytes = samplesPerFrame * Channels * BytesPerSample;
+
+        // Two frames at least, so one can be playing while the next is queued and an arriving
+        // slot never finds the device empty. Above that, as many as fit in the latency budget -
+        // at 50 fps a frame is 20 ms, so four of them are the same 80 ms as two at 25.
+        _maxQueued = Math.Clamp(MaxLatencyMs * rate / 1000, 2, BufferCount - 1);
 
         var format = new WaveFormat
         {
@@ -150,7 +202,7 @@ public sealed class SpeakerOutput : IDisposable
             for (int i = 0; i < BufferCount; i++)
                 if ((Marshal.ReadInt32(_headers[i], HdrFlags) & WhdrDone) == 0) queued++;
 
-            if (queued >= MaxQueued) { Dropped++; return; }
+            if (queued >= _maxQueued) { Dropped++; return; }
 
             // Round-robin from where the last one went, so buffers are reused in the order
             // the device finishes with them.

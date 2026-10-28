@@ -47,7 +47,7 @@ public static class MonitorFeed
                 behind = TidalLock.Describe(tidal.Delay),
                 fill = tidal.FillFraction,
                 framesToAir = tidal.FramesToAir,
-                targetFrames = tidal.Line?.TargetFrames ?? 0,
+                targetFrames = tidal.TargetFrames,
             },
 
             frames = new

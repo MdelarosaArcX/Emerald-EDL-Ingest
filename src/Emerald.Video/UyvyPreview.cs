@@ -18,9 +18,19 @@ namespace Emerald.Video;
 public static class UyvyPreview
 {
     /// <summary>
-    /// The default reduction per axis — a quarter-size image, which is what a thumbnail wants.
+    /// The default reduction per axis: a half-size image, 960x540 from a 1080 source.
+    ///
+    /// <b>Raised from a quarter.</b> A quarter-size picture is 480x270, which is more than a
+    /// 352-wide thumbnail can show and visibly soft the moment the deck is expanded to fill the
+    /// window — and expanding it is exactly what an operator does when they want to look at
+    /// something properly. Half-size is sharp in both.
+    ///
+    /// The cost is four times the pixels per converted frame, which is half a millisecond of
+    /// integer arithmetic on this plant's hardware. The old quarter was chosen when this
+    /// converted a full-size frame and the comment above it said that cost a core; it never did
+    /// at this size.
     /// </summary>
-    public const int Decimation = 4;
+    public const int Decimation = 2;
 
     /// <summary>
     /// Frames a second converted by default.

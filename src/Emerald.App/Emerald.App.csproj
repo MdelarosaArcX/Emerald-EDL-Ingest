@@ -16,7 +16,29 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
+
+    <!-- The executable's own icon: what Explorer, the taskbar, Alt-Tab, the Start Menu
+         shortcuts and Add/Remove Programs all show. Built from assets\icon\Emerald_icon@512w.png
+         into seven sizes - 512 halves cleanly to 256, 128, 64, 32 and 16 - because the shell asks for 16 and 32 constantly and letting it
+         downscale a single large image gives a soft, muddy small icon.
+
+         It is also the fallback every WPF window uses when it sets no Icon of its own, which is
+         why this one property reaches every dialog in every module. -->
+    <ApplicationIcon>emerald.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The same image as a WPF resource, so a window can be given it explicitly and the
+         about-face of the title bar is the artwork rather than a scaled exe icon. -->
+    <Resource Include="emerald.ico" />
+
+    <!-- The artwork itself, linked from assets\ rather than copied, so there is one of each.
+         The 512-pixel versions: the mark is drawn at under 30 pixels in a header and the logo at
+         about a hundred on an idle screen, so 512 leaves room for a high-DPI display scaling
+         either up and is still a quarter the size of the @2x and @3x exports. -->
+    <Resource Include="..\..\assets\icon\Emerald_icon@512w.png" Link="Assets\emerald-mark.png" />
+    <Resource Include="..\..\assets\logo\Emerald_Logo@512w.png" Link="Assets\emerald-logo.png" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Emerald.Core\Emerald.Core.csproj" />

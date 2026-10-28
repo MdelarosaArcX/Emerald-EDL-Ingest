@@ -121,11 +121,127 @@ public sealed class PipelineState
             _frames = _frames with { Recorded = recorded, NotEncoded = notEncoded, NotDelayed = notDelayed };
     }
 
-    /// <summary>The transmitter\x27s side: what went out, and what it had to do to keep up.</summary>
-    public void SetAired(long aired, long repeated, long skipped, long resyncs)
+    /// <summary>
+    /// Which frame of the recording is going to air this instant, counted from the recording's
+    /// own first frame. Null when nothing is being transmitted.
+    ///
+    /// <b>Not</b> from the first frame the delay took. Tidal lock can be armed - or disarmed and
+    /// armed again - part-way through a recording, and the line it opens then starts counting at
+    /// nought; counting from there put the on-air marker as far behind as the recording had been
+    /// running when it was armed.
+    ///
+    /// <b>This is the measured position, not a calculated one.</b> Where the transmitter has got
+    /// to can be worked out from the station clock and the delay — now minus the delay — and
+    /// that answer is right only while nothing goes wrong. The moment the transmitter repeats a
+    /// frame because nothing new had arrived, or skips one to hold the delay, the real position
+    /// and the calculated one part company and never come back together. Every repeat is a frame
+    /// of permanent error.
+    ///
+    /// So the transmitter publishes where it actually is, and anything drawing a marker uses
+    /// this in preference to the arithmetic.
+    /// </summary>
+    public long? AiredFrame
+    {
+        get { lock (_gate) return _airedFrame; }
+    }
+
+    private long? _airedFrame;
+
+    /// <summary>
+    /// The time of day the recording rolled, counted at the recording's own rate. Null before
+    /// the receiver has said what rate that is.
+    ///
+    /// <b>The same start Live Edit's ruler uses</b> - the moment stamped into the recording's
+    /// folder name - and not a separate reading of the station clock. The playback deck's ON AIR
+    /// readout and Live Edit's on-air mark are the same fact, and they used to be worked out
+    /// from two different starts, at two different rates: they agreed at first and then drifted
+    /// apart. Now both are this start plus the frame the transmitter sent, through
+    /// <see cref="OnAirTimeOfDay"/>, so they cannot disagree.
+    ///
+    /// Set by the capture deck and deliberately <b>not</b> cleared when the recording stops:
+    /// tidal lock goes on draining a whole delay of it afterwards, and the playback deck still
+    /// needs to say what time of day the picture going out was taken at. The next recording
+    /// replaces it.
+    /// </summary>
+    public Timecode? RecordingStart
+    {
+        get { lock (_gate) return _recordingStart; }
+        set { lock (_gate) _recordingStart = value; }
+    }
+
+    private Timecode? _recordingStart;
+
+    /// <summary>
+    /// The same moment as <see cref="RecordingStart"/>, with its date.
+    ///
+    /// A timecode wraps at midnight and a recording does not stop for it: an hour rolled at
+    /// 23:30 is on air at 00:15 the next day, and a time of day alone cannot say which day that
+    /// is. Live Edit's ruler runs on past midnight to keep such a recording in one piece, and
+    /// places the on-air mark from this.
+    /// </summary>
+    public DateTime? RecordingStartedAt
+    {
+        get { lock (_gate) return _recordingStartedAt; }
+        set { lock (_gate) _recordingStartedAt = value; }
+    }
+
+    private DateTime? _recordingStartedAt;
+
+    /// <summary>
+    /// When the picture on air now was captured, as a date and time - <see cref="OnAirTimeOfDay"/>
+    /// without the wrap at midnight. Null when nothing is on air.
+    /// </summary>
+    public DateTime? OnAirAt
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _recordingStartedAt is { } started &&
+                       _recordingStart is { Rate: > 0 } start &&
+                       _airedFrame is { } aired && aired >= 0
+                    ? started + TimeSpan.FromSeconds(aired / (double)start.Rate)
+                    : null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The station timecode a frame of the recording was taken at - frame nought being
+    /// <paramref name="start"/> - wrapping at midnight the way the clock does.
+    /// </summary>
+    public static Timecode? TimecodeOf(Timecode? start, long recordingFrame) =>
+        start is { Rate: > 0 } s && recordingFrame >= 0 ? s.AddWrapping(recordingFrame) : null;
+
+    /// <summary>
+    /// The time of day the picture on air now was captured, or null when nothing is.
+    ///
+    /// In time rather than frames, so a window counting at a different rate from the recording
+    /// converts it rather than adding frames of one rate to a count in another - which is a
+    /// drift that grows with every minute on air.
+    /// </summary>
+    public TimeSpan? OnAirTimeOfDay =>
+        TimecodeOf(RecordingStart, AiredFrame ?? -1) is { } tc ? TimeSpan.FromSeconds(tc.TotalSeconds) : null;
+
+    /// <summary>The transmitter's side: what went out, and what it had to do to keep up.</summary>
+    public void SetAired(long aired, long repeated, long skipped, long resyncs,
+                         long? onAirFrame = null)
     {
         lock (_gate)
+        {
             _frames = _frames with { Aired = aired, Repeated = repeated, Skipped = skipped, Resyncs = resyncs };
+            _airedFrame = onAirFrame;
+        }
+    }
+
+    /// <summary>
+    /// Every frame, the position alone. The counts above go once a second, but a timecode
+    /// readout of what is on air that moved once a second would be showing the frames digit
+    /// as a guess.
+    /// </summary>
+    public void SetAiredFrame(long onAirFrame)
+    {
+        lock (_gate) _airedFrame = onAirFrame;
     }
 
     /// <summary>A recording has ended; the next one starts its count from nothing.</summary>
@@ -136,7 +252,11 @@ public sealed class PipelineState
 
     public void ClearAired()
     {
-        lock (_gate) _frames = _frames with { Aired = 0, Repeated = 0, Skipped = 0, Resyncs = 0 };
+        lock (_gate)
+        {
+            _frames = _frames with { Aired = 0, Repeated = 0, Skipped = 0, Resyncs = 0 };
+            _airedFrame = null;
+        }
     }
 
     /// <summary>The EDL queue: how many are waiting and what is cued.</summary>

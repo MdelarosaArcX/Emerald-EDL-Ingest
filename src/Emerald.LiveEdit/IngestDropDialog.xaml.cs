@@ -33,14 +33,35 @@ public partial class IngestDropDialog : Window
         _markOut = markOut;
         _rate = rate;
 
+        bool ranged = markIn is { } from && markOut is { } to && to > from;
+
         WhatText.Text =
             $"{Path.GetFileName(path)}\n" +
             $"{ingestFrames:N0} frames ({new Timecode(ingestFrames, rate)})   " +
             $"dropped at {new Timecode(dropFrame, rate)}\n" +
-            (markIn is { } a && markOut is { } b && b > a
-                ? $"marked range {new Timecode(a, rate)} - {new Timecode(b, rate)} " +
-                  $"({b - a:N0} frames)"
+            (ranged
+                ? $"marked range {new Timecode(markIn!.Value, rate)} - " +
+                  $"{new Timecode(markOut!.Value, rate)} " +
+                  $"({markOut.Value - markIn.Value:N0} frames)"
                 : "no marked range - fit to fill and replace need one");
+
+        // Overlay stays selected, whatever is marked.
+        //
+        // A marked range does not decide what the drop meant. Marks are set for all sorts of
+        // reasons - an export, a note of where something starts - and a drop while they happen
+        // to be set is not a request to use them. Choosing Fit to fill or Replace is what moves
+        // the item onto the marks; until then it goes where it was dropped, which is the thing
+        // the operator actually did with the pointer.
+        //
+        // An earlier version pre-selected Fit to fill whenever a range existed. That put a
+        // speed change one unread keystroke away from being committed, on the strength of
+        // guessing at intent.
+
+        // The two range modes cannot be planned without a range, so they are not offered without
+        // one. Their descriptions stay readable, which is how an operator learns what a mark
+        // would buy them.
+        FitRadio.IsEnabled = ranged;
+        ReplaceRadio.IsEnabled = ranged;
 
         ShowEffect();
     }

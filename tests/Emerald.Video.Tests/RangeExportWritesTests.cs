@@ -69,6 +69,40 @@ public sealed class RangeExportWritesTests
         return null;
     }
 
+    /// <summary>
+    /// A file's picture size, read with ffprobe beside the ffmpeg that wrote it.
+    ///
+    /// Returns an empty string rather than throwing when it cannot be read, so a probe that is
+    /// missing fails the comparison with something legible instead of an exception from inside a
+    /// helper.
+    /// </summary>
+    private static string Raster(string ffmpeg, string path)
+    {
+        string probe = Path.Combine(Path.GetDirectoryName(ffmpeg) ?? "", "ffprobe.exe");
+
+        if (!File.Exists(probe)) return "";
+
+        try
+        {
+            using Process? p = Process.Start(new ProcessStartInfo(probe)
+            {
+                Arguments = $"-v error -select_streams v:0 -show_entries stream=width,height " +
+                            $"-of csv=p=0 \"{path}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+            });
+
+            if (p is null) return "";
+
+            string got = p.StandardOutput.ReadToEnd().Trim();
+            p.WaitForExit();
+
+            return got;
+        }
+        catch (Exception) { return ""; }
+    }
+
     /// <summary>A silent colour clip of a given length, which stands in for a captured segment.</summary>
     private static bool MakeSegment(string ffmpeg, string path, int seconds, string colour)
     {
@@ -145,6 +179,17 @@ public sealed class RangeExportWritesTests
             // It lands in the ingest folder, which is what the Ingest Media tab lists.
             Assert.Equal(RangeExport.FolderFor(store), Path.GetDirectoryName(result.Path));
             Assert.Contains(result.Path, RangeExport.List(store, null).Select(c => c.Path));
+
+            // The playable copy is the source's own raster, not a thumbnail.
+            //
+            // It was 640x360, which was sized for the list's thumbnail - and is what an ingest
+            // placement then showed on the main viewer, because the export itself is DNxHD and
+            // cannot be decoded here. A scaled-down copy is the picture in that case, so it is
+            // not scaled down.
+            string? playable = RangeExport.PreviewFor(result.Path);
+
+            Assert.NotNull(playable);
+            Assert.Equal(Raster(ffmpeg!, result.Path), Raster(ffmpeg!, playable!));
         }
         finally
         {

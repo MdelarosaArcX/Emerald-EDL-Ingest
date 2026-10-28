@@ -69,14 +69,18 @@ public sealed class RecordingMasterTests
     }
 
     [Fact]
-    public void The_proxy_is_left_exactly_as_it_was()
+    public void The_proxy_is_still_h264_with_no_fixed_bitrate()
     {
+        // This used to pin "ultrafast" as well, as part of asserting that adding the master
+        // changed nothing about the proxy. The proxy has since been changed on purpose - it is
+        // the picture every viewer shows, so it is full raster and High profile now - and the
+        // settings themselves are pinned in ProxyQualityTests. What belongs here is only that
+        // the master's arrival did not give the proxy a codec or a bitrate of its own.
         List<string> args = Args();
 
         Assert.Equal("libx264", RecordingProfile.LowRes.VideoCodec);
         Assert.Null(RecordingProfile.LowRes.VideoBitrate);
         Assert.Contains("libx264", args);
-        Assert.Contains("ultrafast", args);
     }
 
     [Fact]
@@ -91,10 +95,14 @@ public sealed class RecordingMasterTests
     }
 
     [Fact]
-    public void The_master_is_still_full_raster_and_the_proxy_still_half()
+    public void Both_outputs_are_full_raster()
     {
+        // The proxy was half size, which is what "proxy" usually means. It is not a stand-in
+        // here: nothing in the application can decode the DNxHD master, so the proxy is the
+        // picture every viewer shows and the one an edit is judged on. Scaled back up to fill a
+        // viewer, half size is visibly soft.
         Assert.False(RecordingProfile.HighRes.HalfSize);
-        Assert.True(RecordingProfile.LowRes.HalfSize);
+        Assert.False(RecordingProfile.LowRes.HalfSize);
     }
 
     [Fact]

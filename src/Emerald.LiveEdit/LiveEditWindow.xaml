@@ -1,8 +1,9 @@
 <Window x:Class="Emerald.LiveEdit.LiveEditWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:core="clr-namespace:Emerald.Core;assembly=Emerald.Core"
         Title="Emerald - Live Edit" Height="820" Width="1360"
-        WindowStartupLocation="CenterScreen"
+        WindowStartupLocation="CenterScreen" WindowState="Maximized"
         Background="{StaticResource Bg}"
         PreviewKeyDown="Window_PreviewKeyDown"
         MouseWheel="Window_MouseWheel">
@@ -64,37 +65,70 @@
                       Cursor="SizeWE" ShowsPreview="False"
                       ToolTip="Drag to resize the media panel and the viewer"/>
 
-        <StackPanel Grid.Row="0" Grid.ColumnSpan="3" Orientation="Horizontal" Margin="0,0,0,14">
-            <TextBlock Text="LIVE EDIT" Foreground="{StaticResource Ok}" FontSize="16" FontWeight="Bold"/>
-            <TextBlock x:Name="KeyHintText" Margin="14,0,0,0" VerticalAlignment="Center"
-                       Foreground="{StaticResource Muted}" FontSize="11.5"
-                       Text="space play/pause  -  arrows one frame  -  I/O mark  -  B bookmark  -  +/- zoom  -  A on air  -  middle-drag to pan"/>
+        <!-- The header over the big screen: what is being looked at on the left, the delay on the
+             right. A DockPanel in the screen's own column, so the delay sits at the right edge of
+             the big screen and never runs on over the media panel. -->
+        <DockPanel Grid.Row="0" Grid.Column="0" Margin="0,0,0,14" LastChildFill="True">
+            <!-- The delay from air: what was chosen, plus every insert, less every deleted scene.
+                 Docked first so it keeps its room; the readouts to its left give way. -->
+            <TextBlock x:Name="DelayText" DockPanel.Dock="Right" VerticalAlignment="Center"
+                       Margin="12,0,0,0" FontFamily="Consolas" FontSize="12" FontWeight="Bold"
+                       Foreground="{StaticResource Warn}" Visibility="Collapsed"/>
 
-            <StackPanel Orientation="Horizontal" Margin="20,0,0,0" VerticalAlignment="Center">
-                <Button Content="&#8592;" Style="{StaticResource GhostButton}" Width="26"
-                        Click="DayBack_Click" ToolTip="The day before"/>
-                <TextBlock x:Name="DayText" Margin="8,0,8,0" VerticalAlignment="Center"
-                           FontFamily="Consolas" FontSize="12" Foreground="{StaticResource Text}"/>
-                <Button Content="&#8594;" Style="{StaticResource GhostButton}" Width="26"
-                        Click="DayForward_Click" ToolTip="The day after"/>
+            <StackPanel Orientation="Horizontal" ClipToBounds="True">
+                <TextBlock Text="LIVE EDIT" Foreground="{StaticResource Ok}" FontSize="16" FontWeight="Bold"/>
+                <TextBlock Text="{x:Static core:EmeraldVersion.Text}" Foreground="{StaticResource Muted}"
+                           FontSize="11" Margin="8,0,0,0" VerticalAlignment="Bottom" FontFamily="Consolas"
+                           ToolTip="The version of Emerald running on this machine"/>
+
+                <StackPanel Orientation="Horizontal" Margin="20,0,0,0" VerticalAlignment="Center">
+                    <Button Content="&#8592;" Style="{StaticResource GhostButton}" Width="26"
+                            Click="DayBack_Click" ToolTip="The day before"/>
+                    <TextBlock x:Name="DayText" Margin="8,0,8,0" VerticalAlignment="Center"
+                               FontFamily="Consolas" FontSize="12" Foreground="{StaticResource Text}"/>
+                    <Button Content="&#8594;" Style="{StaticResource GhostButton}" Width="26"
+                            Click="DayForward_Click" ToolTip="The day after"/>
+                </StackPanel>
+
+                <TextBlock x:Name="RecordingText" Margin="16,0,0,0" VerticalAlignment="Center"
+                           FontFamily="Consolas" FontSize="11.5"
+                           Foreground="{StaticResource Muted}"/>
+
+                <TextBlock x:Name="OnAirText" Margin="20,0,0,0" VerticalAlignment="Center"
+                           FontFamily="Consolas" FontSize="12" FontWeight="Bold"
+                           Foreground="{StaticResource Bad}"/>
             </StackPanel>
+        </DockPanel>
 
-            <TextBlock x:Name="RecordingText" Margin="16,0,0,0" VerticalAlignment="Center"
-                       FontFamily="Consolas" FontSize="11.5"
-                       Foreground="{StaticResource Muted}"/>
-
-            <TextBlock x:Name="OnAirText" Margin="20,0,0,0" VerticalAlignment="Center"
-                       FontFamily="Consolas" FontSize="12" FontWeight="Bold"
-                       Foreground="{StaticResource Bad}"/>
+        <!-- Going live from here, and the record of what that did. Over the media panel, at the
+             top of the page. -->
+        <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right"
+                    VerticalAlignment="Top" Margin="0,0,0,14">
+            <Button x:Name="LogsButton" Content="Logs" Style="{StaticResource GhostButton}"
+                    Height="28" Padding="14,0" Click="Logs_Click"
+                    ToolTip="The EDL this timeline has written, and Live Edit's log"/>
+            <Button x:Name="GoLiveButton" Content="&#9679; Go Live" Style="{StaticResource GhostButton}"
+                    Height="28" Padding="14,0" Margin="8,0,0,0" FontWeight="Bold"
+                    Foreground="{StaticResource Bad}" Click="GoLive_Click"
+                    ToolTip="Put the recording to air from here, with this timeline's ingest media and deleted scenes"/>
         </StackPanel>
 
         <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource PanelDeep}"
                 BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6">
             <Grid>
-                <MediaElement x:Name="Player" LoadedBehavior="Manual" UnloadedBehavior="Stop"
+                <!-- Two players on the one screen, one showing and one waiting. The waiting one
+                     opens whatever comes next - the next segment, an ingest item the playhead is
+                     about to run into, the recording it hands back to - before the cut, so the
+                     cut is a swap between two open players rather than a source change, which
+                     is black for as long as the new file takes to open. -->
+                <MediaElement x:Name="PlayerA" LoadedBehavior="Manual" UnloadedBehavior="Stop"
                               Stretch="Uniform" Margin="1" ScrubbingEnabled="True"
                               MediaOpened="Player_Opened" MediaEnded="Player_Ended"
                               MediaFailed="Player_Failed"/>
+                <MediaElement x:Name="PlayerB" LoadedBehavior="Manual" UnloadedBehavior="Stop"
+                              Stretch="Uniform" Margin="1" ScrubbingEnabled="True"
+                              MediaOpened="Player_Opened" MediaEnded="Player_Ended"
+                              MediaFailed="Player_Failed" Opacity="0" IsMuted="True"/>
                 <!-- One player per layer. In the tree because WPF will not play a MediaElement
                      that is not, zero-sized because there is nothing of theirs to look at. -->
                 <MediaElement x:Name="LayerA" LoadedBehavior="Manual" UnloadedBehavior="Stop"
@@ -109,6 +143,52 @@
                            HorizontalAlignment="Center" VerticalAlignment="Center"
                            TextAlignment="Center" TextWrapping="Wrap"
                            Foreground="{StaticResource Muted}" FontSize="14"/>
+
+                <!-- The segment still being recorded, shown from the delay line's frames: no file
+                     of it can be opened until the recorder closes it. Above the players, below the
+                     live REC view. -->
+                <Grid x:Name="HeldView" Visibility="Collapsed" Background="{StaticResource PanelDeep}">
+                    <Image x:Name="HeldImage" Stretch="Uniform" Margin="1"
+                           RenderOptions.BitmapScalingMode="Linear"/>
+                    <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10"
+                            Background="#C0101419" CornerRadius="4" Padding="8,3"
+                            ToolTip="This segment is still being recorded. Its picture comes from the delay buffer, which holds the last few minutes of the recording; the sound is not played here.">
+                        <TextBlock x:Name="HeldText" Text="RECORDING - from the delay buffer"
+                                   Foreground="{StaticResource Warn}" FontWeight="Bold"
+                                   FontFamily="Consolas" FontSize="12"/>
+                    </Border>
+                </Grid>
+
+                <!-- The recording as it comes in, from the capture deck's own preview. Over the
+                     players rather than instead of them, so leaving it puts back exactly the
+                     frame the timeline was on. -->
+                <Grid x:Name="RecordingView" Visibility="Collapsed" Background="{StaticResource PanelDeep}">
+                    <Image x:Name="RecordingImage" Stretch="Uniform" Margin="1"
+                           RenderOptions.BitmapScalingMode="Linear"/>
+                    <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10"
+                            Background="#C0101419" CornerRadius="4" Padding="8,3">
+                        <TextBlock x:Name="RecordingViewText" Text="&#9679; REC"
+                                   Foreground="{StaticResource Bad}" FontWeight="Bold"
+                                   FontFamily="Consolas" FontSize="14"/>
+                    </Border>
+                </Grid>
+
+                <!-- Going live with a delay: how long until the delay is full and the recording
+                     goes to air. Over everything on this screen, because it is the one thing the
+                     operator is waiting for. -->
+                <Border x:Name="CountdownBadge" HorizontalAlignment="Center" VerticalAlignment="Top"
+                        Margin="0,14,0,0" Padding="18,8" CornerRadius="6" Background="#E0101419"
+                        BorderBrush="{StaticResource Warn}" BorderThickness="1"
+                        Visibility="Collapsed" IsHitTestVisible="False">
+                    <StackPanel>
+                        <TextBlock x:Name="CountdownLabel" Text="ON AIR IN" HorizontalAlignment="Center"
+                                   Foreground="{StaticResource Warn}" FontWeight="Bold" FontSize="11"/>
+                        <TextBlock x:Name="CountdownText" Text="--:--:--:--" HorizontalAlignment="Center"
+                                   Foreground="White" FontWeight="Bold" FontFamily="Consolas" FontSize="30"/>
+                        <TextBlock x:Name="CountdownDetail" HorizontalAlignment="Center"
+                                   Foreground="{StaticResource Muted}" FontSize="11"/>
+                    </StackPanel>
+                </Border>
             </Grid>
         </Border>
 
@@ -343,8 +423,25 @@
         <Border Grid.Row="2" Grid.ColumnSpan="3" Margin="0,14,0,0" Padding="14,10"
                 Background="{StaticResource Panel}" BorderBrush="{StaticResource Line}"
                 BorderThickness="1" CornerRadius="6">
+            <!-- Three groups across, and the long status line on its own row underneath.
+                 They used to share one cell: the transport was centred, the zoom controls were
+                 left-aligned and the readouts right-aligned, all on top of each other. That is
+                 fine while the status text is short and hopeless when it is not - an ingest
+                 placement's description is a sentence, and it grew rightwards straight across
+                 the Play button, swallowing the clicks meant for it. Columns stop them
+                 overlapping; its own row gives the sentence somewhere to be. -->
             <Grid>
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center">
                     <Button x:Name="BackButton" Content="&#9668;&#9668;" Style="{StaticResource GhostButton}"
                             Width="46" Click="StepBack_Click"
                             ToolTip="Back one step of the current zoom (left arrow)"/>
@@ -355,12 +452,36 @@
                             Width="46" Click="StepForward_Click"
                             ToolTip="Forward one step of the current zoom (right arrow)"/>
 
+                    <!-- Plays what is on air, locked to the on-air mark, so this screen can be put
+                         beside the playback deck's monitor and the two compared. -->
+                    <Button x:Name="PlayOnAirButton" Content="&#9654; ON AIR" Style="{StaticResource GhostButton}"
+                            Margin="20,0,0,0" Padding="10,0" Click="PlayOnAir_Click"
+                            ToolTip="Play from the on-air mark and stay locked to it, to compare with the playback deck (Shift+A). Click again to stop."/>
+
+                    <!-- The recording as it comes in, on the big screen. -->
+                    <Button x:Name="RecordingViewButton" Content="&#9679; REC" Style="{StaticResource GhostButton}"
+                            Margin="8,0,0,0" Padding="10,0" Click="RecordingView_Click"
+                            ToolTip="Show the recording as it comes in on the big screen (R). Click again to go back to the timeline."/>
+
+                    <!-- Undo and redo for the timeline's edits, as far back as the last fifty. -->
+                    <Button x:Name="UndoButton" Content="&#8630; Undo" Style="{StaticResource GhostButton}"
+                            Margin="20,0,0,0" Padding="8,0" Click="Undo_Click" IsEnabled="False"/>
+                    <Button x:Name="RedoButton" Content="Redo &#8631;" Style="{StaticResource GhostButton}"
+                            Margin="6,0,0,0" Padding="8,0" Click="Redo_Click" IsEnabled="False"/>
+
                     <Button x:Name="MarkInButton" Content="Mark In" Style="{StaticResource GhostButton}"
                             Margin="20,0,8,0" Click="MarkIn_Click"
                             ToolTip="Mark in at the playhead, or clear it if it is already here (I)"/>
                     <Button x:Name="MarkOutButton" Content="Mark Out" Style="{StaticResource GhostButton}"
                             Click="MarkOut_Click"
                             ToolTip="Mark out at the playhead, or clear it if it is already here (O)"/>
+
+                    <!-- Takes the marked range out of what goes to air. Only once both marks are
+                         set, and only ahead of the no touch zone. -->
+                    <Button x:Name="DeleteSceneButton" Content="Delete Scene" Style="{StaticResource GhostButton}"
+                            Margin="8,0,0,0" IsEnabled="False" Click="DeleteScene_Click"
+                            Foreground="{StaticResource Bad}"
+                            ToolTip="Take the marked range out: it will not go to air, and the delay shrinks by its length"/>
 
                     <!-- A single point, not a range: "bleep here", "cut from here". Amber, so it
                          is never mistaken for the green in/out pair or the red transmitter. -->
@@ -395,7 +516,8 @@
 
                 <!-- Zoom lives with the transport rather than on the timeline: it is a thing
                      done while watching, and the keyboard is the real control. -->
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center">
+                <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal"
+                            HorizontalAlignment="Left" VerticalAlignment="Center">
                     <Button x:Name="ZoomOutButton" Content="&#8722;" Style="{StaticResource GhostButton}"
                             Width="30" Click="ZoomOut_Click" ToolTip="Show more time (-)"/>
                     <TextBlock x:Name="ZoomText" Width="120" TextAlignment="Center"
@@ -408,16 +530,22 @@
                          only what runs from the start of the capture to the transmitter.
                          The infinity sign rather than the word - it is the one glyph that says
                          this without needing eight characters of the transport bar. -->
-                    <ToggleButton x:Name="InfiniteButton" Content="&#8734;" Margin="16,0,0,0"
+                    <!-- Holds the timeline still so a particular stretch can be worked on. While
+                         it is running the marker is pinned and the recording slides under it;
+                         frozen, the view stays put and the marker crosses it. -->
+                    <!-- A snowflake: frozen. Segoe UI Symbol, which every Windows has and which
+                         carries the glyph, rather than whatever the theme font falls back to. -->
+                    <ToggleButton x:Name="FreezeButton" Content="&#x2744;" Margin="16,0,0,0"
+                                  Style="{StaticResource IpSmallToggle}" Height="24" Width="34"
+                                  Padding="0" FontSize="15" FontFamily="Segoe UI Symbol"
+                                  Click="Freeze_Changed"
+                                  ToolTip="Freeze: hold the timeline still and let the markers move across it. Unfreeze and it runs on with air from where it is. A goes back to the on-air mark."/>
+
+                    <ToggleButton x:Name="InfiniteButton" Content="&#8734;" Margin="8,0,0,0" IsChecked="True"
                                   Style="{StaticResource IpSmallToggle}" Height="24" Width="34"
                                   Padding="0" FontSize="17" Click="Infinite_Changed"
-                                  ToolTip="Infinite view: the capture up to the on-air point, as one bar"/>
+                                  ToolTip="Infinite: every segment on the clock, zoomable out to the whole day. Off: the recording as one bar, zoomed out no further than the delay."/>
 
-                    <!-- What is selected on a layer, and its level. Keyboard-driven: the
-                         brackets move it a decibel at a time, Delete takes it off. -->
-                    <TextBlock x:Name="LayerText" Margin="16,0,0,0" VerticalAlignment="Center"
-                               FontFamily="Consolas" FontSize="11"
-                               Foreground="{StaticResource Ok}"/>
                 </StackPanel>
 
                 <!-- The right-hand readouts. Nothing in here grows with what the operator does:
@@ -425,7 +553,8 @@
                      set, and because this panel and the volume slider share one Grid it reached
                      back across the slider and swallowed the clicks meant for it. The marks are
                      labelled on the timeline itself, which is where they are. -->
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal"
+                            HorizontalAlignment="Right" VerticalAlignment="Center">
                     <!-- Go to an exact frame, typed. At anything short of the last zoom level one
                          pixel of the timeline is many frames, so there is no click that can land
                          on a chosen frame; this is how you name one. Takes a timecode, or a bare
@@ -447,6 +576,14 @@
                                FontFamily="Consolas" FontSize="11"
                                Foreground="{StaticResource Muted}"/>
                 </StackPanel>
+
+                <!-- What is selected on a layer or the ingest lane, and what it does. A whole
+                     row of its own because it is a sentence, and trimmed rather than wrapped so
+                     the bar cannot change height as the selection changes. -->
+                <TextBlock x:Name="LayerText" Grid.Row="1" Grid.ColumnSpan="3"
+                           Margin="0,6,0,0" FontFamily="Consolas" FontSize="11"
+                           TextTrimming="CharacterEllipsis"
+                           Foreground="{StaticResource Ok}"/>
             </Grid>
         </Border>
 
@@ -456,7 +593,9 @@
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="24"/>
+                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
@@ -465,45 +604,132 @@
                      something you would grab. -->
                 <Canvas x:Name="RulerCanvas" Grid.Row="0" ClipToBounds="True"
                         Background="#141920" SizeChanged="Timeline_SizeChanged"
+                        MouseLeftButtonDown="Ruler_Click"
                         MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
-                        MouseLeave="Pan_Leave"/>
+                        MouseLeave="Pan_Leave"
+                        Cursor="Hand"
+                        ToolTip="Click to seek. Middle-drag to pan."/>
+
+                <!-- ====================== the ingest lane ======================
+                     Directly above the segments, between them and the ruler, because it is the
+                     one track that changes what goes to air: an item here replaces the
+                     recording under it. The two layers at the bottom are monitor layers and
+                     belong below. Takes a drop from the Ingest list anywhere on the timeline,
+                     and this is where the result lands. -->
+                <Canvas x:Name="IngestCanvas" Grid.Row="1" Height="38" ClipToBounds="True"
+                        Background="#121823" AllowDrop="True"
+                        SizeChanged="Timeline_SizeChanged"
+                        DragOver="Overlay_DragOver" Drop="Overlay_Drop"
+                        MouseLeftButtonDown="Ingest_Click"
+                        MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
+                        MouseLeave="Pan_Leave"
+                        ToolTip="Click to seek and select. Middle-drag to pan. Wheel to zoom."/>
 
                 <!-- Left button puts the playhead somewhere; the middle button - the scroll
                      wheel pressed - drags the view itself, which is what a hand cursor over a
                      timeline means everywhere else. -->
-                <Canvas x:Name="TrackCanvas" Grid.Row="1" ClipToBounds="True"
+                <Canvas x:Name="TrackCanvas" Grid.Row="2" ClipToBounds="True"
                         SizeChanged="Timeline_SizeChanged"
                         MouseLeftButtonDown="Timeline_Click" Background="Transparent"
+                        AllowDrop="True" DragOver="Overlay_DragOver" Drop="Overlay_Drop"
                         MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
                         MouseLeave="Pan_Leave"/>
+
+                <!-- ====================== the audio lane ======================
+                     The recording's own sound, under its picture. C cuts it at the playhead; a
+                     click picks up the piece between cuts (or the marked range), which [ and ]
+                     make quieter and louder. Delete Scene takes the sound out with the picture. -->
+                <Canvas x:Name="AudioCanvas" Grid.Row="3" Height="72" ClipToBounds="True"
+                        Background="#0E1512"
+                        SizeChanged="Timeline_SizeChanged"
+                        MouseLeftButtonDown="Audio_Click"
+                        MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
+                        MouseLeave="Pan_Leave"
+                        ToolTip="The recording's sound. Click to pick up a piece; C cuts at the playhead; [ ] level. Delete Scene takes out the sound with the picture."/>
+
+                <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Left"
+                            VerticalAlignment="Top" Margin="48,3,0,0">
+                    <Button Content="&#9986; Cut" Style="{StaticResource GhostButton}" Height="20"
+                            Padding="6,0" FontSize="10" Click="CutAudio_Click"
+                            ToolTip="Cut the sound at the playhead (C)"/>
+                    <Button Content="&#8722;dB" Style="{StaticResource GhostButton}" Height="20"
+                            Padding="6,0" FontSize="10" Margin="4,0,0,0" Click="AudioDown_Click"
+                            ToolTip="The piece picked up a decibel quieter ([)"/>
+                    <Button Content="+dB" Style="{StaticResource GhostButton}" Height="20"
+                            Padding="6,0" FontSize="10" Margin="4,0,0,0" Click="AudioUp_Click"
+                            ToolTip="The piece picked up a decibel louder (])"/>
+                </StackPanel>
 
                 <!-- The layers. Drop an audio or video file on one to lay it over the recording
                      at the time you dropped it - an ad, a bed, a voice track. Two, because two
                      is what a lane and an alternate need and more would make the timeline a
                      thicket at this height. -->
-                <!-- 108: two hand-drop lanes and the ingest lane below them, 36 each. -->
-                <Canvas x:Name="OverlayCanvas" Grid.Row="2" Height="108" ClipToBounds="True"
+                <!-- 72: the two hand-drop lanes, 36 each. The ingest lane has its own canvas
+                     above the segments. -->
+                <Canvas x:Name="OverlayCanvas" Grid.Row="4" Height="72" ClipToBounds="True"
                         Background="#101419" AllowDrop="True"
                         SizeChanged="Timeline_SizeChanged"
                         DragOver="Overlay_DragOver" Drop="Overlay_Drop"
-                        MouseLeftButtonDown="Overlay_Click"/>
+                        MouseLeftButtonDown="Overlay_Click"
+                        MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
+                        MouseLeave="Pan_Leave"/>
 
                 <!-- Left-aligned with a margin rather than drawn on the canvas: it moves every
                      frame, and moving a margin does not rebuild the timeline under it. -->
                 <!-- Two markers, and they are not the same thing. The playhead is where the
                      operator is looking; the on-air marker is where the transmitter actually
                      is. Red is the one that matters on air. -->
-                <Rectangle x:Name="Playhead" Grid.RowSpan="3" Width="1.5" HorizontalAlignment="Left"
+                <Rectangle x:Name="Playhead" Grid.Row="1" Grid.RowSpan="4" Width="1.5" HorizontalAlignment="Left"
                            Fill="{StaticResource Tc}" Margin="0" IsHitTestVisible="False"/>
 
-                <Rectangle x:Name="OnAirMarker" Grid.RowSpan="3" Width="2" HorizontalAlignment="Left"
+                <!-- The no touch zone: from the transmitter to ten seconds ahead of it. What is in
+                     it is about to go out, and its media is already being opened, so nothing in it
+                     can be selected or changed. Moved like the marker, by margin, every frame. -->
+                <Border x:Name="NoTouchZone" Grid.Row="1" Grid.RowSpan="3" HorizontalAlignment="Left"
+                        Background="#2EEF4444" BorderBrush="#88EF4444" BorderThickness="0,0,1,0"
+                        Margin="0" IsHitTestVisible="False" Visibility="Collapsed"
+                        ClipToBounds="True">
+                    <TextBlock Text="NO EDIT ZONE" Foreground="{StaticResource Bad}" FontSize="8.5"
+                               FontWeight="Bold" FontFamily="Consolas" Margin="4,2,0,0"
+                               VerticalAlignment="Top" HorizontalAlignment="Left"/>
+                </Border>
+
+                <Rectangle x:Name="OnAirMarker" Grid.Row="1" Grid.RowSpan="4" Width="2" HorizontalAlignment="Left"
                            Fill="{StaticResource Bad}" Margin="0" IsHitTestVisible="False"
                            Visibility="Collapsed"/>
+
+                <!-- Details of whatever was last clicked: a bookmark's note, or a segment's
+                     metadata. One card for both, because they answer the same question about
+                     different things and two floating panels competing for the same corner
+                     would be worse than one. Positioned near the click and dismissed by
+                     clicking anywhere that is not a bookmark or a segment. -->
+                <Border x:Name="DetailsCard" Grid.Row="2" Visibility="Collapsed"
+                        HorizontalAlignment="Left" VerticalAlignment="Top"
+                        Background="#F2141920" BorderBrush="{StaticResource Accent}"
+                        BorderThickness="1" CornerRadius="5" Padding="11,9"
+                        MaxWidth="420" Panel.ZIndex="30">
+                    <StackPanel>
+                        <Grid>
+                            <TextBlock x:Name="DetailsHeading" FontSize="11.5" FontWeight="SemiBold"
+                                       Foreground="{StaticResource Text}"
+                                       TextTrimming="CharacterEllipsis" Margin="0,0,22,0"/>
+
+                            <Button Content="&#215;" Style="{StaticResource GhostButton}"
+                                    HorizontalAlignment="Right" VerticalAlignment="Top"
+                                    Width="18" Height="18" Padding="0" FontSize="11"
+                                    Click="DetailsClose_Click" ToolTip="Close"/>
+                        </Grid>
+
+                        <TextBlock x:Name="DetailsBody" Margin="0,6,0,0" FontSize="10.5"
+                                   FontFamily="Consolas" TextWrapping="Wrap"
+                                   Foreground="{StaticResource Muted}"/>
+                    </StackPanel>
+                </Border>
 
                 <!-- Only there when there is something to scroll: at the widest zoom the whole
                      day is across the window and a scrollbar would be a control that does
                      nothing. Its units are frames of the day, like everything else here. -->
-                <ScrollBar x:Name="TimeScroll" Grid.Row="3" Orientation="Horizontal"
+                <ScrollBar x:Name="TimeScroll" Grid.Row="5" Orientation="Horizontal"
                            Height="18" Margin="0,2,0,0" Minimum="0"
                            SmallChange="1" Visibility="Collapsed"
                            Scroll="TimeScroll_Scroll"/>

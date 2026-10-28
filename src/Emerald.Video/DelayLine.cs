@@ -42,6 +42,16 @@ public sealed class DelayFrameBuffer
     public int AudioBytes { get; internal set; }
     public long Sequence { get; internal set; } = -1;
 
+    /// <summary>
+    /// Which frame of the <i>recording</i> this is, counted from the recorder's first frame.
+    ///
+    /// Not the same number as <see cref="Sequence"/>, which counts from the first frame this
+    /// line took. A line opened part-way through a recording - arming, or disarming and arming
+    /// again, ten minutes in - starts its own count at nought while the recording is already
+    /// ten minutes along, and anything placing the transmitter on the recording needs this one.
+    /// </summary>
+    public long RecordingFrame { get; internal set; } = -1;
+
     /// <summary>True when the receiver genuinely carried audio, rather than silence standing in.</summary>
     public bool AudioWasReal { get; internal set; }
 }
@@ -81,6 +91,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private const int OffVideoBytes = 8;    // int
     private const int OffAudioBytes = 12;   // int
     private const int OffFlags = 16;        // int
+    private const int OffRecordingFrame = 24; // long
     private const int FlagAudioReal = 1;
 
     /// <summary>
@@ -251,13 +262,26 @@ public sealed class DelayLine : IDelayLine, IDisposable
         return true;
     }
 
-    public static DelayLine Create(string folder, CaptureFormat format, TimeSpan delay)
+    public static DelayLine Create(string folder, CaptureFormat format, TimeSpan delay) =>
+        Create(folder, format, delay, TimeSpan.Zero);
+
+    /// <summary>
+    /// A line that fills to <paramref name="delay"/> but holds <paramref name="headroom"/> more.
+    ///
+    /// For a transmitter whose delay grows while it runs - Live Edit's, where an insert holds
+    /// the recording back for as long as it plays. The ring cannot be enlarged once it exists,
+    /// so the room has to be made up front; the target, and so the countdown, is still only the
+    /// delay asked for.
+    /// </summary>
+    public static DelayLine Create(string folder, CaptureFormat format, TimeSpan delay, TimeSpan headroom)
     {
-        if (!Validate(folder, format, delay, out long size, out string? problem))
+        TimeSpan holds = delay + (headroom > TimeSpan.Zero ? headroom : TimeSpan.Zero);
+
+        if (!Validate(folder, format, holds, out long size, out string? problem))
             throw new DelayLineException(problem!);
 
         long stride = SlotStrideFor(format);
-        long slots = SlotCountFor(format, delay);
+        long slots = SlotCountFor(format, holds);
         long target = (long)Math.Ceiling(delay.TotalSeconds * format.FrameRate);
 
         string path = System.IO.Path.Combine(
@@ -364,7 +388,12 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// Never throws. A ring that cannot be written seals itself and lets the drain finish;
     /// losing the delay must not cost the operator the recording.
     /// </summary>
-    public unsafe void Write(byte[] video, int videoBytes, byte[]? audio, int audioBytes, bool audioReal)
+    /// <param name="recordingFrame">
+    /// The frame's place in the recording, from <see cref="CapturedFrame.Sequence"/>. Left out,
+    /// the line's own count stands in, which is right only for a line opened as the recording rolled.
+    /// </param>
+    public unsafe void Write(byte[] video, int videoBytes, byte[]? audio, int audioBytes, bool audioReal,
+                             long recordingFrame = -1)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
 
@@ -392,6 +421,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
             *(int*)(slot + OffVideoBytes) = keptVideo;
             *(int*)(slot + OffAudioBytes) = keptAudio;
             *(int*)(slot + OffFlags) = audioReal ? FlagAudioReal : 0;
+            *(long*)(slot + OffRecordingFrame) = recordingFrame >= 0 ? recordingFrame : seq;
 
             // Last, with a release: everything above must be visible before the sequence is.
             Volatile.Write(ref *(long*)(slot + OffSequence), seq);
@@ -456,7 +486,8 @@ public sealed class DelayLine : IDelayLine, IDisposable
         try
         {
             foreach (CapturedFrame frame in _queue!.GetConsumingEnumerable())
-                Write(frame.Video, frame.VideoBytes, frame.Audio, frame.AudioBytes, frame.AudioReal);
+                Write(frame.Video, frame.VideoBytes, frame.Audio, frame.AudioBytes, frame.AudioReal,
+                      frame.Sequence);
         }
         catch (Exception ex)
         {
@@ -508,6 +539,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
         int videoBytes = Math.Min(*(int*)(slot + OffVideoBytes), FrameBytes);
         int audioBytes = Math.Min(*(int*)(slot + OffAudioBytes), _audioCapacity);
         bool audioReal = (*(int*)(slot + OffFlags) & FlagAudioReal) != 0;
+        long recordingFrame = *(long*)(slot + OffRecordingFrame);
 
         fixed (byte* dst = into.Video)
             Buffer.MemoryCopy(slot + SlotHeaderBytes, dst, into.Video.Length, videoBytes);
@@ -534,10 +566,65 @@ public sealed class DelayLine : IDelayLine, IDisposable
         into.AudioBytes = audioBytes;
         into.AudioWasReal = audioReal;
         into.Sequence = sequence;
+        into.RecordingFrame = recordingFrame;
         return DelayReadResult.Ok;
     }
 
     public DelayFrameBuffer NewBuffer() => new(FrameBytes, _audioCapacity);
+
+    /// <summary>
+    /// Which frame of the recording a slot holds, from its header alone - no copy of the picture.
+    /// -1 when the slot is not there to ask: not written yet, lapped, or being written.
+    /// </summary>
+    public unsafe long RecordingFrameAt(long sequence)
+    {
+        if (Volatile.Read(ref _disposed) != 0 || sequence < 0) return -1;
+
+        long written = Volatile.Read(ref _written);
+        if (sequence >= written || sequence < written - SlotCount) return -1;
+
+        byte* slot = SlotAt(sequence);
+
+        if (Volatile.Read(ref *(long*)(slot + OffSequence)) != sequence) return -1;
+        long recordingFrame = *(long*)(slot + OffRecordingFrame);
+
+        Interlocked.MemoryBarrier();
+        return Volatile.Read(ref *(long*)(slot + OffSequence)) == sequence ? recordingFrame : -1;
+    }
+
+    /// <summary>
+    /// The slot holding frame <paramref name="recordingFrame"/> of the recording, or -1 if the
+    /// line does not hold it - older than the ring reaches back, or not recorded yet.
+    ///
+    /// <b>Searched, not worked out.</b> A slot's recording frame is its sequence plus a constant
+    /// only while nothing is dropped; a frame the line could not keep up with leaves a step in
+    /// it. So it starts from the arithmetic and walks by the difference it finds, which lands in
+    /// one or two looks, and settles for the nearest frame when the one asked for was dropped.
+    /// </summary>
+    public long SequenceOf(long recordingFrame)
+    {
+        long newest = FramesWritten - 1;
+        long newestFrame = RecordingFrameAt(newest);
+        if (newestFrame < 0 || recordingFrame > newestFrame) return -1;
+
+        long seq = newest - (newestFrame - recordingFrame);
+
+        for (int look = 0; look < 8; look++)
+        {
+            long at = RecordingFrameAt(seq);
+            if (at < 0) return -1;
+            if (at == recordingFrame) return seq;
+
+            // The frame asked for was dropped, and this slot is beside the gap it left.
+            long beside = RecordingFrameAt(at > recordingFrame ? seq - 1 : seq + 1);
+            if (at > recordingFrame ? beside >= 0 && beside < recordingFrame : beside > recordingFrame)
+                return seq;
+
+            seq -= at - recordingFrame;
+        }
+
+        return -1;
+    }
 
     // ------------------------------------------------------------------ lifetime
 
@@ -547,6 +634,20 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// by whichever half happens to stop first.
     /// </summary>
     public void AddRef() => Interlocked.Increment(ref _refs);
+
+    /// <summary>
+    /// A claim for a reader that found the line somewhere shared and so cannot know it is still
+    /// open: false, and no claim taken, if its last holder has already let it go.
+    /// </summary>
+    public bool TryAddRef()
+    {
+        while (true)
+        {
+            int refs = Volatile.Read(ref _refs);
+            if (refs <= 0 || Volatile.Read(ref _disposed) != 0) return false;
+            if (Interlocked.CompareExchange(ref _refs, refs + 1, refs) == refs) return true;
+        }
+    }
 
     public void Release()
     {

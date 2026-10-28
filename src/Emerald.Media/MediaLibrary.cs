@@ -162,7 +162,19 @@ public static class MediaLibrary
             {
                 if (!Directory.Exists(from)) return;
 
-                foreach (string path in Directory.EnumerateFiles(from, "*", depth))
+                string[] paths = Directory.EnumerateFiles(from, "*", depth)
+                                          .Where(MediaScanner.IsPlayable)
+                                          .ToArray();
+
+                // The probes first, several at once, so the loop below finds them answered. Only
+                // the first listing has many to do - after that MediaProbe remembers every closed
+                // file - but a store of hundreds of short segments was a minute of one ffprobe
+                // after another before the timeline showed anything.
+                if (ffprobePath is not null)
+                    Parallel.ForEach(paths, new ParallelOptions { MaxDegreeOfParallelism = 6 },
+                                     path => MediaProbe.Probe(ffprobePath, path, frameRate));
+
+                foreach (string path in paths)
                 {
                     if (!MediaScanner.IsPlayable(path)) continue;
 

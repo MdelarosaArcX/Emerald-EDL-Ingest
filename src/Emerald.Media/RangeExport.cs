@@ -211,7 +211,7 @@ public static class RangeExport
             // a convenience on top of it.
             progress?.Invoke("writing the playable preview copy - this is the slow part");
 
-            WritePreview(ffmpegPath, output);
+            WritePreview(ffmpegPath, output, frameRate);
 
             return new ExportResult(true, output, "");
         }
@@ -241,6 +241,27 @@ public static class RangeExport
     /// </summary>
     public const string PreviewSuffix = ".preview.mp4";
 
+    /// <summary>
+    /// What to actually play for an export: the export itself when it can be played, and the
+    /// copy written beside it when it cannot.
+    ///
+    /// An export cut from the masters is DNxHD in a .mov, which Media Foundation cannot decode —
+    /// that is the whole reason the copy exists. An export cut from the proxies is already H.264
+    /// in an .mp4 and plays perfectly well, so sending it through the copy would cost a
+    /// generation of quality for nothing.
+    ///
+    /// Judged by extension rather than by probing, because the extension is not a guess here:
+    /// the exporter chooses it from the source it cut, so .mov means masters and .mp4 means
+    /// proxies.
+    /// </summary>
+    public static string? PlayablePathFor(string exportPath)
+    {
+        if (Path.GetExtension(exportPath).Equals(".mp4", StringComparison.OrdinalIgnoreCase))
+            return exportPath;
+
+        return PreviewFor(exportPath);
+    }
+
     /// <summary>The playable copy of an export, if one was written.</summary>
     public static string? PreviewFor(string exportPath)
     {
@@ -262,7 +283,7 @@ public static class RangeExport
     /// good export, and saying it failed would send somebody looking for a problem with media
     /// that is fine.
     /// </summary>
-    private static void WritePreview(string ffmpegPath, string exportPath)
+    private static void WritePreview(string ffmpegPath, string exportPath, int frameRate)
     {
         try
         {
@@ -277,12 +298,31 @@ public static class RangeExport
                      {
                          "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                          "-i", exportPath,
-                         // Small and fast. This is for answering "is this the right material",
-                         // not for looking at closely - the master beside it is for that.
-                         "-vf", "scale=-2:360",
-                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+
+                         // Full raster, and no scale filter at all.
+                         //
+                         // This was 640x360 on the reasoning that it only had to answer "is this
+                         // the right material". That was true when the only thing playing it was
+                         // the thumbnail beside the ingest list. It is not true now: an ingest
+                         // placement plays this copy on the main viewer, because the export
+                         // itself is DNxHD and nothing here can decode that - so this is the
+                         // picture, and 360 lines blown up to fill a viewer is what "very low
+                         // quality" looks like.
+                         "-c:v", "libx264",
+                         "-preset", "veryfast",
+                         "-profile:v", "high",
+                         "-crf", "20",
                          "-pix_fmt", "yuv420p",
-                         "-c:a", "aac", "-b:a", "128k",
+
+                         // No B-frames and a keyframe every half second, for the same reason the
+                         // capture proxy has them: this copy gets scrubbed and stepped through,
+                         // and reordered pictures with eleven seconds between keyframes is what
+                         // makes that lurch.
+                         "-bf", "0",
+                         "-g", Math.Max(1, frameRate / 2).ToString(),
+                         "-sc_threshold", "0",
+
+                         "-c:a", "aac", "-b:a", "192k",
                          PreviewPathFor(exportPath),
                      })
                 info.ArgumentList.Add(a);

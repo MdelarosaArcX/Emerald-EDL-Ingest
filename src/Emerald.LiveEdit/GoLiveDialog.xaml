@@ -1,0 +1,77 @@
+<Window x:Class="Emerald.LiveEdit.GoLiveDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Go Live" Width="440" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Background="{StaticResource Bg}">
+
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="GO LIVE" Foreground="{StaticResource Bad}"
+                   FontSize="14" FontWeight="Bold"/>
+
+        <TextBlock Grid.Row="1" Margin="0,6,0,0" TextWrapping="Wrap" FontSize="11"
+                   Foreground="{StaticResource Muted}"
+                   Text="Puts the capture deck's recording to air a delay later, with this timeline's ingest media and deleted scenes played into it as the recording reaches them. The playback deck is not affected."/>
+
+        <Grid Grid.Row="2" Margin="0,14,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="96"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Text="Board" Foreground="{StaticResource Muted}"
+                       FontSize="11.5" VerticalAlignment="Center"/>
+            <ComboBox x:Name="BoardBox" Grid.Row="0" Grid.Column="1" Height="26"
+                      SelectionChanged="Board_Changed"/>
+
+            <TextBlock Grid.Row="1" Text="TX ports" Foreground="{StaticResource Muted}"
+                       FontSize="11.5" Margin="0,10,0,0" VerticalAlignment="Top"/>
+            <StackPanel Grid.Row="1" Grid.Column="1" Margin="0,10,0,0">
+                <WrapPanel x:Name="PortPanel"/>
+                <TextBlock x:Name="PortsNote" FontSize="10.5" Foreground="{StaticResource Muted}"
+                           TextWrapping="Wrap" Margin="0,4,0,0"/>
+            </StackPanel>
+
+            <TextBlock Grid.Row="2" Text="Delay" Foreground="{StaticResource Muted}"
+                       FontSize="11.5" Margin="0,10,0,0" VerticalAlignment="Center"/>
+            <ComboBox x:Name="DelayBox" Grid.Row="2" Grid.Column="1" Height="26" Margin="0,10,0,0"
+                      SelectionChanged="Room_Changed"
+                      ToolTip="How far behind the receiver the transmission runs before any insert or cut changes it"/>
+
+            <TextBlock Grid.Row="3" Text="Insert room" Foreground="{StaticResource Muted}"
+                       FontSize="11.5" Margin="0,10,0,0" VerticalAlignment="Center"/>
+            <ComboBox x:Name="HeadroomBox" Grid.Row="3" Grid.Column="1" Height="26" Margin="0,10,0,0"
+                      SelectionChanged="Room_Changed"
+                      ToolTip="How much the delay may grow while live. Every inserted item holds the recording back for its length; the delay buffer is made big enough for this much, up front."/>
+        </Grid>
+
+        <!-- What it will take: the disk the delay buffer needs, and the most the inserts can add. -->
+        <Border Grid.Row="3" Margin="0,14,0,0" Padding="11,9" CornerRadius="4"
+                Background="#1F242D" BorderBrush="{StaticResource Line}" BorderThickness="1">
+            <TextBlock x:Name="SummaryText" FontFamily="Consolas" FontSize="11" LineHeight="16"
+                       Foreground="{StaticResource Tc}" TextWrapping="Wrap"/>
+        </Border>
+
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+            <Button Content="Cancel" Style="{StaticResource GhostButton}" Width="88"
+                    IsCancel="True" Click="Cancel_Click"/>
+            <Button x:Name="GoButton" Content="Go Live" Style="{StaticResource PrimaryButton}"
+                    Width="104" Margin="8,0,0,0" IsDefault="True" Click="Go_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

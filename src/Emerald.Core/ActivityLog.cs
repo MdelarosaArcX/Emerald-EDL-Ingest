@@ -16,7 +16,7 @@ public enum LogLevel { Info, Ok, Warn, Error }
 /// "Capture:" or "Tidal lock " or "Audio " and no two modules agreed on the punctuation, so
 /// the source could not be filtered on — only searched for, badly.
 /// </summary>
-public enum LogSource { App, Capture, Preview, TidalLock, Edl, Playout, Playback, Ingest, Media, Board }
+public enum LogSource { App, Capture, Preview, TidalLock, Edl, Playout, Playback, Ingest, Media, Board, LiveEdit }
 
 /// <summary>
 /// One line of the record.

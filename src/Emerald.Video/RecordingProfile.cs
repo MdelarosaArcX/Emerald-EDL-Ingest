@@ -83,7 +83,19 @@ public sealed record RecordingProfile(
     int AudioSampleRate,
     int SegmentSeconds)
 {
-    /// <summary>The proxy: what the clip strip lists and the stage plays.</summary>
+    /// <summary>
+    /// The proxy: what the clip strip lists, what Live Edit scrubs, and what every viewer in
+    /// the application actually plays — because nothing here can decode the DNxHD master.
+    ///
+    /// <b>Full raster, not half.</b> It was 960x540, which is what "proxy" usually means — but
+    /// this one is not a stand-in for something the operator can also watch. The master is
+    /// unplayable in the application, so the proxy is the picture: Live Edit, the ingest monitor
+    /// and every preview show it, and an edit is judged on it. A half-size picture scaled back
+    /// up to fill a viewer is soft, and reading "the video is low res" off it is correct.
+    ///
+    /// On this plant that costs nothing worth having: a Xeon Gold 6138, twenty cores, measured
+    /// at a few per cent while recording. x264 at 1080p25 is one or two of them.
+    /// </summary>
     public static RecordingOutput LowRes { get; } = new(
         Key: "low",
         Folder: "low",
@@ -92,7 +104,7 @@ public sealed record RecordingProfile(
         VideoCodec: "libx264",
         VideoLabel: "H.264",
         PixelFormat: "yuv420p",
-        HalfSize: true,
+        HalfSize: false,
         FourCc: "avc1");
 
     /// <summary>
@@ -181,6 +193,8 @@ public sealed record RecordingProfile(
         // 30 seconds is the default, and it has to be on this list to be usable at all: Pick
         // treats a value that is not here as unknown and falls back, so a settings file asking
         // for 30 would have been silently overruled.
+        new RecordingOption<int>(10, "10 s"),
+        new RecordingOption<int>(15, "15 s"),
         new RecordingOption<int>(30, "30 s"),
         new RecordingOption<int>(60, "1 min"),
         new RecordingOption<int>(120, "2 min"),
@@ -344,8 +358,28 @@ public sealed record RecordingProfile(
 
             if (output.VideoCodec == "libx264")
             {
-                args.Add("-preset"); args.Add("ultrafast");
-                args.Add("-tune"); args.Add("zerolatency");
+                // veryfast, not ultrafast.
+                //
+                // ultrafast turns off CABAC and most of the motion search, which is why the
+                // proxy came out as Constrained Baseline: measured at 2.9 Mbps for a 960x540
+                // picture, which is a great many bits for a mediocre one. veryfast restores
+                // CABAC and a real motion search, and on this hardware - twenty cores at a few
+                // per cent - the extra time is irrelevant.
+                args.Add("-preset"); args.Add("veryfast");
+
+                // High profile for CABAC and 8x8 transforms. Nothing that plays this cannot
+                // read it: Media Foundation, every browser and every editor have handled High
+                // since about 2007.
+                args.Add("-profile:v"); args.Add("high");
+
+                // No B-frames, kept deliberately after dropping -tune zerolatency, which used
+                // to impose it as a side effect.
+                //
+                // This is a scrubbing copy. B-frames reorder the stream, and a player stepping
+                // backwards a frame at a time through reordered pictures is the slow, lurching
+                // behaviour that makes an edit timeline unusable. The bitrate they would save is
+                // not worth that here.
+                args.Add("-bf"); args.Add("0");
 
                 // A keyframe every half second, so the proxy can be seeked.
                 //

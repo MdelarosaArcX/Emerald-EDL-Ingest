@@ -111,6 +111,41 @@ public class RecordingSequenceTests
             },
             shuffled.OrderBy(f => f, StringComparer.Ordinal));
     }
+
+    // ------------------------------------------------------------------ midnight
+
+    /// <summary>
+    /// A recording rolled at 23:30:00 hands over to the new day's folder after exactly half an
+    /// hour of frames, so the folder can be named 00-00-00 and be right to the frame.
+    /// </summary>
+    [Fact]
+    public void Midnight_is_an_exact_count_of_frames_from_the_folder_start()
+    {
+        var rolled = new DateTime(2026, 10, 17, 23, 30, 0);
+
+        Assert.Equal(30 * 60 * 25, RecordingSequence.FramesToNextDay(rolled, 25));
+        Assert.Equal(30 * 60 * 50, RecordingSequence.FramesToNextDay(rolled, 50));
+    }
+
+    [Fact]
+    public void A_recording_rolled_at_midnight_has_a_whole_day_to_run()
+    {
+        var midnight = new DateTime(2026, 10, 18);
+
+        Assert.Equal(24L * 3600 * 25, RecordingSequence.FramesToNextDay(midnight, 25));
+    }
+
+    /// <summary>The new day's folder is named for midnight, so Live Edit places it at 00:00:00.</summary>
+    [Fact]
+    public void The_new_day_folder_reads_back_as_midnight()
+    {
+        var midnight = new DateTime(2026, 10, 18);
+        RecordingNames names = RecordingSequence.Next(midnight, "media");
+
+        Assert.Equal("2026-10-18_00-00-00", names.Folder);
+        Assert.Equal(midnight, RecordingSequence.FolderStartedAt(names.Folder));
+        Assert.Equal(1, names.Start);
+    }
 }
 
 /// <summary>

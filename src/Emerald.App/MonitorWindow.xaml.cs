@@ -547,8 +547,14 @@ public partial class MonitorWindow : Window
 
         // The delay itself accounts for exactly this many frames not yet being out. Anything
         // beyond it is a frame that was recorded and is not going to air.
-        long delay = lockState.Line?.TargetFrames ?? 0;
-        long behind = Math.Max(0, frames.Recorded - frames.Aired - delay);
+        long delay = lockState.TargetFrames;
+        // From the frame of the recording actually on air, not from frames sent: the line can have
+        // been filling since the recording began, long before this transmitter started counting.
+        // A second of slack, because the recorded count is only published once a second.
+        long slack = TidalLock.Shared.Line?.FrameRate ?? 25;
+        long behind = PipelineState.Shared.AiredFrame is { } airedAt
+            ? Math.Max(0, frames.Recorded - (airedAt + 1) - delay - slack)
+            : 0;
 
         DelayFrames.Text =
             $"{frames.Aired:N0} out of {frames.Recorded:N0}  ·  delay {delay:N0}" +

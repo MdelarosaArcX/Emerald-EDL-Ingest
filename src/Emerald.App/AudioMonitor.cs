@@ -1,3 +1,4 @@
+using Emerald.Core;
 using Emerald.Video;
 
 namespace Emerald.App;
@@ -248,25 +249,92 @@ public sealed class AudioMonitor : IDisposable
     /// signal would otherwise leave every bar frozen where it was, which looks exactly like a
     /// signal that is still there.
     /// </summary>
+    /// <summary>How many drops had been counted when this was last reported.</summary>
+    private long _dropsSaid;
+    private DateTime _dropsSaidAt = DateTime.MinValue;
+
+    /// <summary>
+    /// Says when the speaker monitor is dropping, and how far behind the picture it is.
+    ///
+    /// <b>Dropping here is normal and worth saying anyway.</b> The receiver's audio clock and
+    /// the sound card's are independent, so one of them is always slightly faster; when the card
+    /// is the slower, the queue reaches its cap and every surplus frame is discarded to stop the
+    /// sound sliding further behind the picture. That is the design working, not a fault.
+    ///
+    /// It is reported because the symptom without it — "the audio goes out of sync and I think
+    /// frames are being dropped, I don't know" — is unanswerable after the fact. A line naming
+    /// the latency and the count makes it a measurement.
+    ///
+    /// At most once a minute, since on a diverging pair of clocks it never stops.
+    /// </summary>
+    private void ReportSpeakerDrift()
+    {
+        SpeakerOutput? speakers;
+
+        lock (_gate) speakers = _speakers;
+
+        if (speakers is not { IsOpen: true }) return;
+
+        long dropped = speakers.Dropped;
+
+        if (dropped <= _dropsSaid) return;
+
+        DateTime now = DateTime.UtcNow;
+
+        if ((now - _dropsSaidAt).TotalSeconds < 60) return;
+
+        long since = dropped - _dropsSaid;
+
+        _dropsSaid = dropped;
+        _dropsSaidAt = now;
+
+        ActivityLog.Shared.Info(LogSource.Preview,
+            $"The speaker monitor dropped {since} frame(s) of audio in the last minute and is " +
+            $"{speakers.LatencyMs} ms behind the picture. This is the monitor holding its own " +
+            "lip sync: the receiver and the sound card run on separate clocks, so the slower one " +
+            "is trimmed. Nothing recorded or transmitted is affected.",
+            @event: "preview.audiodrift");
+    }
+
     public void Tick(TimeSpan elapsed)
     {
+        ReportSpeakerDrift();
+
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
         long last = Volatile.Read(ref _lastTicks);
-        long since = System.Diagnostics.Stopwatch.GetTimestamp() - last;
+        long since = now - last;
 
         // A quarter second with nothing arriving is a feed that has gone, not a slow frame.
         if (last != 0 && since <= System.Diagnostics.Stopwatch.Frequency / 4) return;
 
-        PairsPresent = 0;
+        long holdTicks = (long)(SignalHold.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
 
         lock (_levelGate)
         {
-            Array.Clear(_signalTicks);
-
+            // The meters fall, and the presence hold is left to expire on its own.
+            //
+            // This used to zero the pair count and wipe every channel's last-signal time the
+            // moment a quarter second passed with nothing arriving. That made the three-second
+            // hold above unreachable: the shorter rule always won, so any gap in the audio -
+            // a pause between words, a stall in whatever is feeding the monitor - collapsed the
+            // count to nothing and the next slot put it straight back.
+            //
+            // On a feed that stutters, that is a pair count flapping between one and none twice
+            // a second, and a log of nothing but "1 of 8 carrying (was 0)" alternating with
+            // "0 of 8 carrying (was 1)". The hold exists precisely so a quiet moment is not
+            // mistaken for a language going away; it is now allowed to do its job, and the
+            // count only falls once three seconds have genuinely passed without signal.
             for (int c = 0; c < _meters.Length; c++)
             {
                 _meters[c].Idle(elapsed);
                 _levels[c] = _meters[c].Level;
             }
+
+            PairsPresent = CountPairs(now, holdTicks);
+
+            // Past the hold with nothing at all: the channel times can go, so a feed that comes
+            // back is treated as new rather than as a continuation of something three seconds old.
+            if (PairsPresent == 0) Array.Clear(_signalTicks);
         }
     }
 

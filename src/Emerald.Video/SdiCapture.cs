@@ -78,6 +78,15 @@ public sealed class SdiCapture : IDisposable
     public event Action<CaptureResult>? Finished;
 
     /// <summary>
+    /// Raised on the capture thread when a recording runs past midnight and carries on into a
+    /// folder of the new day - with that folder's names. The recording has not stopped: the
+    /// receiver, the frame count, the delay line and whatever is on air all go on as they were.
+    /// Only where the files go has changed, so a handler watching the store for segments should
+    /// start watching the new folder.
+    /// </summary>
+    public event Action<RecordingNames>? Rolled;
+
+    /// <summary>
     /// Every frame off the receiver, raised on the capture thread.
     ///
     /// The arrays are freshly allocated per frame and become the handler's own to keep - unlike
@@ -189,8 +198,10 @@ public sealed class SdiCapture : IDisposable
         int rxChannel = request.RxChannel;
 
         IntPtr board = IntPtr.Zero, stream = IntPtr.Zero;
-        Process? ffmpeg = null;
-        NamedPipeServerStream? audioPipe = null;
+        // The encoder writing the files, and the next day's once it is being started - kept
+        // out here so however the recording ends, both are closed.
+        Encoder? encoder = null;
+        Task<Encoder?>? upcoming = null;
         SdiAudioReader? audio = null;
         RxLease? lease = null;
 
@@ -331,14 +342,9 @@ public sealed class SdiCapture : IDisposable
                 ? "Capture: audio on channels 1-2."
                 : $"Capture: audio on {pairs} pairs (channels 1-{pairs * 2}), one track each.");
 
-            string pipeName = $"edlcap_{Environment.ProcessId}_{Guid.NewGuid():N}";
-            audioPipe = new NamedPipeServerStream(pipeName, PipeDirection.Out, 1,
-                                                  PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
-
-            ffmpeg = StartEncoder(request, pipeName, format, pairs);
-            _ffmpeg = ffmpeg;
-            _audioPipe = audioPipe;
-            Task connect = audioPipe.WaitForConnectionAsync(ct);
+            encoder = Encoder.Open(this, request, format, pairs, ct);
+            _ffmpeg = encoder.Ffmpeg;
+            _audioPipe = encoder.Pipe;
 
             int recordChannels = pairs * 2;
 
@@ -358,40 +364,22 @@ public sealed class SdiCapture : IDisposable
                 UyvyPreview.CreateBuffer(format.Width, format.Height),
             };
             int previewNext = 0;
-            Stream videoOut = ffmpeg.StandardInput.BaseStream;
-
-            // Video and audio are written by separate threads. A frame is far larger than a
-            // pipe buffer, so a video write blocks until ffmpeg drains it — and ffmpeg will
-            // not drain more video until it has the matching audio to interleave. Writing
-            // both from one thread deadlocks after a handful of frames.
-            using var videoQueue = new BlockingCollection<byte[]>(VideoQueueDepth);
-            using var audioQueue = new BlockingCollection<byte[]>(AudioQueueDepth);
 
             long dropped = 0;
             long droppedSaid = 0;
             long droppedSaidAt = 0;
 
-            var videoWriter = new Thread(() =>
-            {
-                try { foreach (byte[] b in videoQueue.GetConsumingEnumerable()) videoOut.Write(b, 0, b.Length); }
-                catch { /* torn down */ }
-                finally { try { videoOut.Close(); } catch { } }
-            })
-            { IsBackground = true, Name = "capture video writer" };
+            // Midnight. A recording that runs on past it hands over to a folder of the new day,
+            // without stopping: the receiver, the frame count and the delay line all carry on,
+            // and only the encoder changes. See RollOver below.
+            DateTime? dayStarted = !request.SingleFile && request.Names is { } rolledNames
+                ? RecordingSequence.FolderStartedAt(rolledNames.Folder)
+                : null;
 
-            var audioWriter = new Thread(() =>
-            {
-                try { foreach (byte[] b in audioQueue.GetConsumingEnumerable()) audioPipe.Write(b, 0, b.Length); }
-                catch { /* torn down */ }
-                finally { try { audioPipe.Dispose(); } catch { } }
-            })
-            { IsBackground = true, Name = "capture audio writer" };
-
-            videoWriter.Start();
-            audioWriter.Start();
+            long? rollAt = dayStarted is { } ds ? RecordingSequence.FramesToNextDay(ds, format.FrameRate) : null;
+            DateTime nextDay = dayStarted?.Date.AddDays(1) ?? DateTime.MaxValue;
 
             long frames = 0;
-            bool pipeReady = false;
             int lockFailures = 0;
             bool warnedNoSlots = false;
             var started = Stopwatch.StartNew();
@@ -404,6 +392,54 @@ public sealed class SdiCapture : IDisposable
             while (!ct.IsCancellationRequested &&
                    (request.FrameLimit is not { } limit || frames < limit))
             {
+                if (rollAt is { } at)
+                {
+                    // The new day's encoder is started ten seconds ahead and off this thread:
+                    // starting ffmpeg takes long enough that doing it here, on the receiver's
+                    // clock, would cost frames at exactly the moment the handover is meant to
+                    // be seamless.
+                    if (upcoming is null && frames >= at - format.FrameRate * 10L)
+                    {
+                        CaptureRequest forDay = request with
+                        {
+                            Names = RecordingSequence.Next(nextDay, request.NamePrefix),
+                        };
+
+                        upcoming = Task.Run(() => OpenForDay(forDay, format, pairs, ct));
+                    }
+
+                    if (frames >= at && upcoming is not null)
+                    {
+                        // Long since finished in practice. Waited on only if ffmpeg was slow to
+                        // start, which costs a few frames here rather than the handover.
+                        Encoder? next = upcoming.GetAwaiter().GetResult();
+                        upcoming = null;
+
+                        if (next is not null)
+                        {
+                            Encoder old = encoder;
+
+                            encoder = next;
+                            _ffmpeg = next.Ffmpeg;
+                            _audioPipe = next.Pipe;
+
+                            // Off this thread: closing it flushes its last segment, which can take
+                            // a moment the receiver does not have.
+                            _ = Task.Run(old.Finish);
+
+                            Report($"Capture: midnight - the recording carries on into folder " +
+                                   $"{next.Names?.Folder}, at frame {frames} " +
+                                   $"({new Timecode(frames, format.FrameRate)} in).");
+
+                            try { Rolled?.Invoke(next.Names!.Value); }
+                            catch { /* a subscriber that throws must not stop a recording */ }
+                        }
+
+                        rollAt = at + RecordingSequence.FramesToNextDay(nextDay, format.FrameRate);
+                        nextDay = nextDay.AddDays(1);
+                    }
+                }
+
                 IntPtr slot = IntPtr.Zero;
                 if (VideoMasterHD.VHD_LockSlotHandle(stream, ref slot) != 0)
                 {
@@ -443,7 +479,12 @@ public sealed class SdiCapture : IDisposable
 
                         // Never block the slot loop: a stalled encoder must cost frames, not
                         // back up into the receiver and cause overruns.
-                        if (!videoQueue.TryAdd(copy)) dropped++;
+                        //
+                        // Counted, not just dropped. The audio for this slot is written only if
+                        // this frame was - see the audio block below - because the two pipes
+                        // carry no timestamps and their alignment is nothing more than how many
+                        // of each were written.
+                        if (!encoder.OfferVideo(copy)) dropped++;
 
                         if (PreviewFrame is not null && size >= (uint)format.FrameBytes &&
                             frames % previewEvery == 0)
@@ -461,11 +502,7 @@ public sealed class SdiCapture : IDisposable
                     }
 
                     // ffmpeg only opens the audio pipe once video has identified input 0.
-                    if (!pipeReady && connect.IsCompleted)
-                    {
-                        pipeReady = true;
-                        Report("Capture: encoder attached to the audio pipe.");
-                    }
+                    bool pipeReady = encoder.PipeReady;
 
                     // Audio is extracted for whoever wants it. It used to be pulled only once
                     // ffmpeg had attached its pipe, which is fine for a recording that starts
@@ -507,7 +544,15 @@ public sealed class SdiCapture : IDisposable
                         var chunk = new byte[bytes];
                         Buffer.BlockCopy(interleaved, 0, chunk, 0, bytes);
 
-                        if (pipeReady) audioQueue.TryAdd(chunk);
+                        // As much audio as there is video, and no more.
+                        //
+                        // Normally one chunk: this slot's picture went to the encoder, so its
+                        // sound follows. None when the picture was dropped - a frame of sound
+                        // with no picture behind it is exactly what walks lip sync, 40 ms at a
+                        // time, and over an hour of a busy encoder that is seconds. More than one
+                        // only when a previous slot's audio could not be queued, which this then
+                        // pays back.
+                        if (pipeReady) encoder.OfferAudio(chunk);
 
                         tapAudio = chunk;
                         tapAudioBytes = bytes;
@@ -544,12 +589,31 @@ public sealed class SdiCapture : IDisposable
                 // fill the record with the news that it is still falling over.
                 if (dropped > droppedSaid && Environment.TickCount64 - droppedSaidAt > 5000)
                 {
+                    // Marked on the timeline as well as written down. A log line answers "did we
+                    // lose anything"; a mark answers "where", which is the question asked when
+                    // somebody is looking at the material either side of it.
+                    DropMarks.Shared.Add(DateTime.Now, (int)(dropped - droppedSaid), DropKind.Capture);
+
+                    // The alignment is said alongside the drops, because "frames were lost" and
+                    // "the recording is out of sync" are two different questions and the second
+                    // is the one that matters when watching it back. Dropping a frame costs a
+                    // moment of picture; it no longer costs lip sync, and the figure proves it.
+                    long imbalance = CaptureSync.Imbalance(encoder.VideoIn, encoder.AudioIn);
+
                     ActivityLog.Shared.Warn(LogSource.Capture,
                         $"DROP  {dropped - droppedSaid} frame(s) not encoded at frame {frames} " +
                         $"({new Timecode(frames, format.FrameRate)}) - the encoder could not keep up " +
-                        $"({dropped} dropped so far).",
+                        $"({dropped} dropped so far). " +
+                        (imbalance == 0
+                            ? "Picture and sound are still in step - the audio for a dropped frame " +
+                              "is dropped with it."
+                            : $"Sound is {imbalance} frame(s) " +
+                              $"({CaptureSync.DriftMs(encoder.VideoIn, encoder.AudioIn, format.FrameRate):F0} ms) " +
+                              "out of step with picture."),
                         @event: "capture.dropped", correlation: SessionId,
-                        detail: $"frame {frames}\ndropped now {dropped - droppedSaid}\ndropped total {dropped}");
+                        detail: $"frame {frames}\ndropped now {dropped - droppedSaid}\n" +
+                                $"dropped total {dropped}\nvideo frames encoded {encoder.VideoIn}\n" +
+                                $"audio frames encoded {encoder.AudioIn}\nimbalance {imbalance}");
 
                     droppedSaid = dropped;
                     droppedSaidAt = Environment.TickCount64;
@@ -565,12 +629,21 @@ public sealed class SdiCapture : IDisposable
             framesTaken = frames;
             reachedLimit = request.FrameLimit is { } wanted && frames >= wanted;
 
-            videoQueue.CompleteAdding();
-            audioQueue.CompleteAdding();
-            videoWriter.Join(TimeSpan.FromSeconds(5));
-            audioWriter.Join(TimeSpan.FromSeconds(5));
+            encoder.Drain();
             string tally = dropped > 0 ? frames + " frames, " + dropped + " dropped" : frames + " frames";
-            Report($"Capture: stopped after {new Timecode(frames, format.FrameRate)} ({tally}).");
+
+            // The closing word on sync, said whether or not anything was dropped. "in step" after
+            // a recording is the sentence somebody wants before they trust the file, and a line
+            // that only appeared when something was wrong could not be told from the check not
+            // running at all.
+            long finalImbalance = CaptureSync.Imbalance(encoder.VideoIn, encoder.AudioIn);
+
+            Report($"Capture: stopped after {new Timecode(frames, format.FrameRate)} ({tally}). " +
+                   $"{encoder.VideoIn} video and {encoder.AudioIn} audio frames encoded - " +
+                   (finalImbalance == 0
+                       ? "picture and sound in step."
+                       : $"OUT OF STEP by {finalImbalance} frame(s) " +
+                         $"({CaptureSync.DriftMs(encoder.VideoIn, encoder.AudioIn, format.FrameRate):F0} ms)."));
 
             lock (_encoderErrors)
                 foreach (string e in _encoderErrors.Take(5)) Fail("Capture encoder: " + e);
@@ -586,11 +659,21 @@ public sealed class SdiCapture : IDisposable
         }
         finally
         {
-            try { ffmpeg?.StandardInput.BaseStream.Close(); } catch { }
-            try { audioPipe?.Dispose(); } catch { }
-            try { if (ffmpeg is { HasExited: false }) ffmpeg.WaitForExit(5000); } catch { }
-            try { if (ffmpeg is { HasExited: false }) ffmpeg.Kill(true); } catch { }
-            ffmpeg?.Dispose();
+            encoder?.Finish();
+
+            // A next day's encoder that was started but never handed a frame - the recording
+            // stopped in the last seconds before midnight. Closed, and its empty folders taken
+            // away, so the store does not grow a day that holds nothing.
+            if (upcoming is not null)
+            {
+                try { upcoming.Wait(TimeSpan.FromSeconds(5)); } catch { }
+
+                if (upcoming.IsCompletedSuccessfully && upcoming.Result is { } unused)
+                {
+                    unused.Finish();
+                    unused.RemoveIfEmpty(request.Folder);
+                }
+            }
 
             if (stream != IntPtr.Zero) { VideoMasterHD.VHD_StopStream(stream); VideoMasterHD.VHD_CloseStreamHandle(stream); }
             if (board != IntPtr.Zero) VideoMasterHD.VHD_CloseBoardHandle(board);
@@ -639,6 +722,216 @@ public sealed class SdiCapture : IDisposable
     }
 
     private readonly List<string> _encoderErrors = new();
+
+    /// <summary>
+    /// The encoder for the next day's folder, started ahead of midnight. Null when it could not
+    /// be: the recording then carries on in the old day's folder rather than stopping, and says so.
+    /// </summary>
+    private Encoder? OpenForDay(CaptureRequest request, CaptureFormat format, int pairs, CancellationToken ct)
+    {
+        try
+        {
+            // The segment muxer does not create directories - see the same step in Run.
+            foreach (RecordingOutput output in RecordingProfile.Outputs)
+                Directory.CreateDirectory(
+                    Path.Combine(RecordingProfile.FolderFor(output, request.Folder), request.Names!.Value.Folder));
+
+            return Encoder.Open(this, request, format, pairs, ct);
+        }
+        catch (Exception ex)
+        {
+            ActivityLog.Shared.Warn(LogSource.Capture,
+                $"Capture: could not start the new day's folder {request.Names?.Folder} ({ex.Message}). " +
+                "The recording carries on in the folder it is in.",
+                @event: "capture.rollfailed", correlation: SessionId);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// One ffmpeg and the two pipes into it: what a recording writes its files through.
+    ///
+    /// A recording has one of these at a time, except across midnight, when the next day's is
+    /// started a few seconds early and the frames simply start going to it. That is why it is an
+    /// object rather than a handful of locals: the receiver loop has to be able to swap it.
+    ///
+    /// Video and audio are written by separate threads. A frame is far larger than a pipe
+    /// buffer, so a video write blocks until ffmpeg drains it — and ffmpeg will not drain more
+    /// video until it has the matching audio to interleave. Writing both from one thread
+    /// deadlocks after a handful of frames.
+    /// </summary>
+    private sealed class Encoder
+    {
+        private readonly SdiCapture _owner;
+        private readonly Task _connect;
+        private readonly BlockingCollection<byte[]> _video = new(VideoQueueDepth);
+        private readonly BlockingCollection<byte[]> _audio = new(AudioQueueDepth);
+        private readonly Thread _videoWriter;
+        private readonly Thread _audioWriter;
+        private bool _pipeReady;
+        private int _finished;
+
+        public Process Ffmpeg { get; }
+        public NamedPipeServerStream Pipe { get; }
+        public RecordingNames? Names { get; }
+
+        /// <summary>
+        /// Frames of each actually handed to this encoder. These two numbers are its files' lip
+        /// sync: the pipes carry no timestamps, so ffmpeg takes one video frame and one frame's
+        /// worth of samples to be the same length of time, and nothing else aligns them. They
+        /// must come out equal.
+        /// </summary>
+        public long VideoIn { get; private set; }
+        public long AudioIn { get; private set; }
+
+        private Encoder(SdiCapture owner, Process ffmpeg, NamedPipeServerStream pipe,
+                        RecordingNames? names, CancellationToken ct)
+        {
+            _owner = owner;
+            Ffmpeg = ffmpeg;
+            Pipe = pipe;
+            Names = names;
+            _connect = pipe.WaitForConnectionAsync(ct);
+
+            Stream videoOut = ffmpeg.StandardInput.BaseStream;
+
+            _videoWriter = new Thread(() =>
+            {
+                try { foreach (byte[] b in _video.GetConsumingEnumerable()) videoOut.Write(b, 0, b.Length); }
+                catch { /* torn down */ }
+                finally { try { videoOut.Close(); } catch { } }
+            })
+            { IsBackground = true, Name = "capture video writer" };
+
+            _audioWriter = new Thread(() =>
+            {
+                try { foreach (byte[] b in _audio.GetConsumingEnumerable()) pipe.Write(b, 0, b.Length); }
+                catch { /* torn down */ }
+                finally { try { pipe.Dispose(); } catch { } }
+            })
+            { IsBackground = true, Name = "capture audio writer" };
+
+            _videoWriter.Start();
+            _audioWriter.Start();
+        }
+
+        public static Encoder Open(SdiCapture owner, CaptureRequest request, CaptureFormat format,
+                                   int pairs, CancellationToken ct)
+        {
+            string pipeName = $"edlcap_{Environment.ProcessId}_{Guid.NewGuid():N}";
+            var pipe = new NamedPipeServerStream(pipeName, PipeDirection.Out, 1,
+                                                 PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            try
+            {
+                Process ffmpeg = owner.StartEncoder(request, pipeName, format, pairs);
+                return new Encoder(owner, ffmpeg, pipe, request.SingleFile ? null : request.Names, ct);
+            }
+            catch
+            {
+                pipe.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>True once ffmpeg has opened the audio pipe, which it does only after video has identified input 0.</summary>
+        public bool PipeReady
+        {
+            get
+            {
+                if (!_pipeReady && _connect.IsCompleted)
+                {
+                    _pipeReady = true;
+                    _owner.Report("Capture: encoder attached to the audio pipe.");
+                }
+
+                return _pipeReady;
+            }
+        }
+
+        /// <summary>
+        /// One frame of picture, if there is room for it. Never blocks: a stalled encoder must
+        /// cost frames, not back up into the receiver and cause overruns.
+        /// </summary>
+        public bool OfferVideo(byte[] frame)
+        {
+            if (!_video.TryAdd(frame)) return false;
+
+            VideoIn++;
+            return true;
+        }
+
+        /// <summary>
+        /// As much audio as there is video, and no more.
+        ///
+        /// Normally one chunk: this slot's picture went to the encoder, so its sound follows.
+        /// None when the picture was dropped - a frame of sound with no picture behind it is
+        /// exactly what walks lip sync, 40 ms at a time, and over an hour of a busy encoder that
+        /// is seconds. More than one only when a previous slot's audio could not be queued, which
+        /// this then pays back - with the same bytes each time, because what matters is that the
+        /// streams stay the same length, and a repeated frame of sound is a far smaller fault
+        /// than a permanent offset.
+        /// </summary>
+        public void OfferAudio(byte[] chunk)
+        {
+            int due = CaptureSync.AudioChunksDue(VideoIn, AudioIn);
+
+            for (int i = 0; i < due; i++)
+            {
+                if (!_audio.TryAdd(i == 0 ? chunk : (byte[])chunk.Clone())) break;
+
+                AudioIn++;
+            }
+        }
+
+        /// <summary>No more frames: lets the writers empty their queues into ffmpeg and stop.</summary>
+        public void Drain()
+        {
+            try { _video.CompleteAdding(); } catch (ObjectDisposedException) { }
+            try { _audio.CompleteAdding(); } catch (ObjectDisposedException) { }
+
+            _videoWriter.Join(TimeSpan.FromSeconds(5));
+            _audioWriter.Join(TimeSpan.FromSeconds(5));
+        }
+
+        /// <summary>
+        /// Closes it down: drains, closes both inputs so ffmpeg finalises its files, and waits for
+        /// it to exit. Safe to call twice, and from any thread.
+        /// </summary>
+        public void Finish()
+        {
+            if (Interlocked.Exchange(ref _finished, 1) != 0) return;
+
+            Drain();
+
+            try { Ffmpeg.StandardInput.BaseStream.Close(); } catch { }
+            try { Pipe.Dispose(); } catch { }
+            try { if (!Ffmpeg.HasExited) Ffmpeg.WaitForExit(5000); } catch { }
+            try { if (!Ffmpeg.HasExited) Ffmpeg.Kill(true); } catch { }
+            Ffmpeg.Dispose();
+
+            _video.Dispose();
+            _audio.Dispose();
+        }
+
+        /// <summary>Takes away this encoder's folders if it never wrote anything into them.</summary>
+        public void RemoveIfEmpty(string store)
+        {
+            if (Names is not { } names) return;
+
+            foreach (RecordingOutput output in RecordingProfile.Outputs)
+            {
+                string dir = Path.Combine(RecordingProfile.FolderFor(output, store), names.Folder);
+
+                try
+                {
+                    if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+                        Directory.Delete(dir);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+    }
 
     private Process StartEncoder(CaptureRequest request, string pipeName, CaptureFormat format, int audioPairs)
     {

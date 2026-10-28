@@ -73,6 +73,20 @@ public static class RecordingSequence
     }
 
     /// <summary>
+    /// Frames from <paramref name="from"/> to the next midnight, at a rate - where a recording
+    /// rolled at that moment hands over to a new day's folder.
+    ///
+    /// <b>Counted in frames, not read off the clock.</b> Everything that places a segment - Live
+    /// Edit's ruler, the on-air mark - does it from the folder's start plus frames recorded, so
+    /// the handover has to be the frame at which that sum reaches 00:00:00. Then the new folder
+    /// can be named exactly 00-00-00 and its first segment starts exactly where the last one of
+    /// the old day ended. A folder is named to the second, so a whole-second start and a whole
+    /// rate make this an exact count, with no rounding anywhere.
+    /// </summary>
+    public static long FramesToNextDay(DateTime from, int frameRate) =>
+        (long)Math.Round((from.Date.AddDays(1) - from).TotalSeconds * Math.Max(1, frameRate));
+
+    /// <summary>
     /// The folder and the filename pattern for a recording about to roll.
     ///
     /// Shaped as <c>prefix_MMddyyHHmm_N</c>, e.g. <c>media_0930262209_1</c>. The date and time

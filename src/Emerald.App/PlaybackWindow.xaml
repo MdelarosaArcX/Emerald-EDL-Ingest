@@ -18,8 +18,12 @@
 
             <!-- ============================= header ============================= -->
             <Grid Grid.Row="0" Margin="18,0,18,0">
-                <TextBlock Text="Emerald Playback" Foreground="{StaticResource IpMint}"
-                           FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Image Source="/Assets/emerald-mark.png" Width="26" Height="26" Margin="0,0,9,0"
+                           RenderOptions.BitmapScalingMode="HighQuality" VerticalAlignment="Center"/>
+                    <TextBlock Text="Emerald Playback" Foreground="{StaticResource IpMint}"
+                               FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                </StackPanel>
 
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
                     <TextBlock x:Name="ClockText" Text="--:--:--:--" FontFamily="Consolas"
@@ -120,12 +124,37 @@
                                 </Grid.RowDefinitions>
 
                                 <Grid Grid.Row="0" Margin="0,0,0,7">
-                                    <TextBlock x:Name="LogHeader" Text="PLAYBACK ACTIVITY"
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+
+                                    <TextBlock x:Name="LogHeader" Grid.Column="0" Text="PLAYBACK ACTIVITY"
                                                Foreground="{StaticResource IpMuted}"
                                                FontSize="9.5" FontWeight="SemiBold"
                                                VerticalAlignment="Center"/>
 
-                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                    <!-- What is on air, while tidal lock is transmitting: the timecode the
+                                         picture going out was captured at, and how far into the recording
+                                         it is. The same figure Live Edit's on-air mark is drawn from. -->
+                                    <StackPanel x:Name="AirTcPanel" Grid.Column="1" Orientation="Horizontal"
+                                                Visibility="Collapsed" VerticalAlignment="Center" Margin="16,0,12,0"
+                                                ToolTip="Timecode of the frame on air (when it was captured), and how far into the recording it is">
+                                        <Ellipse Width="7" Height="7" Margin="0,0,6,0" Fill="{StaticResource IpRed}"
+                                                 VerticalAlignment="Center"/>
+                                        <TextBlock Text="ON AIR" FontSize="9.5" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource IpRed}" VerticalAlignment="Center"
+                                                   Margin="0,0,7,0"/>
+                                        <TextBlock x:Name="AirTcText" Text="--:--:--:--" FontFamily="Consolas"
+                                                   FontSize="13" FontWeight="Bold" Foreground="{StaticResource IpRed}"
+                                                   VerticalAlignment="Center"/>
+                                        <TextBlock x:Name="AirElapsedText" Text="" FontFamily="Consolas"
+                                                   FontSize="11" Foreground="{StaticResource IpMuted}"
+                                                   VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                    </StackPanel>
+
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
                                         <ToggleButton x:Name="FollowLogButton" Content="FOLLOW"
                                                       IsChecked="True"
                                                       Style="{StaticResource IpSmallToggle}"
@@ -182,8 +211,15 @@
                             <Grid>
                                 <Image x:Name="PreviewImage" Stretch="Uniform" Margin="1"
                                        RenderOptions.BitmapScalingMode="HighQuality"/>
+                                <!-- The logo, while there is no picture: shown and hidden with the
+                                     placeholder line, so it is never over a live feed. -->
+                                <Image Source="/Assets/emerald-logo.png" Height="104" Opacity="0.6"
+                                       Margin="0,0,0,26" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       RenderOptions.BitmapScalingMode="HighQuality"
+                                       Visibility="{Binding Visibility, ElementName=PreviewPlaceholder}"/>
                                 <TextBlock x:Name="PreviewPlaceholder" Text="preview idle"
-                                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                                           HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                           Margin="0,0,0,16"
                                            Foreground="{StaticResource IpDim}" FontSize="11.5"/>
                                 <Border VerticalAlignment="Top" HorizontalAlignment="Left" Margin="7"
                                         Background="#CC060A10" CornerRadius="3" Padding="7,3">

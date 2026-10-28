@@ -73,6 +73,14 @@ public static class BoardService
                 warnings.Add($"Board {i} ({model}) could not be opened (error {openRc}); it may be in use.");
             }
 
+            // Said out loud when the card has more channels than this layer can name, rather
+            // than the extra ones simply being absent from a list with no explanation.
+            if (rx > VideoMasterHD.MaxChannels || tx > VideoMasterHD.MaxChannels)
+                warnings.Add(
+                    $"Board {i} ({model}) reports {rx} RX and {tx} TX channels; Emerald can " +
+                    $"address the first {VideoMasterHD.MaxChannels} of each, so the rest are " +
+                    "not offered.");
+
             boards.Add(new BoardInfo
             {
                 Index = i,
@@ -81,8 +89,22 @@ public static class BoardService
                 BoardTypeName = VideoMasterHD.BoardTypeName(boardType),
                 RxCount = (int)rx,
                 TxCount = (int)tx,
-                RxPorts = Enumerable.Range(0, (int)rx).Select(n => new ChannelPort("RX", n)).ToList(),
-                TxPorts = Enumerable.Range(0, (int)tx).Select(n => new ChannelPort("TX", n)).ToList(),
+
+                // Only the channels that can actually be opened.
+                //
+                // The board's count and what this layer can name a stream type for are two
+                // different things, and they used to be conflated: a card reporting seven
+                // outputs had all seven listed, and choosing the fifth threw an
+                // ArgumentOutOfRangeException from deep inside the open - an argument fault
+                // surfacing as "the transmitter would not start", with the real reason three
+                // layers down. A port that cannot be driven is not offered.
+                RxPorts = Enumerable.Range(0, (int)rx)
+                    .Where(VideoMasterHD.Supports)
+                    .Select(n => new ChannelPort("RX", n)).ToList(),
+
+                TxPorts = Enumerable.Range(0, (int)tx)
+                    .Where(VideoMasterHD.Supports)
+                    .Select(n => new ChannelPort("TX", n)).ToList(),
             });
         }
 

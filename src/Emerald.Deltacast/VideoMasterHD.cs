@@ -34,11 +34,27 @@ public static class VideoMasterHD
     public const uint VHD_SDI_SP_VIDEO_STANDARD = EnumBaseSdi + 1;
     public const uint VHD_SDI_SP_INTERFACE = EnumBaseSdi + 5;
 
-    // Stream types: the TX channels are not contiguous in the enum.
+    // Stream types: the TX channels are not contiguous in the enum, and the gaps are not a
+    // pattern that can be extrapolated. Taken from VideoMasterHD_Core.h, VHD_STREAMTYPE:
+    //
+    //   TX0=2  TX1=3    TX2=11  TX3=12    TX4=33  TX5=34  TX6=35  TX7=36    TX8..TX11=48..51
+    //   RX0=0  RX1=1    RX2=9   RX3=10    RX4..RX7=20..23                   RX8..RX11=44..47
+    //
+    // The numbers in between belong to the coupled, modify and hardware-process stream types, so
+    // guessing at the next one in a run would open something else entirely - on a transmitter,
+    // the wrong output.
     public const uint VHD_ST_TX0 = 2;
     public const uint VHD_ST_TX1 = 3;
     public const uint VHD_ST_TX2 = 11;
     public const uint VHD_ST_TX3 = 12;
+    public const uint VHD_ST_TX4 = 33;
+    public const uint VHD_ST_TX5 = 34;
+    public const uint VHD_ST_TX6 = 35;
+    public const uint VHD_ST_TX7 = 36;
+    public const uint VHD_ST_TX8 = 48;
+    public const uint VHD_ST_TX9 = 49;
+    public const uint VHD_ST_TX10 = 50;
+    public const uint VHD_ST_TX11 = 51;
 
     public const uint VHD_SDI_STPROC_DISJOINED_VIDEO = EnumBaseSdi + 2;
 
@@ -60,12 +76,27 @@ public static class VideoMasterHD
 
     public const uint VHDERR_NOERROR = 0;
 
+    /// <summary>How many channels of each direction this layer can name a stream type for.</summary>
+    public const int MaxChannels = 12;
+
+    /// <summary>
+    /// Whether a channel number can be turned into a stream type at all.
+    ///
+    /// Asked before a port is offered to an operator. A board reports how many channels it has,
+    /// and that count is not a promise that this layer knows the enum value for each of them —
+    /// it used to stop at four, so a card with seven outputs had three of them listed on the
+    /// playback deck that could not be opened.
+    /// </summary>
+    public static bool Supports(int channel) => channel is >= 0 and < MaxChannels;
+
     /// <summary>RX channel numbers are as scattered through VHD_STREAMTYPE as the TX ones.</summary>
     public static uint RxStreamType(int channel) => channel switch
     {
         0 => 0, 1 => 1, 2 => 9, 3 => 10,
         4 => 20, 5 => 21, 6 => 22, 7 => 23,
-        _ => throw new ArgumentOutOfRangeException(nameof(channel), channel, "Only RX0-RX7 are supported."),
+        8 => 44, 9 => 45, 10 => 46, 11 => 47,
+        _ => throw new ArgumentOutOfRangeException(nameof(channel), channel,
+                 $"Only RX0-RX{MaxChannels - 1} can be named as a stream type."),
     };
 
     /// <summary>Maps a TX channel number to its VHD_STREAMTYPE value.</summary>
@@ -75,7 +106,16 @@ public static class VideoMasterHD
         1 => VHD_ST_TX1,
         2 => VHD_ST_TX2,
         3 => VHD_ST_TX3,
-        _ => throw new ArgumentOutOfRangeException(nameof(channel), channel, "Only TX0-TX3 are supported."),
+        4 => VHD_ST_TX4,
+        5 => VHD_ST_TX5,
+        6 => VHD_ST_TX6,
+        7 => VHD_ST_TX7,
+        8 => VHD_ST_TX8,
+        9 => VHD_ST_TX9,
+        10 => VHD_ST_TX10,
+        11 => VHD_ST_TX11,
+        _ => throw new ArgumentOutOfRangeException(nameof(channel), channel,
+                 $"Only TX0-TX{MaxChannels - 1} can be named as a stream type."),
     };
 
     [DllImport(Dll, CallingConvention = CallingConvention.StdCall)]

@@ -48,6 +48,101 @@ public class TidalLockTests
         Assert.Null(lockState.CueAt);
     }
 
+    /// <summary>
+    /// The capture deck keeps a line filling for as long as it records, sized for the longest
+    /// delay anything might want. A lock that takes it counts against its own delay, not the
+    /// line's size - so a recording that already has the delay in hand has nothing to count
+    /// down, and goes to air at once.
+    /// </summary>
+    [Fact]
+    public void A_line_already_holding_the_delay_has_nothing_left_to_fill()
+    {
+        TidalLock lockState = New();
+        lockState.Arm(TimeSpan.FromMinutes(2));
+
+        var ready = new FakeDelayLine { TargetFrames = 5 * 60 * 25, FramesWritten = 20 * 60 * 25 };
+        lockState.RecordingRolled(ready, null);
+
+        Assert.Equal(2 * 60 * 25, lockState.TargetFrames);
+        Assert.Equal(0, lockState.FramesToAir);
+        Assert.Equal(1.0, lockState.FillFraction);
+    }
+
+    // ------------------------------------------------------------------ from the first segment
+
+    private const long Segment = 30 * 25;
+    private const long Reach = 5 * 60 * 25;
+
+    /// <summary>Twenty minutes in, but the line reaches back only five - here, ten seconds in.</summary>
+    [Fact]
+    public void From_the_first_segment_the_delay_is_everything_recorded()
+    {
+        Assert.Equal(10 * 25, TidalLock.FramesFor(DelayStart.FromFirstSegment, 0, 10 * 25, Segment, Reach));
+    }
+
+    /// <summary>Armed before anything is recorded: from the first frame, as it arrives.</summary>
+    [Fact]
+    public void From_the_first_segment_before_recording_is_no_delay()
+    {
+        Assert.Equal(0, TidalLock.FramesFor(DelayStart.FromFirstSegment, 0, 0, Segment, Reach));
+    }
+
+    /// <summary>Ten seconds in: wait for the rest of the first segment, then start at its first frame.</summary>
+    [Fact]
+    public void When_the_first_segment_is_ready_the_delay_is_a_segment()
+    {
+        Assert.Equal(Segment, TidalLock.FramesFor(DelayStart.WhenFirstSegmentReady, 0, 10 * 25, Segment, Reach));
+    }
+
+    /// <summary>Armed after the first segment exists, it is ready already: from the top, now.</summary>
+    [Fact]
+    public void A_first_segment_already_recorded_starts_from_it_now()
+    {
+        Assert.Equal(2 * 60 * 25, TidalLock.FramesFor(DelayStart.WhenFirstSegmentReady, 0, 2 * 60 * 25, Segment, Reach));
+    }
+
+    /// <summary>
+    /// A recording longer than the line holds has lost its first frames from the line, so the
+    /// start is the oldest frame still there rather than a jump the transmitter cannot make.
+    /// </summary>
+    [Fact]
+    public void Past_what_the_line_holds_it_starts_from_the_oldest_frame()
+    {
+        Assert.Equal(Reach, TidalLock.FramesFor(DelayStart.FromFirstSegment, 0, 20 * 60 * 25, Segment, Reach));
+        Assert.Equal(Reach, TidalLock.FramesFor(DelayStart.WhenFirstSegmentReady, 0, 20 * 60 * 25, Segment, Reach));
+    }
+
+    [Fact]
+    public void A_fixed_delay_is_just_the_delay()
+    {
+        Assert.Equal(3000, TidalLock.FramesFor(DelayStart.Fixed, 3000, 20 * 60 * 25, Segment, Reach));
+    }
+
+    [Fact]
+    public void Arming_remembers_where_it_starts()
+    {
+        TidalLock lockState = New();
+        lockState.Arm(TimeSpan.Zero, DelayStart.WhenFirstSegmentReady);
+
+        Assert.Equal(DelayStart.WhenFirstSegmentReady, lockState.Start);
+
+        lockState.Resolve(TimeSpan.FromSeconds(30));
+        Assert.Equal(TimeSpan.FromSeconds(30), lockState.Delay);
+    }
+
+    /// <summary>A recording younger than the delay still waits for the rest of it.</summary>
+    [Fact]
+    public void A_line_younger_than_the_delay_counts_down_the_difference()
+    {
+        TidalLock lockState = New();
+        lockState.Arm(TimeSpan.FromMinutes(2));
+
+        var ready = new FakeDelayLine { TargetFrames = 5 * 60 * 25, FramesWritten = 30 * 25 };
+        lockState.RecordingRolled(ready, null);
+
+        Assert.Equal(90 * 25, lockState.FramesToAir);
+    }
+
     [Fact]
     public void Arming_waits_for_the_recorder_rather_than_starting_anything()
     {

@@ -96,6 +96,14 @@ public sealed class AppSettings
     public const int DefaultSegmentSeconds = 30;
 
     /// <summary>
+    /// True once an operator has picked the segment length on the capture deck. From then on it
+    /// is a decision rather than a leftover default, and <see cref="Migrate"/> leaves it alone -
+    /// otherwise choosing two minutes would be quietly undone the next time the settings loaded,
+    /// because two minutes is also what the old default was.
+    /// </summary>
+    [JsonPropertyName("recordingSegmentChosen")] public bool RecordingSegmentChosen { get; set; }
+
+    /// <summary>
     /// The segment length written into every settings file before the default changed.
     ///
     /// Like <see cref="RecordingSequence.FormerDefaultPrefix"/>, this is not a choice anybody
@@ -104,8 +112,8 @@ public sealed class AppSettings
     /// would keep two-minute segments for good — which is also two minutes before the newest
     /// material can be played, probed or exported.
     ///
-    /// There is no control for this on the deck, so an operator could not have set it
-    /// deliberately through the application either.
+    /// There was no control for this on the deck then, so nobody could have chosen it. There is
+    /// now, and a choice made there is marked by <see cref="RecordingSegmentChosen"/>.
     /// </summary>
     public const int FormerDefaultSegmentSeconds = 120;
 
@@ -123,6 +131,42 @@ public sealed class AppSettings
     /// that still expects a single port finds one.
     /// </summary>
     [JsonPropertyName("playbackPorts")] public string PlaybackPorts { get; set; } = "";
+
+    // What Live Edit last went live with, so the Go Live box opens on it. Kept apart from the
+    // playback deck's, because the two are separate transmissions and commonly on separate ports.
+    [JsonPropertyName("liveBoardIndex")] public uint LiveBoardIndex { get; set; }
+
+    /// <summary>TX port names, separated by a bar, as <see cref="PlaybackPorts"/>.</summary>
+    [JsonPropertyName("livePorts")] public string LivePorts { get; set; } = "";
+
+    [JsonPropertyName("liveDelaySeconds")] public int LiveDelaySeconds { get; set; } = 120;
+
+    /// <summary>Whether Go Live last started a set delay behind, or from the first segment.</summary>
+    [JsonPropertyName("liveDelayStart")] public DelayStart LiveDelayStart { get; set; }
+
+    /// <summary>
+    /// Whether the capture deck keeps a delay filling for as long as it records, so tidal lock
+    /// and Go Live go to air the moment they are asked rather than after a delay of black.
+    ///
+    /// On by default. It costs what a tidal lock always cost while it ran - a ring of raw frames
+    /// on disk, about six gigabytes a minute at 1080p25, written as it records - but now for the
+    /// whole recording. Off puts back the old behaviour: the delay starts filling when armed.
+    /// </summary>
+    [JsonPropertyName("keepDelayReady")] public bool KeepDelayReady { get; set; } = true;
+
+    /// <summary>
+    /// Draws every window in software instead of on the graphics card.
+    ///
+    /// For a machine whose graphics driver has got into a state where WPF's hardware path
+    /// presents nothing - every window comes up plain white while the application behind it runs
+    /// normally. Restarting the driver or the machine is the cure; this is the way to keep working
+    /// until then, at the cost of some CPU for the previews. Off by default. The environment
+    /// variable EMERALD_SOFTWARE_RENDER=1 does the same without editing this file.
+    /// </summary>
+    [JsonPropertyName("softwareRendering")] public bool SoftwareRendering { get; set; }
+
+    /// <summary>The extra the delay ring holds for inserts to grow the delay into.</summary>
+    [JsonPropertyName("liveHeadroomSeconds")] public int LiveHeadroomSeconds { get; set; } = 300;
 
     /// <summary>
     /// Whether the EDL records the receiver by itself while a message is on air.
@@ -249,7 +293,8 @@ public sealed class AppSettings
     /// </summary>
     public static AppSettings Migrate(AppSettings settings)
     {
-        if (settings.RecordingSegmentSeconds == FormerDefaultSegmentSeconds)
+        if (!settings.RecordingSegmentChosen &&
+            settings.RecordingSegmentSeconds == FormerDefaultSegmentSeconds)
             settings.RecordingSegmentSeconds = DefaultSegmentSeconds;
 
         return settings;

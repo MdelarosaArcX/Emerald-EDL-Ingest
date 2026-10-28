@@ -31,13 +31,61 @@ public static class PlayoutDrift
     public static long Dropped(TimeSpan elapsed, int rate, long framesOut) =>
         Math.Max(0, Expected(elapsed, rate) - framesOut);
 
+}
+
+/// <summary>
+/// The record of what a message lost, stall by stall.
+///
+/// <b>Why a high-water mark and not a difference.</b> The shortfall against the clock can shrink:
+/// the engine catches up a little, the figure comes down. Those frames still did not go out, so
+/// forgiving them would make the closing line understate what happened. The total only ever
+/// rises, and what rises is what gets reported.
+///
+/// Separate from the engine so the accounting can be tested: the invariants worth having — a
+/// stall is counted once, the losses sum to the total, recovery costs nothing and earns nothing —
+/// are exactly the ones that are hard to see are wrong by reading a play loop.
+/// </summary>
+public sealed class DropLedger
+{
+    /// <summary>Frames lost in this message, in total.</summary>
+    public long Total { get; private set; }
+
+    /// <summary>How many separate stalls those frames came from.</summary>
+    public long Stalls { get; private set; }
+
     /// <summary>
-    /// Whether a new figure is worth another line in the log.
-    ///
-    /// A transmitter that is a frame or two behind is within the queue's own slack and saying so
-    /// every second would bury everything else. A fifth of a second of loss is the point at which
-    /// it is a fault rather than jitter, and each further fifth is worth repeating.
+    /// Takes the shortfall as it stands and returns how many frames have been lost since last
+    /// asked — zero when nothing has got worse, which is the usual answer.
     /// </summary>
-    public static bool WorthSaying(long dropped, long alreadySaid, int rate) =>
-        dropped - alreadySaid >= Math.Max(1, rate / 5);
+    public long Record(long droppedSoFar)
+    {
+        if (droppedSoFar <= Total) return 0;
+
+        long lost = droppedSoFar - Total;
+
+        Total = droppedSoFar;
+        Stalls++;
+
+        return lost;
+    }
+
+    /// <summary>Starts again for the next message, so one is never judged on another's stalls.</summary>
+    public void Reset()
+    {
+        Total = 0;
+        Stalls = 0;
+    }
+
+    /// <summary>
+    /// What to say on a closing line.
+    ///
+    /// Said on every message, including the clean ones. "no frames dropped" is the sentence an
+    /// operator wants after a transmission, and a line that is simply absent when all is well
+    /// cannot be told apart from the feature not working.
+    /// </summary>
+    public string Summary(int rate) =>
+        Total <= 0
+            ? "no frames dropped"
+            : $"{Total:N0} frame(s) dropped in {Stalls:N0} stall(s) " +
+              $"({Total / (double)Math.Max(1, rate):F2} s lost)";
 }

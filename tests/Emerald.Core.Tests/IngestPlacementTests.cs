@@ -61,6 +61,21 @@ public sealed class IngestPlacementTests
                                             out _, out _));
     }
 
+    [Theory]
+    [InlineData(IngestMode.Overlay)]
+    [InlineData(IngestMode.Insert)]
+    public void The_other_two_modes_stay_where_they_were_dropped_even_with_marks_set(IngestMode mode)
+    {
+        // Only Fit to fill and Replace are defined by the marked range. Marks get set for all
+        // sorts of reasons, and a drop while they happen to be set is not a request to use
+        // them - these two go where the pointer was and leave the range alone.
+        IngestPlan plan = Plan(mode, ingest: 300, drop: 7_000, markIn: 2000, markOut: 2400);
+
+        Assert.Equal(7_000, plan.StartFrame);
+        Assert.Equal(300, plan.Frames);
+        Assert.Equal(1, plan.Speed);
+    }
+
     // ------------------------------------------------------------------ fit to fill
 
     [Fact]
@@ -108,6 +123,26 @@ public sealed class IngestPlacementTests
         // It is defined by the range, so the drop point must not leak into it.
         Assert.Equal(2000, Plan(IngestMode.FitToFill, 500, drop: 99_999,
                                 markIn: 2000, markOut: 2250).StartFrame);
+    }
+
+    [Theory]
+    [InlineData(IngestMode.FitToFill)]
+    [InlineData(IngestMode.Replace)]
+    public void Both_range_modes_land_on_the_marks_wherever_the_file_was_dropped(IngestMode mode)
+    {
+        // The behaviour an operator expects after marking in and out: the item goes in the
+        // marks, not under the pointer. True of these two whatever the drop point - before the
+        // range, inside it, miles past it.
+        foreach (long drop in new long[] { 0, 1_000, 2_100, 50_000 })
+        {
+            IngestPlan plan = Plan(mode, ingest: 300, drop: drop, markIn: 2000, markOut: 2400);
+
+            Assert.Equal(2000, plan.StartFrame);
+
+            // And it governs the whole of the marked range, whether it fills it with its own
+            // material or hands the tail back to the recording.
+            Assert.Equal(400, plan.Covers);
+        }
     }
 
     // ------------------------------------------------------------------ replace

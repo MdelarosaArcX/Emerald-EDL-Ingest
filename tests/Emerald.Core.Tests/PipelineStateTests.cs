@@ -132,7 +132,94 @@ public class FrameLedgerTests
 
         state.SetRecorded(1, 0, 0);
         state.SetAired(1, 0, 0, 0);
+        state.SetAiredFrame(1);
 
         Assert.Equal(0, changes);
+    }
+
+    /// <summary>The on-air and capture readouts: frame N of a recording is its start plus N.</summary>
+    [Fact]
+    public void A_recording_frame_is_its_start_plus_the_frames()
+    {
+        var start = new Timecode(14 * 3600L * 25, 25);   // 14:00:00:00
+
+        Assert.Equal("14:15:00:00", PipelineState.TimecodeOf(start, 15 * 60 * 25)!.Value.ToString());
+        Assert.Equal("14:00:00:00", PipelineState.TimecodeOf(start, 0)!.Value.ToString());
+    }
+
+    [Fact]
+    public void A_recording_across_midnight_wraps_the_way_the_clock_does()
+    {
+        var start = new Timecode(24 * 3600L * 25 - 25, 25);   // 23:59:59:00
+
+        Assert.Equal("00:00:01:00", PipelineState.TimecodeOf(start, 50)!.Value.ToString());
+    }
+
+    [Fact]
+    public void No_start_or_no_frame_is_no_timecode()
+    {
+        Assert.Null(PipelineState.TimecodeOf(null, 100));
+        Assert.Null(PipelineState.TimecodeOf(new Timecode(0, 25), -1));
+    }
+
+    /// <summary>
+    /// The playback deck's ON AIR and Live Edit's mark are one figure. Live Edit counts at its own
+    /// rate; adding the recording's frames to that count is what let the two drift apart, so the
+    /// figure is a time of day and each converts it.
+    /// </summary>
+    [Fact]
+    public void On_air_is_a_time_of_day_whatever_rate_reads_it()
+    {
+        var state = new PipelineState();
+
+        state.RecordingStart = new Timecode(14 * 3600L * 50, 50);   // 14:00:00:00 at 50
+        state.SetAiredFrame(15 * 60 * 50);                         // fifteen minutes in
+
+        Assert.Equal(TimeSpan.FromHours(14) + TimeSpan.FromMinutes(15), state.OnAirTimeOfDay);
+
+        // Read at 25, the way a ruler at another rate would: still 14:15:00:00, not 14:30.
+        Assert.Equal(TimelineZoom.FrameOfDay(TimeSpan.FromHours(14.25), 25),
+                     TimelineZoom.FrameOfDay(state.OnAirTimeOfDay!.Value, 25));
+    }
+
+    /// <summary>
+    /// A recording rolled at 23:30 is on air at 00:15 the next day. The time of day wraps; the
+    /// dated figure does not, and that is what keeps Live Edit's mark after 23:59 on a ruler the
+    /// recording has run on past midnight.
+    /// </summary>
+    [Fact]
+    public void On_air_past_midnight_keeps_its_date()
+    {
+        var state = new PipelineState();
+        var rolled = new DateTime(2026, 10, 17, 23, 30, 0);
+
+        state.RecordingStartedAt = rolled;
+        state.RecordingStart = new Timecode(TimelineZoom.FrameOfDay(rolled, 25), 25);
+        state.SetAiredFrame(45 * 60 * 25);   // forty-five minutes in
+
+        Assert.Equal(new DateTime(2026, 10, 18, 0, 15, 0), state.OnAirAt);
+        Assert.Equal(TimeSpan.FromMinutes(15), state.OnAirTimeOfDay);
+    }
+
+    [Fact]
+    public void Nothing_on_air_is_no_time_of_day()
+    {
+        var state = new PipelineState();
+        state.RecordingStart = new Timecode(0, 25);
+
+        Assert.Null(state.OnAirTimeOfDay);
+    }
+
+    /// <summary>The per-frame position stands on its own, without the once-a-second counts.</summary>
+    [Fact]
+    public void The_aired_frame_moves_every_frame()
+    {
+        var state = new PipelineState();
+
+        state.SetAiredFrame(22_500);
+        Assert.Equal(22_500, state.AiredFrame);
+
+        state.ClearAired();
+        Assert.Null(state.AiredFrame);
     }
 }

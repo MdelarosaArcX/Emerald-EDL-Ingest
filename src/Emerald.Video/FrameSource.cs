@@ -59,11 +59,22 @@ public sealed class FrameSource : IDisposable
     /// In-point within the media (the SOM). Placed before -i so ffmpeg seeks by keyframe
     /// and then decodes forward, which is fast and frame-accurate for playout.
     /// </param>
-    public static FrameSource Open(string ffmpegPath, string mediaPath, VideoFormat format, TimeSpan? seek = null)
+    /// <param name="speed">
+    /// The rate the media is played at, 1 being its own. Above 1 runs it faster, which a
+    /// fit-to-fill uses to cover a range shorter than the media; frames are then retimed by
+    /// <c>fps</c> to the output rate, so there are always exactly as many as the output needs.
+    /// </param>
+    public static FrameSource Open(string ffmpegPath, string mediaPath, VideoFormat format, TimeSpan? seek = null,
+                                   double speed = 1)
     {
         // scale keeps the source aspect, pad centres it in the raster, fps conforms the
         // rate. Audio is dropped: this is a video playout path.
+        string retime = Math.Abs(speed - 1) > 0.0001 && speed > 0
+            ? $"setpts=PTS/{speed.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)},"
+            : "";
+
         string filter =
+            retime +
             $"scale={format.Width}:{format.Height}:force_original_aspect_ratio=decrease," +
             $"pad={format.Width}:{format.Height}:(ow-iw)/2:(oh-ih)/2:color=black," +
             $"fps={format.FrameRate}";

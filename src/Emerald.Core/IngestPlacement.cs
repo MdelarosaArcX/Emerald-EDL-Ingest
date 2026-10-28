@@ -30,6 +30,14 @@ public enum IngestMode
     /// timeline — and the delay — grows.
     /// </summary>
     Insert,
+
+    /// <summary>
+    /// A scene taken out: the marked range of the recording does not go to air at all, and the
+    /// recording after it follows straight on. The opposite of an insert - it takes no time on
+    /// the timeline, and everything after it moves <i>earlier</i> by the range's length, so the
+    /// delay shrinks by that much. No media: the placement's path is empty.
+    /// </summary>
+    Cut,
 }
 
 /// <summary>
@@ -142,6 +150,27 @@ public static class IngestPlacement
     }
 
     /// <summary>
+    /// Plans taking a scene out: the marked range of the recording, in recording frames, will not
+    /// go to air. Zero length on the timeline, and it pulls everything after it earlier by the
+    /// range - so <see cref="IngestPlan.ShiftsAfterBy"/> is negative.
+    /// </summary>
+    public static bool TryPlanCut(long? markIn, long? markOut, out IngestPlan plan, out string? problem)
+    {
+        plan = default;
+        problem = null;
+
+        if (markIn is not { } from || markOut is not { } to || to <= from)
+        {
+            problem = "Deleting a scene needs a marked range. Mark in and out first.";
+            return false;
+        }
+
+        plan = new IngestPlan(IngestMode.Cut, Math.Max(0, from), 0, to - Math.Max(0, from), 1,
+                              -(to - Math.Max(0, from)));
+        return true;
+    }
+
+    /// <summary>
     /// What a plan does, in a sentence, for the timeline block and the log.
     ///
     /// Written from the plan rather than from the mode, so it states what will actually happen
@@ -175,6 +204,10 @@ public static class IngestPlacement
 
             IngestMode.Insert =>
                 $"inserted for {length}; everything after moves {plan.ShiftsAfterBy:N0} frames later",
+
+            IngestMode.Cut =>
+                $"{plan.Covers:N0} frames ({new Timecode(plan.Covers, rate)}) taken out; " +
+                $"everything after moves {plan.Covers:N0} frames earlier",
 
             _ => length,
         };
