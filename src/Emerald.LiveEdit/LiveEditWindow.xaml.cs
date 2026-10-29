@@ -918,6 +918,16 @@ public partial class LiveEditWindow : Window
         ?? _placed.FirstOrDefault(p => p.Holds(dayFrame));
 
     /// <summary>
+    /// The segment that carries on from a frame: the one holding it, or the first to start within
+    /// two seconds after it - a capture that dropped a frame leaves that much between two files.
+    /// </summary>
+    private Placed? NextSegmentFrom(long dayFrame) =>
+        ClipAt(dayFrame)
+        ?? _placed.Where(p => p.StartFrame > dayFrame && p.StartFrame <= dayFrame + 2L * _rate)
+                  .OrderBy(p => p.StartFrame)
+                  .FirstOrDefault();
+
+    /// <summary>
     /// The closest segment that can actually be played, or none.
     ///
     /// Closest by the gap between the frame and the segment, so a playhead sitting in a hole
@@ -1041,6 +1051,9 @@ public partial class LiveEditWindow : Window
         LeaveHeld(now: false);
 
         _wantOffset = want.OffsetOf(on.CapturedFrame);
+
+        _seekedCaptured = on.CapturedFrame;
+        _seekedAt = DateTime.UtcNow;
 
         bool swapped = false;
 
@@ -1449,6 +1462,28 @@ public partial class LiveEditWindow : Window
 
         }, DispatcherPriority.Background);
 
+    private void ViewerCell_SizeChanged(object sender, SizeChangedEventArgs e) => SizeViewer();
+
+    /// <summary>
+    /// Sizes the big screen to the picture: as large as the cell allows, in the video's own
+    /// shape. Filling the cell instead left the picture letterboxed inside a frame of a
+    /// different shape, with bars of empty screen around it. 16:9 until a file says otherwise.
+    /// </summary>
+    private void SizeViewer()
+    {
+        double aspect = _active is { NaturalVideoWidth: > 0, NaturalVideoHeight: > 0 } p
+            ? p.NaturalVideoWidth / (double)p.NaturalVideoHeight
+            : 16.0 / 9.0;
+
+        double w = ViewerCell.ActualWidth, h = ViewerCell.ActualHeight;
+        if (w <= 0 || h <= 0) return;
+
+        double width = Math.Min(w, h * aspect);
+
+        ViewerFrame.Width = width;
+        ViewerFrame.Height = width / aspect;
+    }
+
     private void Player_Opened(object sender, RoutedEventArgs e)
     {
         // The two players share these handlers, and only the one on screen drives the transport.
@@ -1462,6 +1497,8 @@ public partial class LiveEditWindow : Window
         // frame the operator clicked is actually reached rather than the start of the file.
         _open = true;
         _seekRetries = 0;
+
+        SizeViewer();
 
         ApplyOffset();
 
@@ -1516,11 +1553,33 @@ public partial class LiveEditWindow : Window
         long nextCaptured = ended.EndFrame;
         long next = IngestTimeline.RulerFrameOf(nextCaptured, IngestItems());
 
-        if (ClipAt(nextCaptured) is { Pending: false })
+        // Playing along with air: wherever air is now, which is the one place this screen should
+        // be. Worked out from the segment that ended, a small slip at every handover added up.
+        if (_chasing && _playing && OnAirFrame() is { } air)
         {
-            Seek(next);
-            if (_playing) Player.Play();
-            return;
+            Seek(air);
+
+            if (_held) return;
+            if (_loaded is not null || _onIngest is not null) { Player.Play(); return; }
+        }
+
+        // The next segment, allowing for the frame or two a recording can leave between two
+        // files when the capture drops a frame. Asking for the segment holding exactly the end
+        // frame found nothing in that gap, and the transport stopped dead between two segments.
+        else if (NextSegmentFrom(nextCaptured) is { } following)
+        {
+            long at = Math.Max(nextCaptured, following.StartFrame);
+
+            Seek(IngestTimeline.RulerFrameOf(at, IngestItems()));
+
+            // Into the segment still being recorded: played on from the delay buffer's clock.
+            if (_held) return;
+
+            if (_loaded is not null || _onIngest is not null)
+            {
+                if (_playing) Player.Play();
+                return;
+            }
         }
 
         // The end of the day, and the recording carried on past midnight into the next day's
@@ -1767,14 +1826,34 @@ public partial class LiveEditWindow : Window
             // player's position is in captured frames and the ruler is not.
             long captured = loaded.StartFrame + (long)Math.Round(Player.Position.TotalSeconds * _rate);
 
-            _at = captured + (_at - IngestTimeline.At(_at, IngestItems()).CapturedFrame);
+            // Just after a seek the player still reports where it was for a moment. Read as the
+            // playhead, that put it back where it had come from - at a deleted scene, back in
+            // front of the scene, which was then jumped again: the player went round in a loop
+            // instead of playing on. So the position is not believed until it has arrived.
+            if (_seekedCaptured is { } wanted)
+            {
+                if (Math.Abs(captured - wanted) > _rate / 2 && (DateTime.UtcNow - _seekedAt).TotalMilliseconds < 1500)
+                {
+                    FollowLayers();
+                    DrawMarkers();
+                    return;
+                }
+
+                _seekedCaptured = null;
+            }
+
+            List<IngestItem> items = IngestItems();
+
+            // Where the file's frame is on the ruler, straight from the mapping rather than from
+            // where the playhead was - which, across a jump, is the wrong side of it.
+            _at = IngestTimeline.RulerFrameOf(captured, items);
 
             if (StoppedAtMarkOut()) return;
 
             // Has the player run into a deleted scene? Then the ruler frame it has reached shows
             // the far side of the scene, not what the file is playing - so it goes there, the
             // same jump the transmitter makes on air.
-            if (IngestTimeline.At(_at, IngestItems()) is { OnIngest: false } there && there.CapturedFrame != captured)
+            if (IngestTimeline.At(_at, items) is { OnIngest: false } there && there.CapturedFrame != captured)
             {
                 Seek(_at);
                 if (_playing) Player.Play();
@@ -2087,6 +2166,10 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private bool _chasing;
 
+    /// <summary>The frame of the recording the last seek asked the player for, until it reports being there.</summary>
+    private long? _seekedCaptured;
+    private DateTime _seekedAt = DateTime.MinValue;
+
     /// <summary>
     /// How far the playhead may wander from the on-air mark before it is put back. Half a second:
     /// two players running off two clocks part by a frame now and then, and re-seeking for that
@@ -2166,6 +2249,10 @@ public partial class LiveEditWindow : Window
         }
 
         if (!_open && !_held) return;
+
+        // Not while the last seek is still landing: the playhead reads behind until it does, and
+        // seeking again for that was a picture that kept going black and starting over.
+        if (_seekedCaptured is not null && (DateTime.UtcNow - _seekedAt).TotalMilliseconds < 1500) return;
 
         if (Math.Abs(_at - onAir) > ChaseSlack)
         {

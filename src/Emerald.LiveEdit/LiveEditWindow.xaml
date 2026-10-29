@@ -39,15 +39,15 @@
 
     <Grid Margin="18">
         <!-- The media panel's width is the operator's to set.
-             The viewer is a star column and the panel a fixed one, so dragging the splitter
+             Both are star columns, four to one, so the panel opens at a fifth of the width; dragging the splitter
              between them takes width from one and gives it to the other - the big screen
              re-lays itself out as the panel moves, which is what makes the drag worth having.
              MinWidth on both, so neither can be collapsed to a sliver that cannot be grabbed
              back. -->
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*" MinWidth="320"/>
+            <ColumnDefinition Width="4*" MinWidth="320"/>
             <ColumnDefinition Width="16"/>
-            <ColumnDefinition x:Name="PanelColumn" Width="300" MinWidth="210"/>
+            <ColumnDefinition x:Name="PanelColumn" Width="1*" MinWidth="260"/>
         </Grid.ColumnDefinitions>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -113,8 +113,13 @@
                     ToolTip="Put the recording to air from here, with this timeline's ingest media and deleted scenes"/>
         </StackPanel>
 
-        <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource PanelDeep}"
-                BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="6">
+        <!-- The cell the big screen sits in. Not drawn: it is measured, so the screen itself can be
+             sized to the picture rather than to whatever shape the cell happens to be. -->
+        <Border x:Name="ViewerCell" Grid.Row="1" Grid.Column="0" SizeChanged="ViewerCell_SizeChanged"/>
+
+        <Border x:Name="ViewerFrame" Grid.Row="1" Grid.Column="0" Background="{StaticResource PanelDeep}"
+                HorizontalAlignment="Center" VerticalAlignment="Center"
+                BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="0">
             <Grid>
                 <!-- Two players on the one screen, one showing and one waiting. The waiting one
                      opens whatever comes next - the next segment, an ingest item the playhead is
