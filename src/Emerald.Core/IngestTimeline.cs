@@ -159,6 +159,30 @@ public static class IngestTimeline
         return item.Plan.StartFrame + shift;
     }
 
+    /// <summary>
+    /// The stretch of the ruler around <paramref name="rulerFrame"/> that the recording plays
+    /// straight through: from the end of the last placement or cut at or before it, to the start
+    /// of the next one after it (<see cref="long.MaxValue"/> when there is none).
+    ///
+    /// For following a player along the ruler. Inside the run, a frame further into the file is
+    /// that much further along; at its end something else plays, which the player cannot know.
+    /// </summary>
+    public static (long From, long To) RunAround(long rulerFrame, IReadOnlyList<IngestItem> items)
+    {
+        long from = 0, to = long.MaxValue;
+
+        foreach (IngestItem item in items)
+        {
+            long start = RulerStart(item, items);
+            long end = item.Plan.Mode == IngestMode.Cut ? start : start + item.Plan.Frames;
+
+            if (start > rulerFrame) to = Math.Min(to, start);
+            if (end <= rulerFrame) from = Math.Max(from, end);
+        }
+
+        return (from, to);
+    }
+
     /// <summary>One continuous run of a segment, after inserts and cuts have cut it up.</summary>
     /// <param name="CapturedStart">Where this piece starts in the recording.</param>
     /// <param name="Frames">How long it runs.</param>

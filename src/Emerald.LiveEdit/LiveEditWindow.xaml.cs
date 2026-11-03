@@ -505,11 +505,41 @@ public partial class LiveEditWindow : Window
         GoToDay(day, byHand: false);
     }
 
+    /// <summary>
+    /// Takes up the capture deck's output path if it has changed since this window opened.
+    ///
+    /// The settings were read once, when the window was made, so a path set on the deck after
+    /// that - a new store on the production machine, say - left this looking in the old folder,
+    /// or in the default one beside the program, while the recording went somewhere else. The
+    /// deck saves the path the moment it is set and again when a recording starts. True when it
+    /// had changed.
+    /// </summary>
+    private bool FollowCaptureFolder()
+    {
+        if (AppSettings.SavedCaptureFolder() is not { } saved || saved == _settings.CaptureFolder) return false;
+
+        string was = MediaLibrary.FolderFor(_settings);
+
+        _settings.CaptureFolder = saved;
+        _signature = "";
+
+        ActivityLog.Shared.Info(LogSource.App,
+            $"Live Edit now reads capture media from {MediaLibrary.FolderFor(_settings)} " +
+            $"(was {was}), the capture recording's output path.",
+            @event: "liveedit.capturefolder");
+
+        return true;
+    }
+
     private void CheckStore()
     {
         FollowTheDate();
 
         if (_listing || _checking) return;
+
+        // A new output path is a new store: listed straight away rather than on its fingerprint.
+        if (FollowCaptureFolder()) { LoadClips(); return; }
+
         _checking = true;
 
         string folder = RecordingProfile.FolderFor(RecordingProfile.LowRes,
@@ -739,7 +769,7 @@ public partial class LiveEditWindow : Window
                 c,
                 FrameOn(c.StartsAt!.Value),
                 c.Info is { } info && info.Duration > TimeSpan.Zero
-                    ? (long)Math.Round(info.Duration.TotalSeconds * _rate)
+                    ? (long)Math.Round(info.Runs.TotalSeconds * _rate)
                     : assumed))
             .OrderBy(p => p.StartFrame)
             .ToList();
@@ -789,7 +819,11 @@ public partial class LiveEditWindow : Window
         ShowPosition();
     }
 
-    private void Refresh_Click(object sender, RoutedEventArgs e) => LoadClips();
+    private void Refresh_Click(object sender, RoutedEventArgs e)
+    {
+        FollowCaptureFolder();
+        LoadClips();
+    }
 
     private void DayBack_Click(object sender, RoutedEventArgs e) => GoToDay(_day.AddDays(-1));
     private void DayForward_Click(object sender, RoutedEventArgs e) => GoToDay(_day.AddDays(1));
@@ -959,6 +993,22 @@ public partial class LiveEditWindow : Window
         .Select(o => new IngestItem(o.Path, o.Plan!.Value))
         .ToList();
 
+    /// <summary>
+    /// The ingest items whose picture takes over the big screen, for playing the timeline.
+    ///
+    /// Audio only laid over the recording is left out: there the recording's picture carries on,
+    /// as it does on air, and the item's sound comes from the sound player beside it (see
+    /// FollowIngestSound). Never an insert or a cut, so leaving it out moves nothing on the ruler.
+    /// </summary>
+    private List<IngestItem> PlayedItems() => _overlays
+        .Where(o => o.Plan is not null && !SoundOverRecording(o))
+        .Select(o => new IngestItem(o.Path, o.Plan!.Value))
+        .ToList();
+
+    /// <summary>Audio only, laid over the recording rather than inserted into it.</summary>
+    private static bool SoundOverRecording(Overlay overlay) =>
+        overlay.Plan is { Mode: not (IngestMode.Insert or IngestMode.Cut), Tracks: IngestTracks.AudioOnly };
+
     /// <summary>What the player currently has loaded from the ingest lane, if anything.</summary>
     private string? _onIngest;
 
@@ -966,12 +1016,19 @@ public partial class LiveEditWindow : Window
     /// Whether a block covers a frame of the ruler, as drawn.
     ///
     /// An ingest placement's own StartFrame is in captured frames; where it appears is that plus
-    /// the inserts before it. A hand-dropped layer was put at a ruler position to begin with and
-    /// is taken as it is.
+    /// the inserts before it.
     /// </summary>
+    /// <summary>
+    /// Whether any of a segment can be in the window. Wide rather than exact: from where its first
+    /// frame is on the ruler to where its end is, which takes in every insert inside it.
+    /// </summary>
+    private static bool OnScreen(Placed placed, List<IngestItem> items, long start, long span) =>
+        IngestTimeline.RulerFrameOf(placed.EndFrame, items) >= start &&
+        IngestTimeline.RulerFrameOf(placed.StartFrame, items) <= start + span;
+
     private bool HoldsOnRuler(Overlay overlay, long rulerFrame)
     {
-        if (overlay.Plan is not { } plan) return overlay.Holds(rulerFrame);
+        if (overlay.Plan is not { } plan) return false;
 
         long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, plan), IngestItems());
 
@@ -985,7 +1042,7 @@ public partial class LiveEditWindow : Window
         // Does an ingest placement cover this frame? If so it plays instead of the recording,
         // which is what all four modes have in common - they replace the original video and
         // audio for as long as they run. The big screen is the output, so the item goes on it.
-        TimelineAt on = IngestTimeline.At(_at, IngestItems());
+        TimelineAt on = IngestTimeline.At(_at, PlayedItems());
 
         if (on.OnIngest) { SeekIngest(on); return; }
 
@@ -1100,6 +1157,9 @@ public partial class LiveEditWindow : Window
         LeaveHeld(now: false);
 
         _wantOffset = on.Offset;
+
+        _seekedIngest = on.Offset;
+        _seekedAt = DateTime.UtcNow;
 
         bool swapped = false;
 
@@ -1303,7 +1363,7 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private (Uri Uri, long Offset)? Upcoming(int direction)
     {
-        List<IngestItem> items = IngestItems();
+        List<IngestItem> items = PlayedItems();
         long reach = PreloadSeconds * (long)_rate;
 
         var cuts = new List<long>();
@@ -1519,7 +1579,7 @@ public partial class LiveEditWindow : Window
         // transport simply stopped at the end of an inserted item.
         if (_onIngest is not null)
         {
-            TimelineAt on = IngestTimeline.At(_at, IngestItems());
+            TimelineAt on = IngestTimeline.At(_at, PlayedItems());
 
             long after = on.OnIngest
                 ? _at + Math.Max(1, (long)Math.Round(
@@ -1528,7 +1588,7 @@ public partial class LiveEditWindow : Window
 
             // Walk to the first frame the placement no longer covers, so the handover is exact
             // rather than a guess that might land inside it again.
-            while (IngestTimeline.At(after, IngestItems()).Path == _onIngest &&
+            while (IngestTimeline.At(after, PlayedItems()).Path == _onIngest &&
                    after < _dayFrames - 1)
                 after++;
 
@@ -1551,7 +1611,7 @@ public partial class LiveEditWindow : Window
         // ruler. With no inserts they are the same number, which is exactly why mixing them
         // would go unnoticed until somebody used insert.
         long nextCaptured = ended.EndFrame;
-        long next = IngestTimeline.RulerFrameOf(nextCaptured, IngestItems());
+        long next = IngestTimeline.RulerFrameOf(nextCaptured, PlayedItems());
 
         // Playing along with air: wherever air is now, which is the one place this screen should
         // be. Worked out from the segment that ended, a small slip at every handover added up.
@@ -1563,6 +1623,18 @@ public partial class LiveEditWindow : Window
             if (_loaded is not null || _onIngest is not null) { Player.Play(); return; }
         }
 
+        // An ingest item placed exactly at the join: it plays before the next segment does. The
+        // next segment's first frame is mapped to the far side of an insert there, so going
+        // straight to it played past the item.
+        else if (IngestTimeline.RulerFrameOf(nextCaptured - 1, PlayedItems()) + 1 is var handover &&
+                 IngestTimeline.At(handover, PlayedItems()).OnIngest)
+        {
+            Seek(handover);
+
+            if (_playing && _onIngest is not null) Player.Play();
+            return;
+        }
+
         // The next segment, allowing for the frame or two a recording can leave between two
         // files when the capture drops a frame. Asking for the segment holding exactly the end
         // frame found nothing in that gap, and the transport stopped dead between two segments.
@@ -1570,7 +1642,7 @@ public partial class LiveEditWindow : Window
         {
             long at = Math.Max(nextCaptured, following.StartFrame);
 
-            Seek(IngestTimeline.RulerFrameOf(at, IngestItems()));
+            Seek(IngestTimeline.RulerFrameOf(at, PlayedItems()));
 
             // Into the segment still being recorded: played on from the delay buffer's clock.
             if (_held) return;
@@ -1713,7 +1785,6 @@ public partial class LiveEditWindow : Window
         if (!_playing) return;
 
         Player.Pause();
-        StopLayers();
         _playing = false;
         _stopAt = null;
         PlayButton.Content = "▶";
@@ -1744,6 +1815,7 @@ public partial class LiveEditWindow : Window
         SettleHeld();
         ShowCountdown();
         FollowAudioLevel();
+        FollowIngestSound();
 
         // The segment still being recorded, playing from the delay line: the playhead runs on
         // its own clock, there being no player to read a position from.
@@ -1777,7 +1849,7 @@ public partial class LiveEditWindow : Window
             {
                 long past = _at;
 
-                while (IngestTimeline.At(past, IngestItems()).Path == _onIngest &&
+                while (IngestTimeline.At(past, PlayedItems()).Path == _onIngest &&
                        past < _dayFrames - 1)
                     past++;
 
@@ -1789,7 +1861,6 @@ public partial class LiveEditWindow : Window
                 return;
             }
 
-            FollowLayers();
             DrawMarkers();
 
             if (Following) { ScrollWithTheClock(); ShowScroll(); }
@@ -1801,10 +1872,27 @@ public partial class LiveEditWindow : Window
         // two frames on for every one frame of timeline.
         if (_playing && _onIngest is not null)
         {
-            TimelineAt on = IngestTimeline.At(_at, IngestItems());
+            TimelineAt on = IngestTimeline.At(_at, PlayedItems());
 
             if (on.OnIngest)
             {
+                // Just after the swap the player can still report where the last source was. Read
+                // as the item's position, that put the playhead past the item's end and the
+                // recording took over again - the item was skipped. Not believed until it arrives,
+                // as for the recording below.
+                if (_seekedIngest is { } wanted)
+                {
+                    double fileFrame = Player.Position.TotalSeconds * _rate;
+
+                    if (Math.Abs(fileFrame - wanted) > _rate / 2 && (DateTime.UtcNow - _seekedAt).TotalMilliseconds < 1500)
+                    {
+                        DrawMarkers();
+                        return;
+                    }
+
+                    _seekedIngest = null;
+                }
+
                 double into = Player.Position.TotalSeconds * _rate / Math.Max(0.0001, on.Speed);
 
                 // Where the placement begins on the ruler, so the file's own offset maps back.
@@ -1816,7 +1904,7 @@ public partial class LiveEditWindow : Window
 
                 // Run off the end of the placement and the recording takes over again, which is
                 // a reload rather than a position change.
-                if (IngestTimeline.At(_at, IngestItems()).Path != on.Path) Seek(_at);
+                if (IngestTimeline.At(_at, PlayedItems()).Path != on.Path) Seek(_at);
             }
             else Seek(_at);
         }
@@ -1834,7 +1922,6 @@ public partial class LiveEditWindow : Window
             {
                 if (Math.Abs(captured - wanted) > _rate / 2 && (DateTime.UtcNow - _seekedAt).TotalMilliseconds < 1500)
                 {
-                    FollowLayers();
                     DrawMarkers();
                     return;
                 }
@@ -1842,37 +1929,39 @@ public partial class LiveEditWindow : Window
                 _seekedCaptured = null;
             }
 
-            List<IngestItem> items = IngestItems();
+            List<IngestItem> items = PlayedItems();
 
-            // Where the file's frame is on the ruler, straight from the mapping rather than from
-            // where the playhead was - which, across a jump, is the wrong side of it.
-            _at = IngestTimeline.RulerFrameOf(captured, items);
+            // Where the file's frame is on the ruler: on from where the playhead was, by however
+            // far the file has played, and never out of the run of recording it is in.
+            //
+            // Not the captured frame put through the mapping, which is what this was. The mapping
+            // puts the frame an insert sits at on the far side of the insert - that is where it
+            // plays on air, after it - so a playhead crossing an insert was put straight past it
+            // and the item never played. And just after handing back from an item, a player that
+            // reads a frame short of where it was sent was mapped to before the item, and the
+            // playhead went back into the segments in front of it.
+            TimelineAt here = IngestTimeline.At(_at, items);
+
+            long at = here.OnIngest
+                ? IngestTimeline.RulerFrameOf(captured, items)
+                : _at + (captured - here.CapturedFrame);
+
+            (long from, long to) = IngestTimeline.RunAround(_at, items);
+
+            // Reached the end of the run: an ingest item to play, or a deleted scene to jump -
+            // the same jump the transmitter makes on air. Seek is what swaps the source, and it
+            // keeps playing because it was playing.
+            if (at >= to)
+            {
+                Seek(to);
+
+                if (_playing && (_loaded is not null || _onIngest is not null)) Player.Play();
+                return;
+            }
+
+            _at = Math.Max(from, at);
 
             if (StoppedAtMarkOut()) return;
-
-            // Has the player run into a deleted scene? Then the ruler frame it has reached shows
-            // the far side of the scene, not what the file is playing - so it goes there, the
-            // same jump the transmitter makes on air.
-            if (IngestTimeline.At(_at, items) is { OnIngest: false } there && there.CapturedFrame != captured)
-            {
-                Seek(_at);
-                if (_playing) Player.Play();
-                return;
-            }
-
-            // Has the playhead just run into a placement?
-            //
-            // Nothing asked this before, which is why an ingest item played when the playhead
-            // was put inside it and not when the playhead arrived there on its own: the
-            // recording simply carried on underneath. Seek is what swaps the source, and it
-            // keeps playing because it was playing.
-            if (IngestTimeline.At(_at, IngestItems()).OnIngest)
-            {
-                Seek(_at);
-
-                if (_onIngest is not null) Player.Play();
-                return;
-            }
 
             // Only when the playhead would otherwise leave the window. Scrolling the view is a
             // rebuild, so it must not happen every frame. Not while following, where the view is
@@ -1887,10 +1976,9 @@ public partial class LiveEditWindow : Window
 
         if (Following) { ScrollWithTheClock(); ShowScroll(); }
 
-        FollowLayers();
         DrawMarkers();
 
-        if (_chasing) Chase();
+        if (_chasing) { Chase(); AutoSync(); }
 
         // The next cut, opened before the playhead gets there.
         if (_playing) PreloadNext();
@@ -2168,6 +2256,9 @@ public partial class LiveEditWindow : Window
 
     /// <summary>The frame of the recording the last seek asked the player for, until it reports being there.</summary>
     private long? _seekedCaptured;
+
+    /// <summary>The frame into an ingest item the last seek asked the player for, until it reports being there.</summary>
+    private long? _seekedIngest;
     private DateTime _seekedAt = DateTime.MinValue;
 
     /// <summary>
@@ -2261,6 +2352,73 @@ public partial class LiveEditWindow : Window
         }
     }
 
+    private void Sync_Click(object sender, RoutedEventArgs e) => SyncToAir();
+
+    /// <summary>
+    /// Puts the preview back on what is actually going out: the store read again, so every
+    /// segment sits where it really starts, then played on from the on-air mark, locked to it.
+    /// </summary>
+    private void SyncToAir()
+    {
+        LeaveRecordingView();
+
+        if (OnAirFrame() is not { } onAir)
+        {
+            StoreText.Text = "Nothing is on air to sync with.";
+            return;
+        }
+
+        // Stopped first, so the play that follows the listing starts locking rather than stops it.
+        Pause();
+
+        _syncedAt = DateTime.UtcNow;
+        _afterPlaced = PlayOnAir;
+
+        ActivityLog.Shared.Info(LogSource.App,
+            $"SYNC  Live Edit re-synced to air at {Stamp(onAir)} (was at {Stamp(_at)}).",
+            @event: "liveedit.sync");
+
+        LoadClips();
+    }
+
+    /// <summary>When the auto sync last looked, so it looks only every <see cref="AutoSyncEvery"/>.</summary>
+    private DateTime _syncedAt = DateTime.MinValue;
+
+    private static readonly TimeSpan AutoSyncEvery = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Every half minute while locked to air: back onto the mark if the preview has drifted from it.
+    ///
+    /// Tighter than <see cref="Chase"/>, which lets the playhead wander half a second either way
+    /// because it looks every frame and a re-seek stalls the picture. Looking twice a minute, a
+    /// stall now and then costs little, and two frames is as close as two clocks can be held.
+    /// </summary>
+    private void AutoSync()
+    {
+        if (AutoSyncButton.IsChecked != true) return;
+
+        DateTime now = DateTime.UtcNow;
+        if (now - _syncedAt < AutoSyncEvery) return;
+
+        if (!_open && !_held) return;
+        if (_seekedCaptured is not null && (now - _seekedAt).TotalMilliseconds < 1500) return;
+
+        _syncedAt = now;
+
+        if (OnAirFrame() is not { } onAir) return;
+
+        long off = _at - onAir;
+        if (Math.Abs(off) <= 2) return;
+
+        Seek(onAir);
+        if (!_held) Player.Play();
+
+        ActivityLog.Shared.Info(LogSource.App,
+            $"AUTO SYNC  Live Edit was {Math.Abs(off)} frames {(off < 0 ? "behind" : "ahead of")} air; " +
+            $"put back on the on-air mark at {Stamp(onAir)}.",
+            @event: "liveedit.autosync");
+    }
+
     private void StopChasing()
     {
         if (!_chasing) return;
@@ -2316,8 +2474,6 @@ public partial class LiveEditWindow : Window
             : $"{20 * Math.Log10(level):+0.0;-0.0;0.0} dB";
 
         LevelText.Foreground = Brush(muted ? "Muted" : "Tc");
-
-        ApplyLaneLevels();
     }
 
     private Brush Brush(string key) => (Brush)FindResource(key);
@@ -2528,32 +2684,24 @@ public partial class LiveEditWindow : Window
         }
     }
 
-    // ------------------------------------------------------------------ layers
+    // ------------------------------------------------------------------ ingest items
 
     /// <summary>
-    /// One file laid over the recording: an ad, a bed, a voice track.
+    /// One thing laid into the recording from the Ingest list, or a scene taken out of it.
     ///
-    /// Held in frames of the day like everything else, so where it sits is comparable with the
-    /// recording under it and with what is on air. <see cref="GainDb"/> is this item's own level,
-    /// on top of whatever its lane is set to.
+    /// <see cref="StartFrame"/> is in captured frames - what the operator pointed at - and where it
+    /// is drawn is that plus the inserts before it. <see cref="GainDb"/> is the level its sound
+    /// goes to air at.
     /// </summary>
     private sealed class Overlay
     {
         public required string Path { get; init; }
-        public required int Lane { get; init; }
         public required long StartFrame { get; set; }
         public required long Frames { get; init; }
 
         public double GainDb { get; set; }
 
-        /// <summary>
-        /// How this item sits against the recording, when it came from the Ingest list.
-        ///
-        /// Null for a file dragged in from Explorer onto one of the two plain layers, which is
-        /// the older behaviour and still just a block at a time. An ingest item carries its
-        /// plan, because the four modes mean different things about what goes to air and the
-        /// block has to say which was chosen.
-        /// </summary>
+        /// <summary>How this item sits against the recording: the mode, its span, and which tracks go out.</summary>
         public IngestPlan? Plan { get; set; }
 
         /// <summary>
@@ -2565,57 +2713,22 @@ public partial class LiveEditWindow : Window
         public string Name => Plan is { Mode: IngestMode.Cut } ? "scene cut" : System.IO.Path.GetFileName(Path);
         public long EndFrame => StartFrame + Frames;
 
-        public bool Holds(long dayFrame) => dayFrame >= StartFrame && dayFrame < EndFrame;
+        /// <summary>Media rather than a scene cut.</summary>
+        public bool IsMedia => Plan is { Mode: not IngestMode.Cut };
 
-        /// <summary>Where in the file a day frame falls.</summary>
-        public long OffsetOf(long dayFrame) => Math.Clamp(dayFrame - StartFrame, 0, Math.Max(0, Frames - 1));
+        public bool HasVideo => Plan is { HasVideo: true };
+        public bool HasAudio => Plan is { HasAudio: true };
     }
-
-    /// <summary>
-    /// Two lanes a file can be dropped onto by hand. More would make the timeline a thicket at
-    /// this height.
-    /// </summary>
-    private const int Lanes = 2;
-    private const double LaneHeight = 36;
-
-    /// <summary>
-    /// The lane everything from the Ingest list goes on.
-    ///
-    /// <b>Not in the overlay canvas at all.</b> It has a canvas of its own, directly above the
-    /// segments and below the ruler, because it is the one track that changes what goes to air —
-    /// an item there replaces the recording under it. The two hand-drop lanes are monitor layers
-    /// and belong underneath. A sentinel rather than an index into the lane array for that
-    /// reason: there is no row in the overlay canvas for it to be.
-    ///
-    /// It is not a drop target for files from Explorer: an ingest placement carries a mode, and
-    /// a file dragged in from outside has not been through the dialog that chooses one.
-    /// </summary>
-    private const int IngestLane = -1;
-
-    /// <summary>The first lane a file can be dropped on by hand.</summary>
-    private const int FirstDropLane = 0;
-
-    private const int AllLanes = Lanes;
 
     private readonly List<Overlay> _overlays = new();
     private Overlay? _selected;
 
-    /// <summary>Per-lane level, applied on top of each item's own.</summary>
-    private readonly double[] _laneGainDb = new double[AllLanes];
+    /// <summary>The sound of the selected item was picked up, on the ingest audio lane, rather than the item itself.</summary>
+    private bool _selectedSound;
 
-    /// <summary>
-    /// The player for a lane, or null for the ingest lane.
-    ///
-    /// There are two layer players in the window and three lanes. The ingest lane is a plan
-    /// rather than a monitor feed — what it will do on air is decided by the mode, and this
-    /// window does not yet play that back — so it has no player and says so by returning null
-    /// rather than quietly sharing one and playing the wrong thing.
-    /// </summary>
-    private MediaElement? LanePlayer(int lane) =>
-        lane == FirstDropLane ? LayerA : lane == FirstDropLane + 1 ? LayerB : null;
-
-    /// <summary>What is playing on each lane right now, so it is not restarted every frame.</summary>
-    private readonly Overlay?[] _onLane = new Overlay?[AllLanes];
+    /// <summary>The ingest media item under a frame of the ruler, if any.</summary>
+    private Overlay? IngestAt(long rulerFrame) =>
+        _overlays.FirstOrDefault(o => o.IsMedia && HoldsOnRuler(o, rulerFrame));
 
     // ------------------------------------------------------------------ dropping a file
 
@@ -2628,10 +2741,9 @@ public partial class LiveEditWindow : Window
     /// <summary>
     /// The data format an ingest item is dragged in.
     ///
-    /// Its own format rather than FileDrop, so a drop can be told apart from a file dragged in
-    /// from Explorer. The two are handled differently: an ingest item goes through the dialog
-    /// that chooses how it sits against the recording, and an outside file is laid on a plain
-    /// layer as before.
+    /// Its own format rather than FileDrop, so a drag out of the Ingest list carries the item's
+    /// path rather than relying on Explorer's. A file from Explorer is accepted too, and both go
+    /// through the dialog that chooses how they sit against the recording.
     /// </summary>
     private const string IngestDragFormat = "EmeraldIngestMedia";
 
@@ -2676,10 +2788,9 @@ public partial class LiveEditWindow : Window
             .FirstOrDefault(MediaScanner.IsPlayable);
     }
 
-    private static bool IsIngestDrag(DragEventArgs e) => e.Data.GetDataPresent(IngestDragFormat);
-
     /// <summary>
-    /// Lays a dropped file on the lane and at the time it was dropped.
+    /// Places a dropped file on the timeline, at the time it was dropped, through the dialog that
+    /// asks how it should sit against the recording.
     ///
     /// Its length is probed rather than assumed, because the block's width on the timeline is the
     /// only thing that says how much of the recording it covers — a block drawn at the wrong
@@ -2691,27 +2802,23 @@ public partial class LiveEditWindow : Window
 
         if (Dropped(e) is not { } path) return;
 
-        // The canvas the drop actually landed on, which is now one of three: the ingest lane,
-        // the segments, or the layer lanes. They are stacked in one grid so the horizontal
-        // coordinate means the same thing in all of them, but the vertical does not - taking Y
-        // from the overlay canvas for a drop on the track would give a negative lane.
-        var canvas = sender as IInputElement ?? OverlayCanvas;
-
-        Point at = e.GetPosition(canvas);
-        double dropX = at.X;
-
-        int lane = ReferenceEquals(sender, OverlayCanvas)
-            ? Math.Clamp((int)(at.Y / LaneHeight), FirstDropLane, AllLanes - 1)
-            : FirstDropLane;
+        // Every lane is stacked in one grid, so the horizontal coordinate means the same thing in
+        // all of them.
+        double dropX = e.GetPosition(TrackCanvas).X;
 
         long start = TimelineZoom.FrameAt(dropX, ViewStart, ViewSpan, TrackCanvas.ActualWidth,
                                           _dayFrames - 1);
 
         long frames = 0;
+        bool hasVideo = true, hasAudio = true;
 
         if (MediaProbe.LocateFfprobe(Ffmpeg.Locate(_settings.FfmpegPath)) is { } ffprobe &&
             MediaProbe.Probe(ffprobe, path, _rate) is { } info && info.Duration > TimeSpan.Zero)
+        {
             frames = (long)Math.Round(info.Duration.TotalSeconds * _rate);
+            hasVideo = info.Width > 0;
+            hasAudio = info.HasAudio;
+        }
 
         if (frames <= 0)
         {
@@ -2720,120 +2827,104 @@ public partial class LiveEditWindow : Window
 
             ActivityLog.Shared.Warn(LogSource.App,
                 $"Live Edit could not read the length of {System.IO.Path.GetFileName(path)}, " +
-                "so it was not laid on a layer.",
+                "so it was not placed.",
                 @event: "liveedit.dropfailed", file: path);
             return;
         }
 
-        // From the Ingest list: ask how it should sit against the recording before placing it.
+        // Ask how it should sit against the recording before placing it.
         //
         // The four modes are not interchangeable - three cover the recording and one lengthens
         // it, and only one changes the speed - so there is no sensible default to assume on the
-        // operator's behalf. Cancelling places nothing.
-        if (IsIngestDrag(e))
+        // operator's behalf. Cancelling places nothing. A file dragged in from Explorer goes the
+        // same way: there is no other kind of lane for it to land on.
+        if (!Editable(start))
         {
-            if (!Editable(start))
-            {
-                Refuse("NO EDIT ZONE - ingest media can only be placed ahead of the next ten seconds of air.");
-                return;
-            }
-
-            // In the recording's own frames, which is what a plan is in. On the ruler an insert
-            // earlier on has pushed everything along, so handing the dialog ruler frames placed
-            // the item - and later played it to air - that much late.
-            List<IngestItem> before = IngestItems();
-            long Captured(long ruler) => IngestTimeline.At(ruler, before).CapturedFrame;
-
-            var ask = new IngestDropDialog(path, frames, Captured(start),
-                                           _markIn is { } mIn ? Captured(mIn) : null,
-                                           _markOut is { } mOut ? Captured(mOut) : null, _rate)
-            {
-                Owner = this,
-            };
-
-            if (ask.ShowDialog() != true) return;
-
-            IngestPlan plan = ask.Plan;
-
-            // The two modes that take their place from the marks start at mark in, which can be
-            // somewhere other than where the pointer was.
-            long rulerStart = plan.Mode is IngestMode.FitToFill or IngestMode.Replace && _markIn is { } markedIn
-                ? markedIn
-                : start;
-
-            if (!Editable(rulerStart))
-            {
-                Refuse("NO EDIT ZONE - the marked range starts in the next ten seconds of air, or before it.");
-                return;
-            }
-
-            if (plan.Mode == IngestMode.Insert && !InsertFits(plan.Frames, out string? tooLong))
-            {
-                Refuse(tooLong!);
-                return;
-            }
-
-            var placed = new Overlay
-            {
-                Path = path,
-                Lane = IngestLane,
-                StartFrame = plan.StartFrame,
-                Frames = plan.Frames,
-                Plan = plan,
-            };
-
-            Remember($"placing {placed.Name}");
-
-            _overlays.Add(placed);
-            _selected = placed;
-            _audioPiece = null;
-
-            ActivityLog.Shared.Info(LogSource.LiveEdit,
-                $"EDL  {placed.Name} - {plan.Mode} at {Stamp(rulerStart)}, " +
-                IngestPlacement.Describe(plan, _rate) +
-                (LiveAir.Shared.State is not (LiveAirState.Off or LiveAirState.Failed)
-                    ? $"; goes to air in {(OnAirFrame() is { } air ? new Timecode(Math.Max(0, rulerStart - air), _rate).ToString() : "-")}."
-                    : "."),
-                @event: "liveedit.ingestplaced", correlation: placed.Id, file: path);
-
-            PushCues();
-            Draw();
-            DrawOnAir();
-            ShowLayer();
+            Refuse("NO EDIT ZONE - ingest media can only be placed ahead of the next ten seconds of air.");
             return;
         }
 
-        var overlay = new Overlay { Path = path, Lane = lane, StartFrame = start, Frames = frames };
+        // In the recording's own frames, which is what a plan is in. On the ruler an insert
+        // earlier on has pushed everything along, so handing the dialog ruler frames placed
+        // the item - and later played it to air - that much late.
+        List<IngestItem> before = IngestItems();
+        long Captured(long ruler) => IngestTimeline.At(ruler, before).CapturedFrame;
 
-        Remember($"laying {overlay.Name} on layer {(char)('A' + lane - FirstDropLane)}");
+        var ask = new IngestDropDialog(path, frames, Captured(start),
+                                       _markIn is { } mIn ? Captured(mIn) : null,
+                                       _markOut is { } mOut ? Captured(mOut) : null, _rate,
+                                       hasVideo, hasAudio)
+        {
+            Owner = this,
+        };
 
-        _overlays.Add(overlay);
-        _selected = overlay;
+        if (ask.ShowDialog() != true) return;
+
+        IngestPlan plan = ask.Plan;
+
+        // The two modes that take their place from the marks start at mark in, which can be
+        // somewhere other than where the pointer was.
+        long rulerStart = plan.Mode is IngestMode.FitToFill or IngestMode.Replace && _markIn is { } markedIn
+            ? markedIn
+            : start;
+
+        if (!Editable(rulerStart))
+        {
+            Refuse("NO EDIT ZONE - the marked range starts in the next ten seconds of air, or before it.");
+            return;
+        }
+
+        if (plan.Mode == IngestMode.Insert && !InsertFits(plan.Frames, out string? tooLong))
+        {
+            Refuse(tooLong!);
+            return;
+        }
+
+        var placed = new Overlay
+        {
+            Path = path,
+            StartFrame = plan.StartFrame,
+            Frames = plan.Frames,
+            Plan = plan,
+        };
+
+        Remember($"placing {placed.Name}");
+
+        _overlays.Add(placed);
+        _selected = placed;
+        _selectedSound = false;
         _audioPiece = null;
 
-        ActivityLog.Shared.Info(LogSource.App,
-            $"LAYER {overlay.Name} - on layer {(char)('A' + lane - FirstDropLane)} at {Stamp(start)}, " +
-            $"{frames:N0} frames ({new Timecode(frames, _rate)}).",
-            @event: "liveedit.layer", file: path,
-            detail: $"layer {(char)('A' + lane - FirstDropLane)}\nat {Stamp(start)}\nframes {frames}");
+        ActivityLog.Shared.Info(LogSource.LiveEdit,
+            $"EDL  {placed.Name} - {plan.Mode} at {Stamp(rulerStart)}, " +
+            IngestPlacement.Describe(plan, _rate) +
+            (LiveAir.Shared.State is not (LiveAirState.Off or LiveAirState.Failed)
+                ? $"; goes to air in {(OnAirFrame() is { } air ? new Timecode(Math.Max(0, rulerStart - air), _rate).ToString() : "-")}."
+                : "."),
+            @event: "liveedit.ingestplaced", correlation: placed.Id, file: path);
 
+        PushCues();
         Draw();
+        DrawOnAir();
         ShowLayer();
     }
 
     /// <summary>
-    /// Selects an ingest placement from its own lane.
-    ///
-    /// Separate from the overlay canvas's click because they are separate canvases now, and
-    /// because a click here must not move the playhead — the lane is a list of instructions, and
-    /// picking one up is not the same gesture as pointing at a time.
+    /// Selects an ingest item's picture from the ingest lane, and puts the playhead there - a click
+    /// on any part of a timeline means "look at this moment".
     /// </summary>
-    private void Ingest_Click(object sender, MouseButtonEventArgs e)
+    private void Ingest_Click(object sender, MouseButtonEventArgs e) =>
+        PickIngest(e.GetPosition(IngestCanvas).X, IngestCanvas.ActualWidth, sound: false);
+
+    /// <summary>Picks up one ingest item's sound from the ingest audio lane.</summary>
+    private void IngestAudio_Click(object sender, MouseButtonEventArgs e) =>
+        PickIngest(e.GetPosition(IngestAudioCanvas).X, IngestAudioCanvas.ActualWidth, sound: true);
+
+    private void PickIngest(double x, double width, bool sound)
     {
         LeaveRecordingView();
 
-        long frame = TimelineZoom.FrameAt(e.GetPosition(IngestCanvas).X, ViewStart, ViewSpan,
-                                          IngestCanvas.ActualWidth, _dayFrames - 1);
+        long frame = TimelineZoom.FrameAt(x, ViewStart, ViewSpan, width, _dayFrames - 1);
 
         if (InNoTouchZone(frame))
         {
@@ -2841,23 +2932,28 @@ public partial class LiveEditWindow : Window
             return;
         }
 
-        // A deleted scene is a mark with no width, so it is picked up within a few pixels of it.
-        long near = FramesPerPixel() * 5;
-        List<IngestItem> items = IngestItems();
-
         _audioPiece = null;
-        _selected = _overlays.FirstOrDefault(o => o.Plan is { Mode: IngestMode.Cut } plan &&
-                        Math.Abs(IngestTimeline.RulerStart(new IngestItem(o.Path, plan), items) - frame) <= near)
-                    ?? _overlays.FirstOrDefault(o => o.Plan is not null && HoldsOnRuler(o, frame));
+        _selected = _overlays.FirstOrDefault(o => (sound ? o.HasAudio : o.HasVideo) && HoldsOnRuler(o, frame));
+        _selectedSound = sound && _selected is not null;
 
-        // The playhead goes there too. This lane is part of the timeline, and a click on any
-        // part of a timeline means "look at this moment" - selecting the block without moving
-        // the playhead left the one gesture doing half its job.
         Pause();
         Seek(frame);
 
         ShowLayer();
         Focus();
+    }
+
+    /// <summary>
+    /// A deleted scene within a few pixels of a frame, for a click on the segments: it is a mark
+    /// with no width, drawn across them at the join.
+    /// </summary>
+    private Overlay? CutNear(long rulerFrame)
+    {
+        long near = FramesPerPixel() * 5;
+        List<IngestItem> items = IngestItems();
+
+        return _overlays.FirstOrDefault(o => o.Plan is { Mode: IngestMode.Cut } plan &&
+                   Math.Abs(IngestTimeline.RulerStart(new IngestItem(o.Path, plan), items) - rulerFrame) <= near);
     }
 
     /// <summary>
@@ -2879,148 +2975,72 @@ public partial class LiveEditWindow : Window
         Focus();
     }
 
-    private void Overlay_Click(object sender, MouseButtonEventArgs e)
-    {
-        Point at = e.GetPosition(OverlayCanvas);
-
-        // Every lane including the ingest one, so an ingest placement can be selected and
-        // removed. A drop still only reaches the two hand-drop lanes - a file from Explorer has
-        // not been through the dialog that chooses a mode - but selecting is not dropping.
-        int lane = Math.Clamp((int)(at.Y / LaneHeight), 0, AllLanes - 1);
-
-        long frame = TimelineZoom.FrameAt(at.X, ViewStart, ViewSpan, OverlayCanvas.ActualWidth,
-                                          _dayFrames - 1);
-
-        if (InNoTouchZone(frame))
-        {
-            Refuse("NO EDIT ZONE - the next ten seconds of air cannot be selected or changed.");
-            return;
-        }
-
-        // Against where each block is actually drawn. An ingest placement sits at its ruler
-        // position, which an insert before it has moved, so testing its planned start would
-        // select nothing where the operator clicked and something where they did not.
-        _audioPiece = null;
-        _selected = _overlays.FirstOrDefault(
-            o => o.Plan is null && o.Lane == lane && o.Holds(frame));
-
-        Draw();
-        ShowLayer();
-        Focus();
-    }
-
     // ------------------------------------------------------------------ levels
 
     /// <summary>
-    /// The level an item actually plays at: its own, plus its lane's.
-    ///
-    /// Added in decibels, which is multiplication of the amplitudes — the arithmetic an operator
-    /// expects when they trim a lane and then trim one item on it.
+    /// A decibel up or down on an ingest item's sound. What goes to air, so held to the no edit
+    /// zone like every other edit.
     /// </summary>
-    private double EffectiveGainDb(Overlay overlay) =>
-        Math.Clamp(overlay.GainDb + _laneGainDb[overlay.Lane], -60, 12);
-
     private void NudgeSelectedGain(double by)
     {
-        if (_selected is not { } overlay) return;
+        if (_selected is not { HasAudio: true, Plan: { } plan } overlay) return;
+
+        long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, plan), IngestItems());
+
+        if (!Editable(at))
+        {
+            Refuse($"NO EDIT ZONE - {overlay.Name} has gone to air or is about to, so its level cannot be changed.");
+            return;
+        }
+
+        double level = Math.Clamp(overlay.GainDb + by, AudioEdits.MinDb, AudioEdits.MaxDb);
+        if (level.Equals(overlay.GainDb)) return;
 
         Remember($"the level of {overlay.Name}", key: $"gain:{overlay.Id}");
 
-        overlay.GainDb = Math.Clamp(overlay.GainDb + by, -60, 12);
+        overlay.GainDb = level;
 
-        ApplyLaneLevels();
+        PushCues();
+        FollowAudioLevel(force: true);
         Draw();
         ShowLayer();
 
-        ActivityLog.Shared.Info(LogSource.App,
-            $"LAYER {overlay.Name} - set to {overlay.GainDb:+0.0;-0.0;0.0} dB " +
-            $"({EffectiveGainDb(overlay):+0.0;-0.0;0.0} dB with layer " +
-            $"{(char)('A' + overlay.Lane - FirstDropLane)} at {_laneGainDb[overlay.Lane]:+0.0;-0.0;0.0} dB).",
-            @event: "liveedit.layerlevel", file: overlay.Path);
-    }
-
-    private void NudgeLaneGain(int lane, double by)
-    {
-        if (lane < 0 || lane >= Lanes) return;
-
-        Remember($"the level of layer {(char)('A' + lane - FirstDropLane)}", key: $"lane:{lane}");
-
-        _laneGainDb[lane] = Math.Clamp(_laneGainDb[lane] + by, -60, 12);
-
-        ApplyLaneLevels();
-        Draw();
-        ShowLayer();
+        ActivityLog.Shared.Info(LogSource.LiveEdit,
+            $"AUDIO  {overlay.Name} set to {overlay.GainDb:+0.0;-0.0;0.0} dB.",
+            @event: "liveedit.ingestlevel", correlation: overlay.Id, file: overlay.Path);
     }
 
     private void DeleteSelected()
     {
-        if (_selected is not { } overlay) return;
+        if (_selected is not { Plan: { } placed } overlay) return;
 
         // What goes to air can only be changed ahead of the no touch zone. An item that has
         // started, or is about to, stays: its media is open and the transmitter is committed.
-        if (overlay.Plan is { } placed)
+        long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, placed), IngestItems());
+
+        if (!Editable(at))
         {
-            long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, placed), IngestItems());
-
-            if (!Editable(at))
-            {
-                Refuse($"NO EDIT ZONE - {overlay.Name} has gone to air or is about to, so it cannot be deleted.");
-                return;
-            }
-        }
-
-        Remember(overlay.Plan is { Mode: IngestMode.Cut } ? "restoring a deleted scene" : $"removing {overlay.Name}");
-
-        _overlays.Remove(overlay);
-        _selected = null;
-
-        if (overlay.Plan is { } removed)
-        {
-            ActivityLog.Shared.Info(LogSource.LiveEdit,
-                removed.Mode == IngestMode.Cut
-                    ? $"EDL  deleted scene restored - {removed.Covers:N0} frames go back to air; the delay grows by that much."
-                    : $"EDL  {overlay.Name} taken off the timeline" +
-                      (removed.Mode == IngestMode.Insert ? $"; the delay shrinks by {new Timecode(removed.Frames, _rate)}." : "."),
-                @event: "liveedit.ingestremoved", correlation: overlay.Id, file: overlay.Path);
-
-            PushCues();
-            Draw();
-            DrawOnAir();
-            ShowLayer();
+            Refuse($"NO EDIT ZONE - {overlay.Name} has gone to air or is about to, so it cannot be deleted.");
             return;
         }
 
-        // It may be the one currently sounding.
-        for (int lane = FirstDropLane; lane < AllLanes; lane++)
-            if (ReferenceEquals(_onLane[lane], overlay))
-            {
-                LanePlayer(lane)?.Stop();
-                _onLane[lane] = null;
-            }
+        Remember(placed.Mode == IngestMode.Cut ? "restoring a deleted scene" : $"removing {overlay.Name}");
 
-        ActivityLog.Shared.Info(LogSource.App,
-            $"LAYER {overlay.Name} - taken off layer {(char)('A' + overlay.Lane - FirstDropLane)}.",
-            @event: "liveedit.layerremoved", file: overlay.Path);
+        _overlays.Remove(overlay);
+        _selected = null;
+        _selectedSound = false;
 
+        ActivityLog.Shared.Info(LogSource.LiveEdit,
+            placed.Mode == IngestMode.Cut
+                ? $"EDL  deleted scene restored - {placed.Covers:N0} frames go back to air; the delay grows by that much."
+                : $"EDL  {overlay.Name} taken off the timeline" +
+                  (placed.Mode == IngestMode.Insert ? $"; the delay shrinks by {new Timecode(placed.Frames, _rate)}." : "."),
+            @event: "liveedit.ingestremoved", correlation: overlay.Id, file: overlay.Path);
+
+        PushCues();
         Draw();
+        DrawOnAir();
         ShowLayer();
-    }
-
-    /// <summary>Puts the current levels on the lane players, including the window's own mute.</summary>
-    private void ApplyLaneLevels()
-    {
-        bool muted = MuteButton.IsChecked == true;
-
-        for (int lane = FirstDropLane; lane < AllLanes; lane++)
-        {
-            if (LanePlayer(lane) is not { } player) continue;
-
-            player.IsMuted = muted;
-
-            player.Volume = _onLane[lane] is { } playing
-                ? Math.Clamp(Math.Pow(10, EffectiveGainDb(playing) / 20) * LevelSlider.Value, 0, 1)
-                : 0;
-        }
     }
 
     private void ShowLayer()
@@ -3031,89 +3051,40 @@ public partial class LiveEditWindow : Window
             return;
         }
 
-        if (_selected is not { } overlay)
+        if (_selected is not { Plan: { } plan } overlay)
         {
-            // Nothing said while the layers are empty. The prompt that used to sit here was
-            // permanent furniture in the transport bar explaining a feature to someone who had
-            // not asked about it; the layers are still there and still take a dropped file.
-            LayerText.Text = _overlays.Count == 0
-                ? ""
-                : $"{_overlays.Count} on layers - click one to adjust it";
-
+            LayerText.Text = "";
             LayerText.Foreground = Brush("Muted");
             return;
         }
 
-        // An ingest placement has no level of its own to talk about - what matters about it is
-        // the mode and what that does, which is the sentence the plan already knows how to say.
-        if (overlay.Plan is { } plan)
+        if (_selectedSound)
         {
-            LayerText.Text = $"{overlay.Name}  {plan.Mode}: " +
-                             IngestPlacement.Describe(plan, _rate) + "   Del removes";
-
-            LayerText.Foreground = Brush("Accent");
+            LayerText.Text = $"AUDIO  {overlay.Name}  {overlay.GainDb:+0.0;-0.0;0.0} dB   [ ] level   Del removes the item";
+            LayerText.Foreground = Brush("Warn");
             return;
         }
 
-        LayerText.Text =
-            $"{overlay.Name}  layer {(char)('A' + overlay.Lane - FirstDropLane)}  " +
-            $"{overlay.GainDb:+0.0;-0.0;0.0} dB" +
-            (_laneGainDb[overlay.Lane] != 0
-                ? $" (+ layer {_laneGainDb[overlay.Lane]:+0.0;-0.0;0.0} = " +
-                  $"{EffectiveGainDb(overlay):+0.0;-0.0;0.0})"
-                : "") +
-            "   [ ] level   Del remove";
+        LayerText.Text = $"{overlay.Name}  {plan.Mode}: " +
+                         IngestPlacement.Describe(plan, _rate) + "   Del removes";
 
-        LayerText.Foreground = Brush("Ok");
+        LayerText.Foreground = Brush("Accent");
     }
-
-    // ------------------------------------------------------------------ playing the layers
 
     /// <summary>
-    /// Starts and stops the lane players as the playhead crosses what is on them.
-    ///
-    /// Each lane is its own <see cref="MediaElement"/>, because one cannot mix: WPF plays a single
-    /// source at a time. They are started against the playhead rather than against each other, so
-    /// they line up to within whatever a seek costs — tens of milliseconds, which is fine for a
-    /// bed or an ad under a picture and is not the frame-exact conform a finished render needs.
+    /// Shows the two ingest lanes once there is ingest media on the timeline, and takes them away
+    /// again when there is none, so all four lanes - or the two - share the height equally.
     /// </summary>
-    private void FollowLayers()
+    private void ShowIngestLanes()
     {
-        for (int lane = FirstDropLane; lane < AllLanes; lane++)
-        {
-            Overlay? want = _playing
-                ? _overlays.FirstOrDefault(o => o.Lane == lane && o.Holds(_at))
-                : null;
+        GridLength want = _overlays.Any(o => o.IsMedia)
+            ? new GridLength(1, GridUnitType.Star)
+            : new GridLength(0);
 
-            if (LanePlayer(lane) is not { } player) continue;
+        if (IngestRow.Height == want) return;
 
-            // Already on it: left alone, so it is not reseeking every frame.
-            if (ReferenceEquals(want, _onLane[lane])) continue;
-
-            _onLane[lane] = want;
-
-            if (want is null)
-            {
-                player.Stop();
-                player.Source = null;
-                continue;
-            }
-
-            player.Source = new Uri(want.Path);
-            player.Position = TimeSpan.FromSeconds(want.OffsetOf(_at) / (double)_rate);
-            player.Play();
-        }
-
-        ApplyLaneLevels();
-    }
-
-    private void StopLayers()
-    {
-        for (int lane = FirstDropLane; lane < AllLanes; lane++)
-        {
-            LanePlayer(lane)?.Stop();
-            _onLane[lane] = null;
-        }
+        IngestRow.Height = want;
+        IngestAudioRow.Height = want;
     }
 
     // ------------------------------------------------------------------ transport
@@ -3369,6 +3340,7 @@ public partial class LiveEditWindow : Window
 
             case Key.A when Keyboard.Modifiers == ModifierKeys.Shift: PlayOnAir(); break;
             case Key.A: GoToOnAir(); break;
+            case Key.S when Keyboard.Modifiers == ModifierKeys.Shift: SyncToAir(); break;
 
             case Key.B: EditBookmark(); break;
 
@@ -3388,12 +3360,6 @@ public partial class LiveEditWindow : Window
             case Key.OemOpenBrackets: NudgeSelectedGain(-1); break;
             case Key.OemCloseBrackets: NudgeSelectedGain(+1); break;
             case Key.Delete or Key.Back: DeleteSelected(); break;
-
-            // The lanes themselves, with shift held.
-            case Key.D1 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(FirstDropLane, -1); break;
-            case Key.D2 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(FirstDropLane, +1); break;
-            case Key.D3 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(FirstDropLane + 1, -1); break;
-            case Key.D4 when Keyboard.Modifiers == ModifierKeys.Shift: NudgeLaneGain(FirstDropLane + 1, +1); break;
 
             default: return;
         }
@@ -3532,6 +3498,21 @@ public partial class LiveEditWindow : Window
         }
 
         double where = e.GetPosition(TrackCanvas).X;
+
+        // A deleted scene is drawn across the segments, so it is picked up here - and Del
+        // restores it.
+        if (CutNear(under) is { } cut)
+        {
+            _selected = cut;
+            _selectedSound = false;
+            _audioPiece = null;
+        }
+        else if (_selected is { IsMedia: false })
+        {
+            _selected = null;
+        }
+
+        ShowLayer();
 
         if (_bookmarks.Nearest(under, FramesPerPixel() * 5) is { } hit)
             ShowDetails($"Bookmark  {Stamp(hit.Frame)}",
@@ -3766,7 +3747,32 @@ public partial class LiveEditWindow : Window
         return brush;
     }
 
+    /// <summary>
+    /// Redraws the timeline, and says so in the log when a redraw took long enough to be seen as
+    /// a stutter in playback - it runs on the thread that drives the player. At most once a minute.
+    /// </summary>
     private void Draw()
+    {
+        long began = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        DrawTimeline();
+
+        double ms = System.Diagnostics.Stopwatch.GetElapsedTime(began).TotalMilliseconds;
+
+        if (ms > 40 && (DateTime.UtcNow - _slowDrawSaidAt).TotalMinutes >= 1)
+        {
+            _slowDrawSaidAt = DateTime.UtcNow;
+
+            ActivityLog.Shared.Warn(LogSource.App,
+                $"Live Edit's timeline took {ms:0} ms to redraw ({_placed.Count:N0} segments on the day) - " +
+                "long enough to be seen as a stutter in playback.",
+                @event: "liveedit.slowdraw");
+        }
+    }
+
+    private DateTime _slowDrawSaidAt = DateTime.MinValue;
+
+    private void DrawTimeline()
     {
         RulerCanvas.Children.Clear();
         TrackCanvas.Children.Clear();
@@ -3824,16 +3830,22 @@ public partial class LiveEditWindow : Window
         // third of the height. The overlap it was guarding against is real but rare, and it is
         // handled by drawing order instead - the recording in question goes on last, so it is
         // the one on top and the one that is clickable where two cover the same minute.
+        // The ingest items once for the whole redraw, not once per segment.
+        List<IngestItem> items = IngestItems();
+
+        // Anything wholly outside the window is skipped before any work is done on it. A day's
+        // store is hundreds of segments and the window shows a dozen; splitting every one of
+        // them around the inserts, a dozen times a second while following air, was the lag in
+        // playback - the redraw shares the thread that drives the player.
         IEnumerable<Placed> inOrder = !_infinite
             ? Enumerable.Empty<Placed>()
             : _placed
-                .OrderBy(p => MediaLibrary.RecordingFolder(p.Clip.Path) == _primaryFolder)
+                .Where(p => OnScreen(p, items, start, span))
+                .OrderBy(p => p.Folder == _primaryFolder)
                 .ThenBy(p => p.StartFrame);
 
         foreach (Placed placed in inOrder)
         {
-            // Anything wholly outside the window costs nothing to skip and would cost a visual
-            // for every segment of a day otherwise.
             // Cut at every insert that lands inside it.
             //
             // An insert goes in between rather than over, so a segment with something inserted
@@ -3842,7 +3854,7 @@ public partial class LiveEditWindow : Window
             // inserted item and claimed time that now belongs to something else. A segment with
             // no insert in it is one piece at its own position, which is the ordinary case.
             IReadOnlyList<IngestTimeline.Piece> pieces =
-                IngestTimeline.Split(placed.StartFrame, placed.Frames, IngestItems());
+                IngestTimeline.Split(placed.StartFrame, placed.Frames, items);
 
             bool current = ReferenceEquals(placed, _loaded);
 
@@ -3880,7 +3892,7 @@ public partial class LiveEditWindow : Window
             // cover the same minute the other one is dimmed, so the row reads as "this
             // recording, and something else also here" rather than as two equal claims.
             bool primary = _primaryFolder is null ||
-                           MediaLibrary.RecordingFolder(placed.Clip.Path) == _primaryFolder;
+                           placed.Folder == _primaryFolder;
 
             // Already gone to air, wholly: orange, so what is past cannot be mistaken for what
             // can still be changed.
@@ -3990,6 +4002,9 @@ public partial class LiveEditWindow : Window
         DrawMark(_markOut, "OUT");
         DrawMarkCard(width, start, span);
 
+        GreyCovered(TrackCanvas, width, start, span, height, sound: false);
+
+        DrawCuts(width, start, span, height);
         DrawBookmarks(width, start, span, height);
         DrawDrops(width, start, span, height);
 
@@ -4027,135 +4042,27 @@ public partial class LiveEditWindow : Window
         Playhead.Margin = new Thickness(TimelineZoom.XOf(_at, start, span, width) ?? -10, 0, 0, 0);
 
         DrawIngest(width, start, span);
-        DrawLayers(width, start, span);
+        DrawIngestAudio(width, start, span);
         DrawAudio(width, start, span);
     }
 
     /// <summary>
-    /// The two layers: their dividing line, and whatever has been laid on them.
-    ///
-    /// Drawn from the same window as the recording above, so a block sits under the part of the
-    /// recording it covers. The level is written on the block rather than hidden in a panel —
-    /// an ad at the wrong level is the thing an operator is looking for, and a number they have
-    /// to click to see is a number they will not check.
-    /// </summary>
-    private void DrawLayers(double width, long start, long span)
-    {
-        OverlayCanvas.Children.Clear();
-
-        var line = (Brush)FindResource("Line");
-
-        for (int lane = 0; lane < AllLanes; lane++)
-        {
-            double top = lane * LaneHeight;
-
-            // The lane's own name and level, pinned at the left so they stay put as it scrolls.
-            // The ingest lane is named rather than lettered: it is not a third drop target, it
-            // is where what has been laid into this recording lives.
-            var label = new TextBlock
-            {
-                Text = lane == IngestLane
-                    ? "INGEST"
-                    : _laneGainDb[lane] == 0
-                        ? $"{(char)('A' + lane - FirstDropLane)}"
-                        : $"{(char)('A' + lane - FirstDropLane)}  {_laneGainDb[lane]:+0.0;-0.0;0.0} dB",
-
-                Foreground = Brush(lane == IngestLane ? "Accent"
-                                   : _laneGainDb[lane] == 0 ? "Muted" : "Tc"),
-                FontFamily = new FontFamily("Consolas"),
-                FontSize = 9.5,
-            };
-
-            Canvas.SetLeft(label, 4);
-            Canvas.SetTop(label, top + 2);
-            OverlayCanvas.Children.Add(label);
-
-            if (lane > 0)
-            {
-                OverlayCanvas.Children.Add(new Line
-                {
-                    X1 = 0, X2 = width, Y1 = top, Y2 = top,
-                    Stroke = line, StrokeThickness = 1,
-                });
-            }
-        }
-
-        // The hand-drop lanes only. Ingest placements have their own canvas above the segments,
-        // drawn by DrawIngest.
-        foreach (Overlay overlay in _overlays.Where(o => o.Plan is null))
-        {
-            long laneStart = overlay.StartFrame;
-
-            if (laneStart + overlay.Frames < start || laneStart > start + span) continue;
-
-            double from = Math.Max(0, (laneStart - start) / (double)span * width);
-            double to = Math.Min(width, (laneStart + overlay.Frames - start) / (double)span * width);
-
-            bool chosen = ReferenceEquals(overlay, _selected);
-
-            OverlayCanvas.Children.Add(new Rectangle
-            {
-                Width = Math.Max(2, to - from),
-                Height = LaneHeight - 6,
-                RadiusX = 3,
-                RadiusY = 3,
-                Fill = new SolidColorBrush(Color.FromArgb(0x60, 0x22, 0xC5, 0x5E)),
-                Stroke = Brush(chosen ? "Tc" : "Ok"),
-                StrokeThickness = chosen ? 2 : 1,
-                Margin = new Thickness(from, overlay.Lane * LaneHeight + 3, 0, 0),
-                ToolTip = overlay.Name,
-            });
-
-            if (to - from > 50)
-            {
-                var name = new TextBlock
-                {
-                    Text = $"{overlay.Name}   {EffectiveGainDb(overlay):+0.0;-0.0;0.0} dB",
-
-                    Foreground = (Brush)FindResource("Text"),
-                    FontSize = 9.5,
-                    FontFamily = new FontFamily("Consolas"),
-                    MaxWidth = Math.Max(20, to - from - 8),
-                    TextTrimming = TextTrimming.CharacterEllipsis,
-                };
-
-                Canvas.SetLeft(name, from + 5);
-                Canvas.SetTop(name, overlay.Lane * LaneHeight + 10);
-                OverlayCanvas.Children.Add(name);
-            }
-        }
-    }
-
-    /// <summary>
-    /// The ingest lane: what has been laid into this recording, on its own track above the
-    /// segments.
-    ///
-    /// Blue against the layers' green, because they are different kinds of thing — a layer is
-    /// laid over the monitor feed and keeps it, an ingest placement is an instruction about what
-    /// replaces it. A stretched item is dashed, so a fit-to-fill reads as "not at its own speed"
-    /// without having to be clicked.
+    /// The ingest lane: the picture of what has been laid into this recording, on its own track
+    /// above the segments. An audio-only item has no picture here; its sound is on the ingest audio
+    /// lane. A stretched item is dashed, so a fit-to-fill reads as "not at its own speed" without
+    /// having to be clicked.
     /// </summary>
     private void DrawIngest(double width, long start, long span)
     {
         IngestCanvas.Children.Clear();
 
+        ShowIngestLanes();
+
         double height = Math.Max(10, IngestCanvas.ActualHeight - 6);
 
         List<IngestItem> items = IngestItems();
 
-        var label = new TextBlock
-        {
-            Text = items.Count == 0 ? "INGEST" : $"INGEST  {items.Count}",
-            Foreground = Brush("Accent"),
-            FontFamily = new FontFamily("Consolas"),
-            FontSize = 9.5,
-        };
-
-        Canvas.SetLeft(label, 4);
-        Canvas.SetTop(label, 2);
-        IngestCanvas.Children.Add(label);
-
-        foreach (Overlay overlay in _overlays.Where(o => o.Plan is not null))
+        foreach (Overlay overlay in _overlays.Where(o => o.HasVideo))
         {
             IngestPlan plan = overlay.Plan!.Value;
 
@@ -4167,35 +4074,7 @@ public partial class LiveEditWindow : Window
             double from = Math.Max(0, (at - start) / (double)span * width);
             double to = Math.Min(width, (at + overlay.Frames - start) / (double)span * width);
 
-            bool chosen = ReferenceEquals(overlay, _selected);
-
-            // A deleted scene takes no time on the ruler - the recording either side of it now
-            // meets - so it is a mark at the join, saying how much was taken out there.
-            if (plan.Mode == IngestMode.Cut)
-            {
-                IngestCanvas.Children.Add(new Rectangle
-                {
-                    Width = chosen ? 3 : 2,
-                    Height = height,
-                    Fill = Brush(chosen ? "Tc" : "Bad"),
-                    Margin = new Thickness(Math.Max(0, from - 1), 3, 0, 0),
-                    ToolTip = $"Scene deleted: {IngestPlacement.Describe(plan, _rate)}",
-                });
-
-                var tag = new TextBlock
-                {
-                    Text = $"✂ -{new Timecode(plan.Covers, _rate)}",
-                    Foreground = Brush(chosen ? "Tc" : "Bad"),
-                    FontSize = 9.5,
-                    FontFamily = new FontFamily("Consolas"),
-                    FontWeight = FontWeights.Bold,
-                };
-
-                Canvas.SetLeft(tag, from + 4);
-                Canvas.SetTop(tag, 11);
-                IngestCanvas.Children.Add(tag);
-                continue;
-            }
+            bool chosen = ReferenceEquals(overlay, _selected) && !_selectedSound;
 
             // Already gone to air: orange, as the recording under it is.
             bool aired = OnAirFrame() is { } air && at + overlay.Frames <= air;
@@ -4239,19 +4118,83 @@ public partial class LiveEditWindow : Window
                 var name = new TextBlock
                 {
                     Text = $"{overlay.Name}   {plan.Mode}" +
-                           (plan.Stretched ? $" {plan.Speed:0.###}x" : ""),
+                           (plan.Stretched ? $" {plan.Speed:0.###}x" : "") +
+                           (plan.Tracks == IngestTracks.VideoOnly ? "   video only" : ""),
 
                     Foreground = (Brush)FindResource("Text"),
                     FontSize = 9.5,
                     FontFamily = new FontFamily("Consolas"),
                     MaxWidth = Math.Max(20, to - from - 8),
                     TextTrimming = TextTrimming.CharacterEllipsis,
+                    IsHitTestVisible = false,
                 };
 
                 Canvas.SetLeft(name, from + 5);
-                Canvas.SetTop(name, 11);
+                Canvas.SetTop(name, 9);
                 IngestCanvas.Children.Add(name);
             }
+        }
+
+        var label = new TextBlock
+        {
+            Text = "INGEST",
+            Foreground = Brush("Accent"),
+            FontFamily = new FontFamily("Consolas"),
+            FontSize = 9.5,
+            IsHitTestVisible = false,
+        };
+
+        Canvas.SetLeft(label, 4);
+        Canvas.SetTop(label, height - 10);
+        IngestCanvas.Children.Add(label);
+    }
+
+    /// <summary>
+    /// The deleted scenes, across the segments: each a mark at the join where the recording either
+    /// side of it now meets, saying how much was taken out there. On the segments rather than the
+    /// ingest lane, because that lane is only there once ingest media is.
+    /// </summary>
+    private void DrawCuts(double width, long start, long span, double height)
+    {
+        List<IngestItem> items = IngestItems();
+
+        foreach (Overlay overlay in _overlays.Where(o => o.Plan is { Mode: IngestMode.Cut }))
+        {
+            IngestPlan plan = overlay.Plan!.Value;
+            long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, plan), items);
+
+            if (TimelineZoom.XOf(at, start, span, width) is not { } x) continue;
+
+            bool chosen = ReferenceEquals(overlay, _selected);
+
+            TrackCanvas.Children.Add(new Rectangle
+            {
+                Width = chosen ? 3 : 2,
+                Height = height,
+                Fill = Brush(chosen ? "Tc" : "Bad"),
+                Margin = new Thickness(Math.Max(0, x - 1), 0, 0, 0),
+                ToolTip = $"Scene deleted: {IngestPlacement.Describe(plan, _rate)}",
+            });
+
+            var tag = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(0xD0, 0x10, 0x14, 0x19)),
+                CornerRadius = new CornerRadius(2),
+                Padding = new Thickness(3, 0, 3, 0),
+                IsHitTestVisible = false,
+                Child = new TextBlock
+                {
+                    Text = $"✂ -{new Timecode(plan.Covers, _rate)}",
+                    Foreground = Brush(chosen ? "Tc" : "Bad"),
+                    FontSize = 9.5,
+                    FontFamily = new FontFamily("Consolas"),
+                    FontWeight = FontWeights.Bold,
+                },
+            };
+
+            Canvas.SetLeft(tag, x + 4);
+            Canvas.SetTop(tag, Math.Max(0, height / 2 - 7));
+            TrackCanvas.Children.Add(tag);
         }
     }
 
@@ -4310,14 +4253,12 @@ public partial class LiveEditWindow : Window
         SaveBookmarks();
 
         StopMonitor();
-        StopLayers();
-        LayerA.Close();
-        LayerB.Close();
 
         Player.Stop();
         Player.Close();
         _standby.Stop();
         _standby.Close();
+        StopIngestSound();
     }
 
     // ------------------------------------------------------------- the two media tabs

@@ -4,7 +4,7 @@ using Emerald.Core;
 namespace Emerald.LiveEdit;
 
 /// <summary>
-/// Undo and redo for the timeline's edits: what is placed on the ingest lane and the layers,
+/// Undo and redo for the timeline's edits: what is placed on the ingest lanes and its levels,
 /// deleted scenes, levels, and the audio lane's cuts and levels.
 ///
 /// Each edit records the whole edit state as it was before it - small, a list of placements and
@@ -26,7 +26,6 @@ public partial class LiveEditWindow
     private sealed record EditState(
         string What,
         OverlayState[] Overlays,
-        double[] LaneGainDb,
         IReadOnlyList<AudioEdit> Audio,
         long[] AudioCuts);
 
@@ -43,7 +42,6 @@ public partial class LiveEditWindow
     private EditState Capture(string what) => new(
         what,
         _overlays.Select(o => new OverlayState(o, o.StartFrame, o.GainDb, o.Plan)).ToArray(),
-        (double[])_laneGainDb.Clone(),
         _audioEdits,
         _audioCuts.ToArray());
 
@@ -126,8 +124,8 @@ public partial class LiveEditWindow
 
     /// <summary>
     /// The earliest point on the ruler where putting <paramref name="target"/> back would change
-    /// what goes to air, or null when it changes nothing that does - a hand-dropped layer, a level
-    /// on one, a cut in the sound. Those are this window's monitor, not the transmitter's.
+    /// what goes to air, or null when it changes nothing that does - a cut in the sound, which
+    /// only divides it. That is this window's, not the transmitter's.
     /// </summary>
     private long? ChangedFrom(EditState target)
     {
@@ -146,7 +144,7 @@ public partial class LiveEditWindow
 
             Overlay? now = _overlays.FirstOrDefault(o => ReferenceEquals(o, state.Overlay));
 
-            if (now is null || !Equals(now.Plan, state.Plan))
+            if (now is null || !Equals(now.Plan, state.Plan) || !now.GainDb.Equals(state.GainDb))
             {
                 Consider(state.Overlay, plan);
                 if (now?.Plan is { } current) Consider(now, current);
@@ -168,14 +166,6 @@ public partial class LiveEditWindow
 
     private void Restore(EditState state)
     {
-        // A layer item going away may be the one sounding.
-        for (int lane = FirstDropLane; lane < AllLanes; lane++)
-            if (_onLane[lane] is { } playing && !state.Overlays.Any(s => ReferenceEquals(s.Overlay, playing)))
-            {
-                LanePlayer(lane)?.Stop();
-                _onLane[lane] = null;
-            }
-
         _overlays.Clear();
 
         foreach (OverlayState s in state.Overlays)
@@ -186,8 +176,6 @@ public partial class LiveEditWindow
             _overlays.Add(s.Overlay);
         }
 
-        Array.Copy(state.LaneGainDb, _laneGainDb, _laneGainDb.Length);
-
         _audioEdits = state.Audio;
         _audioCuts.Clear();
         _audioCuts.UnionWith(state.AudioCuts);
@@ -196,7 +184,6 @@ public partial class LiveEditWindow
         _audioPiece = null;
 
         PushCues();
-        ApplyLaneLevels();
         FollowAudioLevel(force: true);
 
         Draw();

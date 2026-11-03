@@ -1,4 +1,5 @@
 using System.IO;
+using Emerald.Core;
 using Emerald.Video;
 
 namespace Emerald.Media;
@@ -203,12 +204,24 @@ public static class StorageWarden
         {
             long freed = 0;
 
+            // Read before the files go: once they have, nothing knows how long this segment ran,
+            // and every segment after it would be placed that much too early. The picture's
+            // length, as the timeline lays segments end to end by (see MediaInfo.Runs).
+            TimeSpan? length = _files.Select(f => MediaCodec.ReadPictureDuration(f.Path) ?? MediaCodec.ReadDuration(f.Path))
+                                     .FirstOrDefault(d => d is { } t && t > TimeSpan.Zero);
+
             foreach ((string path, long bytes) in _files)
             {
                 try
                 {
                     File.Delete(path);
                     freed += bytes;
+
+                    if (length is { } ran &&
+                        Path.GetDirectoryName(path) is { } folder &&
+                        RecordingSequence.FolderStartedAt(Path.GetFileName(folder)) is not null &&
+                        RecordingSequence.NumberIn(Path.GetFileName(path)) is { } number)
+                        PruneLedger.Record(folder, number, ran);
                 }
                 catch (IOException)
                 {

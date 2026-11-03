@@ -445,4 +445,44 @@ public sealed class IngestTimelineTests
         Assert.Equal("early.mov", IngestTimeline.At(1100, items).Path);
         Assert.Equal(2200, IngestTimeline.At(3000, items).CapturedFrame);
     }
+
+    // ------------------------------------------------------------------ following a player
+
+    [Fact]
+    public void A_run_of_recording_ends_where_an_insert_starts_not_past_it()
+    {
+        // The frame an insert sits at maps to the far side of it, so a playhead moved by that
+        // mapping crossed the insert without playing it. The run stops at its start.
+        IngestItem[] items = { Item(IngestMode.Insert, 250, drop: 1000) };
+
+        Assert.Equal(1250, IngestTimeline.RulerFrameOf(1000, items));
+        Assert.Equal((0L, 1000L), IngestTimeline.RunAround(900, items));
+    }
+
+    [Fact]
+    public void After_an_item_the_run_starts_at_its_end_so_the_playhead_cannot_fall_back_before_it()
+    {
+        IngestItem[] items = { Item(IngestMode.Insert, 250, drop: 1000) };
+
+        Assert.Equal((1250L, long.MaxValue), IngestTimeline.RunAround(1250, items));
+
+        // A player a frame short of the insert point maps to before the item.
+        Assert.Equal(999, IngestTimeline.RulerFrameOf(999, items));
+    }
+
+    [Fact]
+    public void A_deleted_scene_ends_one_run_and_starts_the_next_at_the_same_point()
+    {
+        Assert.True(IngestPlacement.TryPlanCut(2000, 2500, out IngestPlan cut, out _));
+        IngestItem[] items = { Item(IngestMode.Overlay, 100, drop: 1000), new("cut", cut) };
+
+        Assert.Equal((1100L, 2000L), IngestTimeline.RunAround(1500, items));
+        Assert.Equal((2000L, long.MaxValue), IngestTimeline.RunAround(2000, items));
+    }
+
+    [Fact]
+    public void With_nothing_placed_the_run_is_the_whole_ruler()
+    {
+        Assert.Equal((0L, long.MaxValue), IngestTimeline.RunAround(5000, None));
+    }
 }

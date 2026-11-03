@@ -582,7 +582,24 @@ public sealed class SdiCapture : IDisposable
                 // Once a second, the counts go where the monitoring page reads them: what came
                 // off the receiver, and what did not make it to the encoder or the ring.
                 if (frames % format.FrameRate == 0)
+                {
                     PipelineState.Shared.SetRecorded(frames, dropped, _delayDrops?.Invoke() ?? 0);
+
+                    // An encoder that has exited takes both files with it, and the loop would
+                    // otherwise carry on dropping every frame until somebody pressed Stop - ten
+                    // minutes of nothing recorded, said only at the end. Stopped here instead,
+                    // so the operator hears about it within a second and can record again.
+                    bool exited;
+                    try { exited = encoder.Ffmpeg.HasExited; } catch (InvalidOperationException) { exited = false; }
+
+                    if (exited)
+                    {
+                        Fail($"Capture: the encoder stopped at frame {frames} " +
+                             $"({new Timecode(frames, format.FrameRate)}) - nothing after that point was " +
+                             "recorded, so the recording has been stopped. The reason follows.");
+                        break;
+                    }
+                }
 
                 // A drop is said the moment it happens, not thirty seconds later in a count. At
                 // most one line every five seconds, so a disk that is falling over does not

@@ -41,6 +41,22 @@ public enum IngestMode
 }
 
 /// <summary>
+/// Which of an ingest item's tracks go to air.
+///
+/// Its picture and sound together is the ordinary case. Video only leaves the sound to whatever
+/// would have been there - the recording's, under a mode that lays over it, and silence under an
+/// insert, where the recording is waiting. Audio only is the same the other way round: the
+/// recording's picture under a mode that lays over it, black under an insert. An insert of either
+/// still takes its full length, so the delay grows exactly as it does for one with both.
+/// </summary>
+public enum IngestTracks
+{
+    Both,
+    VideoOnly,
+    AudioOnly,
+}
+
+/// <summary>
 /// Where a dropped item lands and what it does to the recording.
 ///
 /// <paramref name="Frames"/> is how long the item occupies the timeline, which is not always its
@@ -59,15 +75,23 @@ public enum IngestMode
 /// How many frames everything after this placement moves later. Zero for the three modes that
 /// lay over the recording, and the item's length for an insert.
 /// </param>
+/// <param name="Tracks">Which of the item's tracks go to air: picture and sound, or one of them.</param>
 public readonly record struct IngestPlan(
     IngestMode Mode,
     long StartFrame,
     long Frames,
     long Covers,
     double Speed,
-    long ShiftsAfterBy)
+    long ShiftsAfterBy,
+    IngestTracks Tracks = IngestTracks.Both)
 {
     public long EndFrame => StartFrame + Frames;
+
+    /// <summary>The item's picture goes to air. Not for a cut, which has no media.</summary>
+    public bool HasVideo => Mode != IngestMode.Cut && Tracks != IngestTracks.AudioOnly;
+
+    /// <summary>The item's sound goes to air. Not for a cut, which has no media.</summary>
+    public bool HasAudio => Mode != IngestMode.Cut && Tracks != IngestTracks.VideoOnly;
 
     /// <summary>True when the media is not playing at its recorded rate.</summary>
     public bool Stretched => Math.Abs(Speed - 1) > 0.0001;
@@ -93,7 +117,8 @@ public static class IngestPlacement
     /// </summary>
     public static bool TryPlan(IngestMode mode, long ingestFrames, long dropFrame,
                               long? markIn, long? markOut,
-                              out IngestPlan plan, out string? problem)
+                              out IngestPlan plan, out string? problem,
+                              IngestTracks tracks = IngestTracks.Both)
     {
         plan = default;
         problem = null;
@@ -146,6 +171,9 @@ public static class IngestPlacement
             _ => default,
         };
 
+        // Which tracks go out changes nothing about where the item sits or how long it runs: an
+        // audio-only insert lengthens the delay exactly as one with its picture does.
+        plan = plan with { Tracks = tracks };
         return true;
     }
 
@@ -181,7 +209,18 @@ public static class IngestPlacement
     {
         string length = $"{plan.Frames:N0} frames ({new Timecode(plan.Frames, rate)})";
 
-        return plan.Mode switch
+        string tracks = plan.Mode == IngestMode.Cut ? "" : plan.Tracks switch
+        {
+            IngestTracks.VideoOnly => plan.Mode == IngestMode.Insert
+                ? "video only, silent - "
+                : "video only, the recording's sound carries on - ",
+            IngestTracks.AudioOnly => plan.Mode == IngestMode.Insert
+                ? "audio only, over black - "
+                : "audio only, over the recording's picture - ",
+            _ => "",
+        };
+
+        return tracks + plan.Mode switch
         {
             IngestMode.Overlay =>
                 $"over the recording for {length}",

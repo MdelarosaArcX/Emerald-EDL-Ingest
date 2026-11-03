@@ -583,6 +583,11 @@ public partial class ShellWindow : Window
 
         OutputPathBox.Text = StoreFolder;
         _settings.CaptureFolder = OutputPathBox.Text.Trim();
+
+        // Saved straight away: Live Edit reads its capture media from this path, and should not
+        // wait for this deck to close to find out where the recording is going.
+        AppSettings.SaveCaptureFolder(_settings.CaptureFolder);
+
         RefreshClips();
     }
 
@@ -1014,6 +1019,10 @@ public partial class ShellWindow : Window
         _settings.CaptureFrameRate = SelectedRate();
         _settings.CaptureFolder = folder;
         _settings.RecordingStorageLimitGb = StorageLimitGb;
+
+        // The folder this recording goes into, saved before it starts, so Live Edit shows these
+        // segments rather than whatever folder it was last told about.
+        AppSettings.SaveCaptureFolder(folder);
 
         IReadOnlyList<CaptureAudioTrack> addedAudio = CurrentCaptureAudio();
 

@@ -186,14 +186,37 @@ public sealed class LiveAirTransmitter : IDisposable
                 // ---------------------------------------------------- a cue's media on air
                 if (playing is { } job)
                 {
+                    // Under a mode that lays over the recording, the recording goes by unseen a
+                    // frame for every frame of the media - and a cue with only one track takes the
+                    // other from it: its sound under a video-only item, its picture under an
+                    // audio-only one.
+                    DelayFrameBuffer? under = null;
+
+                    if (job.ConsumesRing && !(job.Cue.HasVideo && job.Cue.HasAudio) &&
+                        _line.TryRead(readSeq, buffers[next]) == DelayReadResult.Ok)
+                        under = buffers[next];
+
                     // The next frame, already decoded ahead - waited for only about a frame's
-                    // time when, for a moment, it is not there yet.
-                    bool got = job.Frames.TryTake(out byte[] frame, frameTime);
-                    bool ended = !got && job.Frames.Finished;
+                    // time when, for a moment, it is not there yet. An audio-only cue has no
+                    // picture to wait for: the recording's, or black under an insert.
+                    byte[] frame;
+                    bool got, ended;
+
+                    if (job.Frames is { } pictures)
+                    {
+                        got = pictures.TryTake(out frame, frameTime);
+                        ended = !got && pictures.Finished;
+                    }
+                    else
+                    {
+                        frame = under?.Video ?? black;
+                        got = job.Taken < job.Length;
+                        ended = !got;
+                    }
 
                     if (got)
                     {
-                        job.Audio.ReadFrame(left, right, job.Taken, 0);
+                        CueSound(job, under, left, right);
 
                         if (!output.PushFrame(frame, fileChannels))
                         {
@@ -203,8 +226,12 @@ public sealed class LiveAirTransmitter : IDisposable
 
                         // The frame just sent stays the one on air until the next replaces it,
                         // so the buffer before it can go back to be filled.
-                        if (job.Last is { } previous) job.Frames.Return(previous);
-                        job.Last = frame;
+                        if (job.Frames is { } readahead)
+                        {
+                            if (job.Last is { } previous) readahead.Return(previous);
+                            job.Last = frame;
+                        }
+
                         job.Taken++;
                     }
                     else if (!ended)
@@ -363,7 +390,8 @@ public sealed class LiveAirTransmitter : IDisposable
                         playing = media;
 
                         Cue(cue, LogLevel.Ok, "playing",
-                            $"EDL  {cue.Name} to air now ({cue.Mode.ToString().ToLowerInvariant()}, " +
+                            $"EDL  {cue.Name} to air now ({cue.Mode.ToString().ToLowerInvariant()}" +
+                            (cue.Tracks == IngestTracks.VideoOnly ? ", video only" : cue.Tracks == IngestTracks.AudioOnly ? ", audio only" : "") + ", " +
                             $"{new Timecode(frames, _format.FrameRate)}) at recording frame {recording:N0}" +
                             (cue.Mode == IngestMode.Insert
                                 ? $"; the delay grows to {new Timecode(Interlocked.Read(ref _target), _format.FrameRate)}."
@@ -438,9 +466,9 @@ public sealed class LiveAirTransmitter : IDisposable
         public required LiveCue Cue { get; init; }
 
         /// <summary>The picture, decoded ahead of the transmitter from the moment the cue is prepared.</summary>
-        public required FrameReadahead Frames { get; init; }
+        public FrameReadahead? Frames { get; init; }
 
-        public required AudioSource Audio { get; init; }
+        public AudioSource? Audio { get; init; }
 
         /// <summary>Frames into the media it was opened at.</summary>
         public long StartOffset { get; init; }
@@ -461,8 +489,8 @@ public sealed class LiveAirTransmitter : IDisposable
 
         public void Dispose()
         {
-            Frames.Dispose();
-            Audio.Dispose();
+            Frames?.Dispose();
+            Audio?.Dispose();
         }
     }
 
@@ -522,7 +550,7 @@ public sealed class LiveAirTransmitter : IDisposable
     /// </summary>
     private CueMedia PreRolled(CueMedia media)
     {
-        media.Frames.WaitFor(Math.Max(1, _format.FrameRate / 2), TimeSpan.FromSeconds(3));
+        media.Frames?.WaitFor(Math.Max(1, _format.FrameRate / 2), TimeSpan.FromSeconds(3));
         return media;
     }
 
@@ -537,20 +565,30 @@ public sealed class LiveAirTransmitter : IDisposable
             : null;
 
         FrameSource? video = null;
+        FrameReadahead? ahead = null;
 
         try
         {
-            video = FrameSource.Open(_ffmpegPath, path, _format, seek, cue.Speed);
-            AudioSource audio = AudioSource.Open(_ffmpegPath, path, _format.FrameRate, -1, seek, cue.Speed);
+            // Only the tracks that go to air: no decoder for a picture or a sound nobody will see
+            // or hear.
+            if (cue.HasVideo)
+            {
+                video = FrameSource.Open(_ffmpegPath, path, _format, seek, cue.Speed);
 
-            // Decoding ahead from now: by the time the cue is due, its first second is in hand.
-            var ahead = new FrameReadahead(video, _format.FrameBytes, _format.FrameRate);
+                // Decoding ahead from now: by the time the cue is due, its first second is in hand.
+                ahead = new FrameReadahead(video, _format.FrameBytes, _format.FrameRate);
+            }
+
+            AudioSource? audio = cue.HasAudio
+                ? AudioSource.Open(_ffmpegPath, path, _format.FrameRate, -1, seek, cue.Speed)
+                : null;
 
             return new CueMedia { Cue = cue, Frames = ahead, Audio = audio, StartOffset = late };
         }
         catch (Exception ex)
         {
-            video?.Dispose();
+            if (ahead is not null) ahead.Dispose();
+            else video?.Dispose();
 
             ActivityLog.Shared.Error(LogSource.LiveEdit,
                 $"EDL  {cue.Name} could not be opened for air: {ex.Message}",
@@ -614,6 +652,49 @@ public sealed class LiveAirTransmitter : IDisposable
         }
 
         return output.PushFrame(frame.Video, _channels);
+    }
+
+    /// <summary>
+    /// The sound under a frame of a cue: the media's own at the cue's level; or, for a video-only
+    /// cue, the recording's going by underneath at the level set on it; or silence, for a
+    /// video-only insert, where the recording is waiting and has no sound to give.
+    /// </summary>
+    private void CueSound(CueMedia job, DelayFrameBuffer? under, short[] left, short[] right)
+    {
+        if (job.Audio is { } sound)
+        {
+            sound.ReadFrame(left, right, job.Taken, 0);
+
+            if (job.Cue.GainDb != 0) Scale(left, right, left.Length, AudioEdits.Linear(job.Cue.GainDb));
+            return;
+        }
+
+        Array.Clear(left);
+        Array.Clear(right);
+
+        if (under is not { } frame) return;
+
+        int samples = Math.Min(left.Length, frame.AudioBytes / 4);
+        byte[] audio = frame.Audio;
+
+        for (int i = 0; i < samples; i++)
+        {
+            int o = i * 4;
+            left[i] = (short)(audio[o] | (audio[o + 1] << 8));
+            right[i] = (short)(audio[o + 2] | (audio[o + 3] << 8));
+        }
+
+        double gain = AudioEdits.Linear(AudioEdits.GainDbAt(frame.RecordingFrame, _audioEdits()));
+        if (gain != 1) Scale(left, right, samples, gain);
+    }
+
+    private static void Scale(short[] left, short[] right, int samples, double gain)
+    {
+        for (int i = 0; i < samples; i++)
+        {
+            left[i] = (short)Math.Clamp(Math.Round(left[i] * gain), short.MinValue, short.MaxValue);
+            right[i] = (short)Math.Clamp(Math.Round(right[i] * gain), short.MinValue, short.MaxValue);
+        }
     }
 
     // ------------------------------------------------------------------ reporting

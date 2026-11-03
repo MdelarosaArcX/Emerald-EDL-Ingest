@@ -300,12 +300,59 @@ public sealed class AppSettings
         return settings;
     }
 
+    /// <summary>
+    /// The capture deck's output path as last saved, read fresh from the file - "" for the
+    /// default store, null when the file cannot be read just now.
+    ///
+    /// For a window that loaded its settings earlier and must still look where the recording
+    /// actually goes: the deck saves the path the moment it is set or a recording starts.
+    /// </summary>
+    public static string? SavedCaptureFolder()
+    {
+        try
+        {
+            if (!File.Exists(FilePath)) return null;
+
+            using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(FilePath));
+
+            return doc.RootElement.TryGetProperty("captureFolder", out JsonElement folder)
+                ? folder.GetString() ?? ""
+                : "";
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Writes the capture output path into the saved settings and nothing else, so a window
+    /// holding an older copy of the rest does not put it back over what another window saved.
+    /// </summary>
+    public static void SaveCaptureFolder(string folder)
+    {
+        // A file there but unreadable just now would load as every setting at its default, and
+        // saving that would wipe the rest. The deck saves everything when it closes anyway.
+        if (File.Exists(FilePath) && SavedCaptureFolder() is null) return;
+
+        AppSettings saved = Load();
+        if (saved.CaptureFolder == folder) return;
+
+        saved.CaptureFolder = folder;
+        saved.Save();
+    }
+
     public void Save()
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(this, Options));
+
+            // Whole or not at all: Live Edit reads this file while the deck writes it (see
+            // SavedCaptureFolder), and half a file read back as every setting at its default.
+            string temp = FilePath + ".tmp";
+            File.WriteAllText(temp, JsonSerializer.Serialize(this, Options));
+            File.Move(temp, FilePath, overwrite: true);
         }
         catch
         {

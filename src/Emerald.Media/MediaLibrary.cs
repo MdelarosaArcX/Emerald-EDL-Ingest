@@ -275,22 +275,49 @@ public static class MediaLibrary
         {
             if (RecordingSequence.FolderStartedAt(group.Key) is not { } rolled) continue;
 
+            List<CapturedClip> ordered = group
+                .OrderBy(c => RecordingSequence.NumberIn(Path.GetFileName(c.Path)) ?? 0)
+                .ToList();
+
+            // The first segment left is not always the first recorded: the storage limit deletes
+            // from the front. It starts after everything deleted before it, not when the folder
+            // rolled - placed at the roll, every segment slid back by what had gone, and the
+            // newest ones landed an hour behind air.
             DateTime at = rolled;
 
-            foreach (CapturedClip clip in group
-                         .OrderBy(c => RecordingSequence.NumberIn(Path.GetFileName(c.Path)) ?? 0))
+            if (RecordingSequence.NumberIn(Path.GetFileName(ordered[0].Path)) is { } first &&
+                first > RecordingSequence.FirstNumber &&
+                Path.GetDirectoryName(ordered[0].Path) is { } dir)
+                at = rolled + PruneLedger.StartOf(first, PruneLedger.Read(dir), Typical(ordered));
+
+            foreach (CapturedClip clip in ordered)
             {
                 placed[clip.Path] = clip with { Starts = at };
 
                 // A segment still open has no length to read, so the run stops being exact from
                 // there on. It is the last one anyway, so there is nothing after it to be wrong.
-                if (clip.Info is { } info && info.Duration > TimeSpan.Zero) at += info.Duration;
+                if (clip.Info is { } info && info.Duration > TimeSpan.Zero) at += info.Runs;
             }
         }
 
         return placed.Count == 0
             ? clips
             : clips.Select(c => placed.TryGetValue(c.Path, out CapturedClip? exact) ? exact : c).ToList();
+    }
+
+    /// <summary>
+    /// How long a segment of this recording usually runs - the middle one of the finished ones,
+    /// so a short first or last segment does not skew it. Fills a gap the ledger does not cover.
+    /// </summary>
+    private static TimeSpan Typical(List<CapturedClip> recording)
+    {
+        TimeSpan[] lengths = recording
+            .Select(c => c.Info?.Runs ?? TimeSpan.Zero)
+            .Where(d => d > TimeSpan.Zero)
+            .OrderBy(d => d)
+            .ToArray();
+
+        return lengths.Length == 0 ? TimeSpan.Zero : lengths[lengths.Length / 2];
     }
 
     /// <summary>

@@ -23,9 +23,20 @@ public partial class IngestDropDialog : Window
     private readonly int _rate;
 
     public IngestDropDialog(string path, long ingestFrames, long dropFrame,
-                            long? markIn, long? markOut, int rate)
+                            long? markIn, long? markOut, int rate,
+                            bool hasVideo = true, bool hasAudio = true)
     {
         InitializeComponent();
+
+        // A file with only one track can only go out as that track.
+        if (!hasVideo || !hasAudio)
+        {
+            BothRadio.IsEnabled = false;
+            VideoOnlyRadio.IsEnabled = hasVideo;
+            AudioOnlyRadio.IsEnabled = hasAudio;
+
+            (hasVideo ? VideoOnlyRadio : AudioOnlyRadio).IsChecked = true;
+        }
 
         _ingestFrames = ingestFrames;
         _dropFrame = dropFrame;
@@ -72,6 +83,11 @@ public partial class IngestDropDialog : Window
         : InsertRadio.IsChecked == true ? IngestMode.Insert
         : IngestMode.Overlay;
 
+    private IngestTracks Tracks =>
+        VideoOnlyRadio.IsChecked == true ? IngestTracks.VideoOnly
+        : AudioOnlyRadio.IsChecked == true ? IngestTracks.AudioOnly
+        : IngestTracks.Both;
+
     private void Mode_Changed(object sender, RoutedEventArgs e) => ShowEffect();
 
     /// <summary>
@@ -83,7 +99,7 @@ public partial class IngestDropDialog : Window
     private void ShowEffect()
     {
         if (!IngestPlacement.TryPlan(Chosen, _ingestFrames, _dropFrame, _markIn, _markOut,
-                                     out IngestPlan plan, out string? problem))
+                                     out IngestPlan plan, out string? problem, Tracks))
         {
             EffectText.Text = problem ?? "That cannot be placed.";
             EffectText.Foreground = (System.Windows.Media.Brush)FindResource("Bad");
@@ -125,7 +141,7 @@ public partial class IngestDropDialog : Window
         // Re-planned rather than trusting what the last ShowEffect left behind, so what is
         // returned is certainly the option currently selected.
         if (!IngestPlacement.TryPlan(Chosen, _ingestFrames, _dropFrame, _markIn, _markOut,
-                                     out IngestPlan plan, out _))
+                                     out IngestPlan plan, out _, Tracks))
             return;
 
         Plan = plan;

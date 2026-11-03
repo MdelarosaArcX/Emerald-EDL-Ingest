@@ -136,7 +136,7 @@ public partial class LiveEditWindow
 
         if (StoppedAtMarkOut()) return false;
 
-        TimelineAt on = IngestTimeline.At(_at, IngestItems());
+        TimelineAt on = IngestTimeline.At(_at, PlayedItems());
 
         // Run into an ingest item, a deleted scene, or a closed file: the ordinary path takes it.
         if (on.OnIngest || ClipAt(on.CapturedFrame) is not { Pending: true } ||

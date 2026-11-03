@@ -113,13 +113,16 @@
                     ToolTip="Put the recording to air from here, with this timeline's ingest media and deleted scenes"/>
         </StackPanel>
 
-        <!-- The cell the big screen sits in. Not drawn: it is measured, so the screen itself can be
-             sized to the picture rather than to whatever shape the cell happens to be. -->
-        <Border x:Name="ViewerCell" Grid.Row="1" Grid.Column="0" SizeChanged="ViewerCell_SizeChanged"/>
+        <!-- The cell the big screen sits in: black edge to edge, with the picture in the middle of
+             it. Measured as well, so the screen itself can be sized to the picture rather than to
+             whatever shape the cell happens to be. -->
+        <Border x:Name="ViewerCell" Grid.Row="1" Grid.Column="0" Background="Black"
+                BorderBrush="{StaticResource Line}" BorderThickness="1"
+                SizeChanged="ViewerCell_SizeChanged"/>
 
-        <Border x:Name="ViewerFrame" Grid.Row="1" Grid.Column="0" Background="{StaticResource PanelDeep}"
+        <Border x:Name="ViewerFrame" Grid.Row="1" Grid.Column="0" Background="Black"
                 HorizontalAlignment="Center" VerticalAlignment="Center"
-                BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="0">
+                BorderThickness="0" CornerRadius="0">
             <Grid>
                 <!-- Two players on the one screen, one showing and one waiting. The waiting one
                      opens whatever comes next - the next segment, an ingest item the playhead is
@@ -134,25 +137,33 @@
                               Stretch="Uniform" Margin="1" ScrubbingEnabled="True"
                               MediaOpened="Player_Opened" MediaEnded="Player_Ended"
                               MediaFailed="Player_Failed" Opacity="0" IsMuted="True"/>
-                <!-- One player per layer. In the tree because WPF will not play a MediaElement
-                     that is not, zero-sized because there is nothing of theirs to look at. -->
-                <MediaElement x:Name="LayerA" LoadedBehavior="Manual" UnloadedBehavior="Stop"
-                              Width="0" Height="0" Volume="1"/>
-                <MediaElement x:Name="LayerB" LoadedBehavior="Manual" UnloadedBehavior="Stop"
-                              Width="0" Height="0" Volume="1"/>
+                <!-- Over the picture while an audio-only ingest item is playing: its file may well
+                     have a picture, and what goes to air there is not it. -->
+                <Border x:Name="AudioOnlyCover" Background="Black" Visibility="Collapsed"
+                        IsHitTestVisible="False">
+                    <TextBlock Text="AUDIO ONLY" Foreground="{StaticResource Muted}" FontSize="13"
+                               FontFamily="Consolas" FontWeight="Bold"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Border>
 
                 <!-- This screen is the timeline's. It shows whatever the playhead is over, so
                      the prompt is about the timeline and not about the lists - picking a file
                      from a list previews it in the small monitor on the right instead. -->
+                <!-- The logo while there is no picture, as on the capture deck: shown and hidden
+                     with the placeholder line, so it is never over a picture. -->
+                <Image Source="/Assets/emerald-logo.png" Height="140" Opacity="0.6"
+                       Margin="0,0,0,60" HorizontalAlignment="Center" VerticalAlignment="Center"
+                       RenderOptions.BitmapScalingMode="HighQuality"
+                       Visibility="{Binding Visibility, ElementName=PreviewPlaceholder}"/>
                 <TextBlock x:Name="PreviewPlaceholder" Text="click the timeline below"
-                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           HorizontalAlignment="Center" VerticalAlignment="Center" Margin="12,150,12,0"
                            TextAlignment="Center" TextWrapping="Wrap"
                            Foreground="{StaticResource Muted}" FontSize="14"/>
 
                 <!-- The segment still being recorded, shown from the delay line's frames: no file
                      of it can be opened until the recorder closes it. Above the players, below the
                      live REC view. -->
-                <Grid x:Name="HeldView" Visibility="Collapsed" Background="{StaticResource PanelDeep}">
+                <Grid x:Name="HeldView" Visibility="Collapsed" Background="Black">
                     <Image x:Name="HeldImage" Stretch="Uniform" Margin="1"
                            RenderOptions.BitmapScalingMode="Linear"/>
                     <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10"
@@ -203,7 +214,7 @@
                  the height and the list row takes the rest. -->
             <Grid>
                 <Grid.RowDefinitions>
-                    <RowDefinition x:Name="MonitorRow" Height="166" MinHeight="74"/>
+                    <RowDefinition x:Name="MonitorRow" Height="300" MinHeight="300"/>
                     <RowDefinition Height="7"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*" MinHeight="90"/>
@@ -226,10 +237,14 @@
                                       MediaOpened="Monitor_Opened" MediaEnded="Monitor_Ended"
                                       MediaFailed="Monitor_Failed"/>
 
+                        <Image Source="/Assets/emerald-logo.png" Height="96" Opacity="0.6"
+                               Margin="0,0,0,56" HorizontalAlignment="Center" VerticalAlignment="Center"
+                               RenderOptions.BitmapScalingMode="HighQuality"
+                               Visibility="{Binding Visibility, ElementName=MonitorPlaceholder}"/>
                         <TextBlock x:Name="MonitorPlaceholder" Text="select a file to preview it"
                                    HorizontalAlignment="Center" VerticalAlignment="Center"
                                    Foreground="{StaticResource Muted}" FontSize="11.5"
-                                   TextWrapping="Wrap" TextAlignment="Center" Margin="12,0"/>
+                                   TextWrapping="Wrap" TextAlignment="Center" Margin="12,104,12,0"/>
 
                         <!-- Its own transport. The window's space bar belongs to the timeline,
                              so this needs a control of its own or it could only ever autoplay. -->
@@ -463,6 +478,17 @@
                             Margin="20,0,0,0" Padding="10,0" Click="PlayOnAir_Click"
                             ToolTip="Play from the on-air mark and stay locked to it, to compare with the playback deck (Shift+A). Click again to stop."/>
 
+                    <!-- Puts the preview back on what is actually going out: reads the store
+                         again and plays on from the on-air mark, locked to it. AUTO does the
+                         same check every half minute while locked. -->
+                    <Button x:Name="SyncButton" Content="&#10227; SYNC" Style="{StaticResource GhostButton}"
+                            Margin="8,0,0,0" Padding="10,0" Click="Sync_Click"
+                            ToolTip="Sync the timeline to air: read the store again and play on from the on-air mark, locked to it (Shift+S)."/>
+                    <ToggleButton x:Name="AutoSyncButton" Content="AUTO" Margin="4,0,0,0" IsChecked="True"
+                                  Style="{StaticResource IpSmallToggle}" Height="26" Padding="8,0"
+                                  FontSize="10.5"
+                                  ToolTip="Auto sync: while locked to air, every 30 seconds put the preview back on the on-air mark if it has drifted more than two frames from it."/>
+
                     <!-- The recording as it comes in, on the big screen. -->
                     <Button x:Name="RecordingViewButton" Content="&#9679; REC" Style="{StaticResource GhostButton}"
                             Margin="8,0,0,0" Padding="10,0" Click="RecordingView_Click"
@@ -598,10 +624,14 @@
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="24"/>
-                    <RowDefinition Height="Auto"/>
+                    <!-- The four lanes share the height equally: ingest picture, segments, ingest
+                         sound, segment sound. The two ingest rows are set to nothing while nothing
+                         has been inserted, so a plain recording gets the whole height for its
+                         picture and its sound. -->
+                    <RowDefinition x:Name="IngestRow" Height="0"/>
                     <RowDefinition Height="*"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
+                    <RowDefinition x:Name="IngestAudioRow" Height="0"/>
+                    <RowDefinition Height="*"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
@@ -616,19 +646,18 @@
                         ToolTip="Click to seek. Middle-drag to pan."/>
 
                 <!-- ====================== the ingest lane ======================
-                     Directly above the segments, between them and the ruler, because it is the
-                     one track that changes what goes to air: an item here replaces the
-                     recording under it. The two layers at the bottom are monitor layers and
-                     belong below. Takes a drop from the Ingest list anywhere on the timeline,
-                     and this is where the result lands. -->
-                <Canvas x:Name="IngestCanvas" Grid.Row="1" Height="38" ClipToBounds="True"
+                     The top lane, above the segments, because it is the picture that replaces or
+                     goes in among them. Only there once something has been inserted. Takes a drop
+                     from the Ingest list anywhere on the timeline, and this is where the result
+                     lands - its sound on the ingest audio lane under the segments. -->
+                <Canvas x:Name="IngestCanvas" Grid.Row="1" ClipToBounds="True"
                         Background="#121823" AllowDrop="True"
                         SizeChanged="Timeline_SizeChanged"
                         DragOver="Overlay_DragOver" Drop="Overlay_Drop"
                         MouseLeftButtonDown="Ingest_Click"
                         MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
                         MouseLeave="Pan_Leave"
-                        ToolTip="Click to seek and select. Middle-drag to pan. Wheel to zoom."/>
+                        ToolTip="Ingest media. Click to seek and select. Del removes. Middle-drag to pan. Wheel to zoom."/>
 
                 <!-- Left button puts the playhead somewhere; the middle button - the scroll
                      wheel pressed - drags the view itself, which is what a hand cursor over a
@@ -640,44 +669,43 @@
                         MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
                         MouseLeave="Pan_Leave"/>
 
+                <!-- ==================== the ingest audio lane ====================
+                     The sound of each ingest item, item by item. A click picks up one item's
+                     sound, which [ and ] make quieter and louder. -->
+                <Canvas x:Name="IngestAudioCanvas" Grid.Row="3" ClipToBounds="True"
+                        Background="#10141C" AllowDrop="True"
+                        SizeChanged="Timeline_SizeChanged"
+                        DragOver="Overlay_DragOver" Drop="Overlay_Drop"
+                        MouseLeftButtonDown="IngestAudio_Click"
+                        MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
+                        MouseLeave="Pan_Leave"
+                        ToolTip="The ingest media's sound. Click an item to pick up its sound; [ ] level."/>
+
                 <!-- ====================== the audio lane ======================
                      The recording's own sound, under its picture. C cuts it at the playhead; a
-                     click picks up the piece between cuts (or the marked range), which [ and ]
-                     make quieter and louder. Delete Scene takes the sound out with the picture. -->
-                <Canvas x:Name="AudioCanvas" Grid.Row="3" Height="72" ClipToBounds="True"
+                     click picks up the piece of the segment under it, between cuts (or the marked
+                     range), which [ and ] make quieter and louder. Delete Scene takes the sound
+                     out with the picture. -->
+                <Canvas x:Name="AudioCanvas" Grid.Row="4" ClipToBounds="True"
                         Background="#0E1512"
                         SizeChanged="Timeline_SizeChanged"
                         MouseLeftButtonDown="Audio_Click"
                         MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
                         MouseLeave="Pan_Leave"
-                        ToolTip="The recording's sound. Click to pick up a piece; C cuts at the playhead; [ ] level. Delete Scene takes out the sound with the picture."/>
+                        ToolTip="The recording's sound. Click a segment to pick up its sound; C cuts at the playhead; [ ] level. Delete Scene takes out the sound with the picture."/>
 
-                <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Left"
+                <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Left"
                             VerticalAlignment="Top" Margin="48,3,0,0">
                     <Button Content="&#9986; Cut" Style="{StaticResource GhostButton}" Height="20"
                             Padding="6,0" FontSize="10" Click="CutAudio_Click"
                             ToolTip="Cut the sound at the playhead (C)"/>
                     <Button Content="&#8722;dB" Style="{StaticResource GhostButton}" Height="20"
                             Padding="6,0" FontSize="10" Margin="4,0,0,0" Click="AudioDown_Click"
-                            ToolTip="The piece picked up a decibel quieter ([)"/>
+                            ToolTip="The sound picked up a decibel quieter ([)"/>
                     <Button Content="+dB" Style="{StaticResource GhostButton}" Height="20"
                             Padding="6,0" FontSize="10" Margin="4,0,0,0" Click="AudioUp_Click"
-                            ToolTip="The piece picked up a decibel louder (])"/>
+                            ToolTip="The sound picked up a decibel louder (])"/>
                 </StackPanel>
-
-                <!-- The layers. Drop an audio or video file on one to lay it over the recording
-                     at the time you dropped it - an ad, a bed, a voice track. Two, because two
-                     is what a lane and an alternate need and more would make the timeline a
-                     thicket at this height. -->
-                <!-- 72: the two hand-drop lanes, 36 each. The ingest lane has its own canvas
-                     above the segments. -->
-                <Canvas x:Name="OverlayCanvas" Grid.Row="4" Height="72" ClipToBounds="True"
-                        Background="#101419" AllowDrop="True"
-                        SizeChanged="Timeline_SizeChanged"
-                        DragOver="Overlay_DragOver" Drop="Overlay_Drop"
-                        MouseLeftButtonDown="Overlay_Click"
-                        MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
-                        MouseLeave="Pan_Leave"/>
 
                 <!-- Left-aligned with a margin rather than drawn on the canvas: it moves every
                      frame, and moving a margin does not rebuild the timeline under it. -->
@@ -690,7 +718,7 @@
                 <!-- The no touch zone: from the transmitter to ten seconds ahead of it. What is in
                      it is about to go out, and its media is already being opened, so nothing in it
                      can be selected or changed. Moved like the marker, by margin, every frame. -->
-                <Border x:Name="NoTouchZone" Grid.Row="1" Grid.RowSpan="3" HorizontalAlignment="Left"
+                <Border x:Name="NoTouchZone" Grid.Row="1" Grid.RowSpan="4" HorizontalAlignment="Left"
                         Background="#2EEF4444" BorderBrush="#88EF4444" BorderThickness="0,0,1,0"
                         Margin="0" IsHitTestVisible="False" Visibility="Collapsed"
                         ClipToBounds="True">

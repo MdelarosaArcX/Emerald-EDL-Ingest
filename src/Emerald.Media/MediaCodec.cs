@@ -279,6 +279,112 @@ public static class MediaCodec
         return TimeSpan.FromSeconds(duration / (double)timescale);
     }
 
+    /// <summary>
+    /// How long the file's picture runs, from the video track's media header - or null when the
+    /// file has no video track or has not finished being written.
+    ///
+    /// <b>Why not the movie header.</b> That is the longest track, and in a recorder's segment
+    /// that is the sound: the encoder's audio frames do not end on a picture frame, so each file's
+    /// audio runs a few milliseconds past its last frame. Measured on this plant, ten-second
+    /// segments came out 0 to 16 ms long, 5.45 s over 685 of them. Laid end to end to place
+    /// segments on the clock, that was the timeline sliding behind air a little more with every
+    /// file. The picture is exactly the frames recorded, so it is what the next segment follows on from.
+    /// </summary>
+    public static TimeSpan? ReadPictureDuration(string path)
+    {
+        try
+        {
+            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            return FindPicture(file, 0, file.Length, 0);
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+        catch (NotSupportedException) { return null; }
+    }
+
+    /// <summary>Down through moov to each trak, and the first whose media is video.</summary>
+    private static TimeSpan? FindPicture(Stream file, long start, long end, int depth)
+    {
+        if (depth > MaxDepth) return null;
+
+        foreach ((string type, long body, long next) in Atoms(file, start, end))
+        {
+            if (type == "moov" && FindPicture(file, body, next, depth + 1) is { } found) return found;
+
+            if (type == "trak" && TrackMedia(file, body, next) is { Handler: "vide" } track) return track.Duration;
+        }
+
+        return null;
+    }
+
+    /// <summary>A track's handler type and its media header's duration, from its mdia.</summary>
+    private static (string Handler, TimeSpan? Duration)? TrackMedia(Stream file, long start, long end)
+    {
+        foreach ((string type, long body, long next) in Atoms(file, start, end))
+        {
+            if (type != "mdia") continue;
+
+            string? handler = null;
+            TimeSpan? duration = null;
+
+            foreach ((string inner, long innerBody, _) in Atoms(file, body, next))
+            {
+                // Media header: laid out as the movie header is, timescale and duration in the
+                // same places for both versions.
+                if (inner == "mdhd") duration = MovieDuration(file, innerBody);
+
+                // Handler: version/flags, pre-defined, then the four-character type.
+                if (inner == "hdlr")
+                {
+                    file.Position = innerBody + 8;
+
+                    Span<byte> kind = stackalloc byte[4];
+                    if (Fill(file, kind)) handler = Encoding.ASCII.GetString(kind);
+                }
+            }
+
+            return handler is null ? null : (handler, duration);
+        }
+
+        return null;
+    }
+
+    /// <summary>The atoms laid side by side between two offsets: type, where its body starts, where the next begins.</summary>
+    private static List<(string Type, long Body, long Next)> Atoms(Stream file, long start, long end)
+    {
+        var found = new List<(string, long, long)>();
+        long at = start;
+        var header = new byte[16];
+
+        while (at + 8 <= end)
+        {
+            file.Position = at;
+            if (!Fill(file, header.AsSpan(0, 8))) break;
+
+            long size = BinaryPrimitives.ReadUInt32BigEndian(header);
+            string type = Encoding.ASCII.GetString(header, 4, 4);
+            long body = at + 8;
+
+            if (size == 1)
+            {
+                if (!Fill(file, header.AsSpan(8, 8))) break;
+                size = (long)BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(8, 8));
+                body += 8;
+            }
+            else if (size == 0)
+            {
+                size = end - at;
+            }
+
+            if (size < 8 || at + size > end) break;
+
+            found.Add((type, body, at + size));
+            at += size;
+        }
+
+        return found;
+    }
+
     private static bool Fill(Stream file, Span<byte> into)
     {
         int read = 0;

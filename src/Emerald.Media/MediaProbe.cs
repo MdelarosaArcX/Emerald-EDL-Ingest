@@ -50,8 +50,18 @@ public sealed record MediaInfo(
     string VideoCodec,
     int Width,
     int Height,
-    IReadOnlyList<MediaAudioStream>? AudioStreams = null)
+    IReadOnlyList<MediaAudioStream>? AudioStreams = null,
+    TimeSpan? PictureDuration = null)
 {
+    /// <summary>
+    /// How long the picture runs - what one segment of a recording is followed on from. The
+    /// file's own duration is its longest track, and a segment's sound runs a few milliseconds
+    /// past its last frame (see <see cref="MediaCodec.ReadPictureDuration"/>); added up over
+    /// hundreds of segments that put the timeline seconds behind air. The file's duration when
+    /// there is no picture to measure.
+    /// </summary>
+    public TimeSpan Runs => PictureDuration is { Ticks: > 0 } picture ? picture : Duration;
+
     /// <summary>Every audio stream in the file, in file order. Never null.</summary>
     public IReadOnlyList<MediaAudioStream> Audio => AudioStreams ?? Array.Empty<MediaAudioStream>();
 
@@ -198,6 +208,7 @@ public static class MediaProbe
         bool hasAudio = false;
         string codec = "?";
         int width = 0, height = 0;
+        double picture = 0;
         var audio = new List<MediaAudioStream>();
 
         if (root.TryGetProperty("streams", out JsonElement streams))
@@ -226,6 +237,10 @@ public static class MediaProbe
                     codec = s.TryGetProperty("codec_name", out JsonElement c) ? c.GetString() ?? "?" : "?";
                     width = s.TryGetProperty("width", out JsonElement w) ? w.GetInt32() : 0;
                     height = s.TryGetProperty("height", out JsonElement h) ? h.GetInt32() : 0;
+
+                    if (s.TryGetProperty("duration", out JsonElement vd) &&
+                        double.TryParse(vd.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out double v))
+                        picture = v;
                 }
 
                 // The timecode track is usually a data stream carrying a "timecode" tag.
@@ -246,7 +261,8 @@ public static class MediaProbe
             VideoCodec: codec,
             Width: width,
             Height: height,
-            AudioStreams: audio);
+            AudioStreams: audio,
+            PictureDuration: picture > 0 ? TimeSpan.FromSeconds(picture) : null);
     }
 
     /// <summary>

@@ -16,4 +16,9 @@
     <ProjectReference Include="..\Emerald.Core\Emerald.Core.csproj" />
     <ProjectReference Include="..\Emerald.Media\Emerald.Media.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- The same logo the capture deck shows while its screen has no picture. -->
+    <Resource Include="..\..\assets\logo\Emerald_Logo@512w.png" Link="Assets\emerald-logo.png" />
+  </ItemGroup>
 </Project>

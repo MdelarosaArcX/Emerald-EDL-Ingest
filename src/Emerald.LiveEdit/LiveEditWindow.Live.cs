@@ -282,7 +282,9 @@ public partial class LiveEditWindow
                 DayToRecording(plan.StartFrame),
                 ToRecording(plan.Frames),
                 ToRecording(plan.Covers),
-                plan.Speed));
+                plan.Speed,
+                plan.Tracks,
+                overlay.GainDb));
         }
 
         LiveAir.Shared.SetCues(cues);
@@ -550,7 +552,6 @@ public partial class LiveEditWindow
         var cut = new Overlay
         {
             Path = "",
-            Lane = IngestLane,
             StartFrame = plan.StartFrame,
             Frames = 0,
             Plan = plan,
@@ -560,6 +561,7 @@ public partial class LiveEditWindow
 
         _overlays.Add(cut);
         _selected = cut;
+        _selectedSound = false;
         _audioPiece = null;
         _markIn = _markOut = null;
 

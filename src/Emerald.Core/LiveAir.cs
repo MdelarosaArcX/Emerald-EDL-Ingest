@@ -36,6 +36,8 @@ public enum LiveAirState
 /// <param name="Frames">How many frames of air the media takes. Zero for a cut.</param>
 /// <param name="Covers">How many frames of the recording it takes the place of (replace, overlay, fit) or removes (cut).</param>
 /// <param name="Speed">The media's rate multiplier. 1 except for fit-to-fill.</param>
+/// <param name="Tracks">Which of the media's tracks go to air. See <see cref="IngestTracks"/>.</param>
+/// <param name="GainDb">The level the media's sound is played at.</param>
 public sealed record LiveCue(
     string Id,
     IngestMode Mode,
@@ -43,9 +45,14 @@ public sealed record LiveCue(
     long RecordingFrame,
     long Frames,
     long Covers,
-    double Speed = 1)
+    double Speed = 1,
+    IngestTracks Tracks = IngestTracks.Both,
+    double GainDb = 0)
 {
     public string Name => MediaPath is null ? "scene cut" : System.IO.Path.GetFileName(MediaPath);
+
+    public bool HasVideo => MediaPath is not null && Tracks != IngestTracks.AudioOnly;
+    public bool HasAudio => MediaPath is not null && Tracks != IngestTracks.VideoOnly;
 
     public long EndFrame => RecordingFrame + Covers;
 

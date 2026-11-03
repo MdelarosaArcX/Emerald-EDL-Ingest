@@ -13,6 +13,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <TextBlock Grid.Row="0" Text="PLACE INGEST MEDIA" Foreground="{StaticResource Ok}"
@@ -72,10 +73,28 @@
             </RadioButton>
         </StackPanel>
 
+        <!-- Which of the file's tracks go to air. Separate from the mode because it is a separate
+             question: an audio-only insert is still an insert, and grows the delay just the same. -->
+        <StackPanel Grid.Row="3" Margin="0,16,0,0">
+            <TextBlock Text="TRACKS" Foreground="{StaticResource Muted}" FontSize="10.5"
+                       FontWeight="Bold"/>
+            <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                <RadioButton x:Name="BothRadio" IsChecked="True" GroupName="Tracks"
+                             Click="Mode_Changed" Content="Video and audio"
+                             Foreground="{StaticResource Text}"/>
+                <RadioButton x:Name="VideoOnlyRadio" GroupName="Tracks" Margin="18,0,0,0"
+                             Click="Mode_Changed" Content="Video only"
+                             Foreground="{StaticResource Text}"/>
+                <RadioButton x:Name="AudioOnlyRadio" GroupName="Tracks" Margin="18,0,0,0"
+                             Click="Mode_Changed" Content="Audio only"
+                             Foreground="{StaticResource Text}"/>
+            </StackPanel>
+        </StackPanel>
+
         <!-- What the chosen option will actually do at this length. Recomputed as the choice
              changes, because "sped up to 1.42x" is the fact that decides it and the option's
              name does not carry it. -->
-        <Border Grid.Row="3" Margin="0,16,0,0" Padding="11,9" CornerRadius="4"
+        <Border Grid.Row="4" Margin="0,16,0,0" Padding="11,9" CornerRadius="4"
                 Background="#1F242D" BorderBrush="{StaticResource Line}" BorderThickness="1">
             <StackPanel>
                 <TextBlock x:Name="EffectText" FontSize="11.5" TextWrapping="Wrap"
@@ -85,7 +104,7 @@
             </StackPanel>
         </Border>
 
-        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right"
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right"
                     Margin="0,16,0,0">
             <Button Content="Cancel" Style="{StaticResource GhostButton}" Width="92"
                     Height="30" IsCancel="True" Click="Cancel_Click"/>
