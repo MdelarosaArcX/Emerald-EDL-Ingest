@@ -49,7 +49,12 @@ public sealed record LiveCue(
     IngestTracks Tracks = IngestTracks.Both,
     double GainDb = 0)
 {
-    public string Name => MediaPath is null ? "scene cut" : System.IO.Path.GetFileName(MediaPath);
+    public string Name => Mode switch
+    {
+        IngestMode.Blank => "deleted scene (black and silence)",
+        _ when MediaPath is null => "scene cut",
+        _ => System.IO.Path.GetFileName(MediaPath),
+    };
 
     public bool HasVideo => MediaPath is not null && Tracks != IngestTracks.AudioOnly;
     public bool HasAudio => MediaPath is not null && Tracks != IngestTracks.VideoOnly;
@@ -92,6 +97,10 @@ public static class LiveCues
 
         foreach (LiveCue cue in cues)
         {
+            // A blank never takes over: it is asked about frame by frame, by BlankAt, so the
+            // latest list always decides and a changed end applies at once.
+            if (cue.Mode == IngestMode.Blank) continue;
+
             if (done.Contains(cue.Id) || cue.RecordingFrame > recordingFrame) continue;
 
             bool fires = cue.Mode switch
@@ -125,6 +134,25 @@ public static class LiveCues
                         c.RecordingFrame + Math.Max(c.Covers, 1) > recordingFrame &&
                         c.RecordingFrame - recordingFrame <= lookahead);
 
+    /// <summary>
+    /// The blank covering <paramref name="recordingFrame"/>, or null: that frame goes to air as
+    /// black and silence instead of itself.
+    ///
+    /// <b>Asked for every frame rather than fired once.</b> A cue that fires is committed - its
+    /// length fixed when it starts - and a blank must not be: lengthening or shortening one that
+    /// is already on air has to take effect on the next frame. Reading the current list each time
+    /// does that, and also means a blank cannot be applied twice: there is nothing to apply, only a
+    /// question answered from the newest EDL.
+    /// </summary>
+    public static LiveCue? BlankAt(long recordingFrame, IReadOnlyList<LiveCue> cues)
+    {
+        foreach (LiveCue cue in cues)
+            if (cue.Mode == IngestMode.Blank && recordingFrame >= cue.RecordingFrame && recordingFrame < cue.EndFrame)
+                return cue;
+
+        return null;
+    }
+
     /// <summary>The delay once every cue has played: the base plus what inserts add, less what cuts remove.</summary>
     public static long DelayWith(long baseFrames, IEnumerable<LiveCue> cues) =>
         baseFrames + cues.Sum(c => c.DelayChange);
@@ -151,7 +179,7 @@ public readonly record struct LiveAirPosition(long RecordingFrame, string? CueId
 /// enough for that at the start. <see cref="Headroom"/> is that extra, chosen when going live;
 /// an insert that would need more is refused in Live Edit rather than lapping the ring on air.
 /// </summary>
-public sealed class LiveAir
+public sealed class LiveAir : IEdlPlayback
 {
     public static LiveAir Shared { get; } = new();
 
@@ -198,7 +226,7 @@ public sealed class LiveAir
     private IReadOnlyList<LiveCue> _cues = Array.Empty<LiveCue>();
 
     /// <summary>
-    /// The cues as Live Edit last laid them out. Replaced whole on every edit, so the transmitter
+    /// The cues of the newest EDL revision taken. Replaced whole by each one, so the transmitter
     /// always reads one consistent list.
     /// </summary>
     public IReadOnlyList<LiveCue> Cues
@@ -206,25 +234,100 @@ public sealed class LiveAir
         get { lock (_gate) return _cues; }
     }
 
-    public void SetCues(IReadOnlyList<LiveCue> cues)
-    {
-        lock (_gate) _cues = cues;
-    }
-
     private IReadOnlyList<AudioEdit> _audioEdits = Array.Empty<AudioEdit>();
 
     /// <summary>
-    /// The levels set on the recording's own sound, in frames of the recording, as Live Edit
-    /// last laid them out. Replaced whole on every edit, like the cues.
+    /// The levels set on the recording's own sound, in frames of the recording, from the same
+    /// revision as the cues.
     /// </summary>
     public IReadOnlyList<AudioEdit> AudioEdits
     {
         get { lock (_gate) return _audioEdits; }
     }
 
-    public void SetAudioEdits(IReadOnlyList<AudioEdit> edits)
+    // ------------------------------------------------------------------ the EDL handshake
+
+    private long _acceptedVersion;
+    private long _appliedVersion;
+    private string? _acceptedTransaction;
+
+    /// <inheritdoc/>
+    public long AcceptedVersion { get { lock (_gate) return _acceptedVersion; } }
+
+    /// <inheritdoc/>
+    public long AppliedVersion { get { lock (_gate) return _appliedVersion; } }
+
+    /// <summary>
+    /// Takes a revision of Live Edit's EDL, or says why not.
+    ///
+    /// Refused when it is not newer than what is held - so an older revision arriving late can
+    /// never put back what a newer one replaced - and when it would change a frame the transmitter
+    /// has already sent or is committed to. The same transaction twice is recognised and changes
+    /// nothing. Version numbers carry on across going off air and on again, so a revision left over
+    /// from an earlier transmission is stale too.
+    /// </summary>
+    public EdlReceipt Submit(EdlRevision revision)
     {
-        lock (_gate) _audioEdits = edits;
+        lock (_gate)
+        {
+            if (revision.TransactionId == _acceptedTransaction)
+                return new EdlReceipt(EdlVerdict.Duplicate, revision.Version, revision.TransactionId,
+                                      $"version {revision.Version} is already held - not applied again.");
+
+            if (revision.Version <= _acceptedVersion)
+                return new EdlReceipt(EdlVerdict.Stale, revision.Version, revision.TransactionId,
+                                      $"version {revision.Version} is not newer than version {_acceptedVersion}, which is held.");
+
+            if (_state is LiveAirState.Off or LiveAirState.Failed)
+                return new EdlReceipt(EdlVerdict.NotLive, revision.Version, revision.TransactionId,
+                                      "Live Edit is not on air.");
+
+            if (CommittedThrough() is { } committed)
+            {
+                long? changed = EdlDiff.EarliestChange(_cues, revision.Cues);
+                long? level = global::Emerald.Core.AudioEdits.FirstDifference(_audioEdits, revision.AudioEdits);
+                long first = Math.Min(changed ?? long.MaxValue, level ?? long.MaxValue);
+
+                if (first <= committed)
+                    return new EdlReceipt(EdlVerdict.TooLate, revision.Version, revision.TransactionId,
+                                          $"it changes recording frame {first:N0}, and air is committed " +
+                                          $"through frame {committed:N0}.");
+            }
+
+            _cues = revision.Cues;
+            _audioEdits = revision.AudioEdits;
+            _acceptedVersion = revision.Version;
+            _acceptedTransaction = revision.TransactionId;
+
+            return new EdlReceipt(EdlVerdict.Accepted, revision.Version, revision.TransactionId, null);
+        }
+    }
+
+    /// <summary>
+    /// The cues, for the transmitter, read once a frame. Reading them is what acknowledges the
+    /// revision they came from: from this moment that version is the one on air.
+    /// </summary>
+    public IReadOnlyList<LiveCue> CuesForAir()
+    {
+        lock (_gate)
+        {
+            _appliedVersion = _acceptedVersion;
+            return _cues;
+        }
+    }
+
+    /// <summary>
+    /// The last recording frame air has sent or is bound to: the frame just sent, or the end of a
+    /// cue's media while that is playing. Null when nothing has gone out.
+    /// </summary>
+    private long? CommittedThrough()
+    {
+        if (_position is not { } at || at.RecordingFrame < 0) return null;
+
+        if (at.CueId is { } id && _cues.FirstOrDefault(c => c.Id == id) is { } playing)
+            return Math.Max(at.RecordingFrame, playing.EndFrame - 1);
+
+        return at.RecordingFrame;
     }
 
     // ------------------------------------------------------------------ where it is

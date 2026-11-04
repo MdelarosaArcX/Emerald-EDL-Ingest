@@ -75,6 +75,12 @@
                        Margin="12,0,0,0" FontFamily="Consolas" FontSize="12" FontWeight="Bold"
                        Foreground="{StaticResource Warn}" Visibility="Collapsed"/>
 
+            <!-- Where the EDL stands with playback: the version on air, one sent and not yet
+                 picked up, or one playback is not acknowledging. Only while live. -->
+            <TextBlock x:Name="EdlStateText" DockPanel.Dock="Right" VerticalAlignment="Center"
+                       Margin="12,0,0,0" FontFamily="Consolas" FontSize="12" FontWeight="Bold"
+                       Visibility="Collapsed"/>
+
             <StackPanel Orientation="Horizontal" ClipToBounds="True">
                 <TextBlock Text="LIVE EDIT" Foreground="{StaticResource Ok}" FontSize="16" FontWeight="Bold"/>
                 <TextBlock Text="{x:Static core:EmeraldVersion.Text}" Foreground="{StaticResource Muted}"
@@ -138,10 +144,13 @@
                               MediaOpened="Player_Opened" MediaEnded="Player_Ended"
                               MediaFailed="Player_Failed" Opacity="0" IsMuted="True"/>
                 <!-- Over the picture while an audio-only ingest item is playing: its file may well
-                     have a picture, and what goes to air there is not it. -->
+                     have a picture, and what goes to air there is not it. And over a deleted
+                     scene, which goes to air as black. -->
+
+
                 <Border x:Name="AudioOnlyCover" Background="Black" Visibility="Collapsed"
                         IsHitTestVisible="False">
-                    <TextBlock Text="AUDIO ONLY" Foreground="{StaticResource Muted}" FontSize="13"
+                    <TextBlock x:Name="AudioOnlyCoverText" Text="AUDIO ONLY" Foreground="{StaticResource Muted}" FontSize="13"
                                FontFamily="Consolas" FontWeight="Bold"
                                HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Border>
@@ -512,7 +521,7 @@
                     <Button x:Name="DeleteSceneButton" Content="Delete Scene" Style="{StaticResource GhostButton}"
                             Margin="8,0,0,0" IsEnabled="False" Click="DeleteScene_Click"
                             Foreground="{StaticResource Bad}"
-                            ToolTip="Take the marked range out: it will not go to air, and the delay shrinks by its length"/>
+                            ToolTip="Put the marked range to air as black and silence, for its whole length - nothing moves and the delay is unchanged. With a deleted scene selected, changes it to the marked range instead"/>
 
                     <!-- A single point, not a range: "bleep here", "cut from here". Amber, so it
                          is never mistaken for the green in/out pair or the red transmitter. -->

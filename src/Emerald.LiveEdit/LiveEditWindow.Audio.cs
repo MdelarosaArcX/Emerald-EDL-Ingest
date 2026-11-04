@@ -185,7 +185,7 @@ public partial class LiveEditWindow
              : $"set to {Db(after)}."),
             @event: "liveedit.audiolevel");
 
-        PushCues();
+        PushCues("audio level changed");
         FollowAudioLevel(force: true);
         DrawAudio();
         ShowLayer();
@@ -218,12 +218,20 @@ public partial class LiveEditWindow
         // audio-only one has its picture covered, as it is on air.
         Overlay? ingest = _onIngest is null ? null : IngestAt(_at);
 
-        Visibility cover = ingest is { HasVideo: false } ? Visibility.Visible : Visibility.Collapsed;
+        // A deleted scene goes to air as black and silence, so it is previewed as that: the
+        // recording plays on underneath, covered and muted.
+        bool blank = _onIngest is null && _overlays.Any(o => o.IsBlank && HoldsOnRuler(o, _at));
+
+        Visibility cover = blank || ingest is { HasVideo: false } ? Visibility.Visible : Visibility.Collapsed;
         if (AudioOnlyCover.Visibility != cover) AudioOnlyCover.Visibility = cover;
+
+        string coverText = blank ? "DELETED - BLACK AND SILENCE ON AIR" : "AUDIO ONLY";
+        if (AudioOnlyCoverText.Text != coverText) AudioOnlyCoverText.Text = coverText;
 
         // Under audio only laid over the recording, the recording's picture plays and its sound
         // does not: the item's sound has taken its place, from the sound player.
-        double gain = _onIngest is null
+        double gain = blank ? 0
+                    : _onIngest is null
                         ? SoundOverRecordingAt(_at) is not null ? 0
                         : AudioEdits.Linear(AudioEdits.GainDbAt(CapturedOf(_at), _audioEdits))
                     : ingest is { HasAudio: false } ? 0
@@ -330,6 +338,78 @@ public partial class LiveEditWindow
                 Margin = new Thickness(from, 0, 0, 0),
                 IsHitTestVisible = false,
             });
+        }
+    }
+
+    private static readonly Brush BlankFill = Frozen(new SolidColorBrush(Color.FromArgb(0xF2, 0x00, 0x00, 0x00)));
+
+    /// <summary>
+    /// The deleted scenes, over a segment lane: black across the whole of each, on the picture
+    /// and on the sound alike, because that is exactly what goes to air there. Drawn over the
+    /// segments rather than in place of them - the recording is still there, and the timeline
+    /// keeps its length - and labelled with how long it runs and where it stands with playback.
+    /// </summary>
+    private void DrawBlanks(Canvas canvas, double width, long start, long span, double height, bool sound)
+    {
+        List<IngestItem> items = IngestItems();
+
+        foreach (Overlay overlay in _overlays.Where(o => o.IsBlank))
+        {
+            (long at, long end) = RulerSpan(overlay, items);
+            if (end < start || at > start + span) continue;
+
+            double from = Math.Max(0, (at - start) / (double)span * width);
+            double to = Math.Min(width, (end - start) / (double)span * width);
+            if (to <= from) continue;
+
+            bool chosen = ReferenceEquals(overlay, _selected);
+            EdlEditRecord? record = _edl.Edit(overlay.Id);
+
+            canvas.Children.Add(new Rectangle
+            {
+                Width = Math.Max(1, to - from),
+                Height = height,
+                Fill = BlankFill,
+                Stroke = Brush(chosen ? "Tc" : "Bad"),
+                StrokeThickness = chosen ? 2 : 1,
+                StrokeDashArray = record?.Conform == EdlConformStatus.Conformed ? null : new DoubleCollection { 4, 2 },
+                Margin = new Thickness(from, 0, 0, 0),
+                ToolTip = $"Deleted scene: {IngestPlacement.Describe(overlay.Plan!.Value, _rate)}\n" +
+                          $"{Stamp(at)} to {Stamp(end)}\n" +
+                          (record?.Conform switch
+                          {
+                              EdlConformStatus.Conformed => $"Conformed in EDL v{record.ConformedVersion}",
+                              EdlConformStatus.Conforming => $"Conforming in EDL v{record.ConformVersion}",
+                              EdlConformStatus.Rejected => "Playback refused its conform",
+                              _ => "Not yet conformed - it is conformed when its first frame reaches the no edit zone",
+                          }),
+            });
+
+            if (to - from < 30) continue;
+
+            string state = record?.Conform switch
+            {
+                EdlConformStatus.Conformed => $"  v{record.ConformedVersion} ✓",
+                EdlConformStatus.Conforming => $"  v{record.ConformVersion}…",
+                EdlConformStatus.Rejected => "  REFUSED",
+                _ => "",
+            };
+
+            var tag = new TextBlock
+            {
+                Text = sound ? "SILENCE" : $"■ DELETED {new Timecode(end - at, _rate)}{state}",
+                Foreground = Brush(chosen ? "Tc" : "Bad"),
+                FontSize = 9.5,
+                FontFamily = new FontFamily("Consolas"),
+                FontWeight = FontWeights.Bold,
+                IsHitTestVisible = false,
+                MaxWidth = Math.Max(0, to - from - 6),
+                TextTrimming = TextTrimming.CharacterEllipsis,
+            };
+
+            Canvas.SetLeft(tag, from + 4);
+            Canvas.SetTop(tag, Math.Max(0, height / 2 - 7));
+            canvas.Children.Add(tag);
         }
     }
 
@@ -639,6 +719,7 @@ public partial class LiveEditWindow
         AudioCanvas.Children.Add(new Path { Data = wave, Stroke = WaveBrush, StrokeThickness = 1, IsHitTestVisible = false });
 
         GreyCovered(AudioCanvas, width, start, span, height, sound: true);
+        DrawBlanks(AudioCanvas, width, start, span, height, sound: true);
 
         // The cuts: a thin line through the lane, like a razor cut in an editor.
         foreach (long cut in _audioCuts)

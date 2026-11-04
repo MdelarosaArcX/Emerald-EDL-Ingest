@@ -267,6 +267,24 @@ Settings live in `%APPDATA%\Emerald\settings.json`. On first run Emerald reads
 `%APPDATA%\EdlGenerator\settings.json` if its own is absent, so board, port, media source and
 audio tracks carry across from the pre-Emerald app.
 
+### Recording past midnight
+
+A recording that runs past midnight is split into one folder per day without stopping. For
+example, a recording from 22:00 to 06:00 writes `2026-11-04_22-00-00` and then
+`2026-11-05_00-00-00`.
+
+- **Capture** (`SdiCapture`): the next day's encoder is started ten seconds before midnight.
+  At the exact frame where the folder's start plus the frames recorded reaches 00:00:00, the
+  frames switch to it. Nothing is restarted: the receiver, the frame count and the delay line
+  carry on. `RecordingSequence.FramesToNextDay` works out that frame.
+- **Live Edit**: each day's folders are on that day's timeline. The timeline moves to the next
+  day when the on-air mark leaves it:
+  - **Following air:** Play On Air carries on there.
+  - **Showing the day air was on:** the timeline goes with air, even if that day was chosen
+    by hand.
+  - **Left on today:** the timeline moves at midnight once air has crossed.
+  - **Playing by hand:** the timeline moves when the last segment ends.
+
 ## EDL fields
 
 | Field | Notes |
@@ -573,6 +591,128 @@ counted at 25 and would otherwise pass a raster-and-rate check.
 
 All of that is `DelayPacer.Decide`, a pure function over integers, so the behaviour that
 matters most on air is the part that is easiest to test without a card.
+
+## Live Edit's EDL
+
+Every edit in Live Edit is a **modification to an EDL**, never to the media. The captured
+files are not touched, trimmed or deleted by anything Live Edit does; the EDL says what
+playback should play, replace, skip, or send as black and silence, and the timeline is a
+picture of that EDL.
+
+### The pieces
+
+| Piece | Where | What it does |
+|---|---|---|
+| Timeline placements | `LiveEditWindow` (`Overlay`, `IngestPlan`) | What the operator has made: ingest items, deleted scenes, levels. Undo and redo work on these. |
+| `EdlLedger` | `Emerald.Core` | Follows every edit from creation to playback: logs it, versions the EDL, conforms edits at the no edit zone, waits for acknowledgement, retries. Pure — no clock, no window, no card. |
+| `EdlLogger` | `Emerald.Core` | The structured EDL log (below). |
+| `LiveAir` | `Emerald.Core` | The playback side of the handshake (`IEdlPlayback`): takes or refuses a revision. |
+| `LiveAirTransmitter` | `Emerald.Video` | Plays the delayed recording to the TX with the EDL applied, frame by frame. |
+
+Playback here is Live Edit's own transmission (**Go Live**), which runs in the same process.
+The playback deck's tidal lock is a separate transmission and does not play Live Edit's EDL.
+
+### Delete is black and silence, not removal
+
+**Delete Scene** puts the marked range to air as **black video and silent audio for exactly
+its length** (`IngestMode.Blank`). The recording runs on underneath, a frame of it used up for
+every frame of black, so:
+
+- the timeline keeps its length, and nothing after the range moves;
+- the delay is not changed;
+- the original frames are still on disk, and shortening or removing the deletion puts them
+  back on air.
+
+On the timeline a deleted scene is a black block across the segments and the segment audio,
+labelled with its length and where it stands with playback (`v12 ✓` once conformed; dashed
+until then). The big screen shows it black and silent, as air will.
+
+**To change one**, click it: it is selected with the marks on its range. Move a mark and press
+Delete Scene again, and the deletion becomes the new range. **Del** puts the whole of it back,
+while its start is still ahead of the no edit zone.
+
+> The scene cut that came before — where the transmitter skips the range and the delay
+> shrinks by its length (`IngestMode.Cut`) — is still understood by the timeline, undo and the
+> transmitter, but Delete Scene no longer makes one.
+
+### Versions
+
+Each send to playback is the **whole EDL** at a **new version** (`EdlRevision`), never a
+change to apply on top of the last. Version numbers only grow, and carry on across going off
+air and back on. Playback answers each one (`EdlReceipt`):
+
+| Verdict | Meaning |
+|---|---|
+| `Accepted` | Taken. In use from playback's next frame. |
+| `Duplicate` | The same transaction id again. Nothing is applied twice. |
+| `Stale` | Not newer than what playback holds, so an older revision can never overwrite a newer one. The ledger reissues once above it. |
+| `TooLate` | It would change a frame already sent, or one playback is committed to. Nothing changes; air stays on the last version. |
+| `NotLive` | Nothing is on air. |
+
+**Taken is not applied.** A revision counts as on air only when the transmitter reads it on
+its frame loop (`LiveAir.CuesForAir`), which is what moves `AppliedVersion`. If that has not
+happened within **2 seconds**, it is logged as a failure and the **latest state** is sent
+again at a new version. Old revisions are never replayed. After **3** attempts the ledger stops
+retrying and the header shows `EDL vN NOT ACKNOWLEDGED`. A late acknowledgement is still
+recognised. **Ctrl+Shift+E** sends the EDL again by hand.
+
+Deleted scenes are applied **per frame**: for every recording frame it sends, the transmitter
+asks the newest EDL whether a deleted scene covers that frame. That is why one already on air
+can still be lengthened or shortened and end exactly where it now ends, and why it cannot be
+applied twice.
+
+### The no edit zone and conform
+
+The no edit zone is the ten seconds ahead of air. Its far edge is the **conform line**.
+
+1. Every edit is sent to playback as soon as it is made (an `UPDATE`).
+2. When an edit's **first frame** reaches the conform line, the whole EDL is sent again as a
+   **`CONFORM`** for that edit, with its whole Mark In–Mark Out range, a transaction id and a
+   version. This happens before any of its frames reach air, not after.
+3. The edit is **CONFORMED** once playback acknowledges that version.
+4. A conformed edit can still change wherever it has not reached the line. Typically that is
+   moving the out point of a deleted scene that is already running. The change is re-conformed
+   at a new version that supersedes the first, and the log records the frames it blacks out or
+   gives back.
+
+A change is allowed when the **first frame it alters** is ahead of the conform line. For a
+deleted scene whose start stays put, that is its nearer end (`EdlDiff.EarliestChange`). Undo
+and redo follow the same rule.
+
+### The EDL log
+
+Every step goes three places:
+
+- **Live Edit's memory**, for the window.
+- **The activity log**, as `EDL …` lines with event `edl.<action>`.
+- **`edl-yyyyMMdd.jsonl`** beside the activity log: one JSON object per line, never trimmed.
+
+The file is the one to trace an edit with.
+
+**Actions:** `lockChanged`, `markIn`, `markOut`, `editCreated`, `editModified`, `editDeleted`,
+`edlGenerated`, `edlUpdated`, `edlSent`, `noEditZone`, `conformStarted`,
+`playbackAcknowledged`, `playbackRejected`, `operationFailed`.
+
+**Fields:**
+
+| Group | Fields |
+|---|---|
+| Identity | `timestamp`, `operationId` (unique per line), `editId` (one per edit, for its whole life), `transactionId` (one per send) |
+| What and when | `action`, `lockState` (Live Edit's transmission, its delay and EDL version, and the tidal lock), `message` |
+| The range | `rate`, `markIn` / `markOut` (timecodes), `startFrame` / `endFrame`, `durationFrames` / `durationSeconds`, `selectedFrames` |
+| Sources | `sourceFiles`, `sources` (each file and exactly which of its frames, per file), `audio` |
+| EDL and playback | `previousVersion` / `updatedVersion`, `conformStatus`, `playbackResponse`, `instruction` (what playback is told, in words), `error` |
+
+How the frame numbers read:
+
+- **Frames of the day** at the ruler's rate, so `markIn` `00:00:40:00` at 25 fps is frame 1000.
+- **`startFrame` and `endFrame`** are the first and last selected frames, both included.
+- **`markOut`** is where the out mark was set, one past the last. A 40-second deletion at
+  25 fps is `startFrame` 1000, `endFrame` 1999, `durationFrames` 1000.
+- **`selectedFrames`** is written as inclusive runs (`{ "first": 1000, "last": 1999 }`), which
+  is the complete list without ninety thousand numbers for an hour.
+- **Across capture files:** a range that crosses a segment boundary lists every file it
+  touches in `sources`, with the frames of each.
 
 ## The Ingest Controller
 

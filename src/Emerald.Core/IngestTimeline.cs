@@ -65,6 +65,10 @@ public static class IngestTimeline
 
             if (frame < start) break;              // ordered, so nothing later can cover it
 
+            // A blank has no media and moves nothing: the recording is still what runs here, and
+            // it is the player's business to show it as black. See BlankAt.
+            if (plan.Mode == IngestMode.Blank) continue;
+
             // A cut takes no time on the ruler: from its point on, the recording carries on from
             // the far side of the range it took out.
             if (plan.Mode == IngestMode.Cut)
@@ -181,6 +185,23 @@ public static class IngestTimeline
         }
 
         return (from, to);
+    }
+
+    /// <summary>
+    /// The blank covering <paramref name="rulerFrame"/>, if any: the deleted scene that puts black
+    /// and silence on air there in place of the recording.
+    /// </summary>
+    public static IngestItem? BlankAt(long rulerFrame, IReadOnlyList<IngestItem> items)
+    {
+        foreach (IngestItem item in items)
+        {
+            if (item.Plan.Mode != IngestMode.Blank) continue;
+
+            long start = RulerStart(item, items);
+            if (rulerFrame >= start && rulerFrame < start + item.Plan.Frames) return item;
+        }
+
+        return null;
     }
 
     /// <summary>One continuous run of a segment, after inserts and cuts have cut it up.</summary>

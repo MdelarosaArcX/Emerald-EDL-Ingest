@@ -38,6 +38,18 @@ public enum IngestMode
     /// delay shrinks by that much. No media: the placement's path is empty.
     /// </summary>
     Cut,
+
+    /// <summary>
+    /// A scene deleted from air without being taken out of time: the marked range goes out as
+    /// black picture and silence, for exactly as long as it runs. The recording goes by unseen
+    /// underneath, a frame for every frame of black, so nothing after it moves, the timeline keeps
+    /// its length, and the delay is not touched. No media: the placement's path is empty.
+    ///
+    /// This is what Delete makes. It is an instruction in the EDL, not a change to the recording:
+    /// the captured files are never touched, and shortening or removing the instruction puts the
+    /// original frames back on air.
+    /// </summary>
+    Blank,
 }
 
 /// <summary>
@@ -87,11 +99,14 @@ public readonly record struct IngestPlan(
 {
     public long EndFrame => StartFrame + Frames;
 
-    /// <summary>The item's picture goes to air. Not for a cut, which has no media.</summary>
-    public bool HasVideo => Mode != IngestMode.Cut && Tracks != IngestTracks.AudioOnly;
+    /// <summary>The item's picture goes to air. Not for a cut or a blank, which have no media.</summary>
+    public bool HasVideo => !HasNoMedia && Tracks != IngestTracks.AudioOnly;
 
-    /// <summary>The item's sound goes to air. Not for a cut, which has no media.</summary>
-    public bool HasAudio => Mode != IngestMode.Cut && Tracks != IngestTracks.VideoOnly;
+    /// <summary>The item's sound goes to air. Not for a cut or a blank, which have no media.</summary>
+    public bool HasAudio => !HasNoMedia && Tracks != IngestTracks.VideoOnly;
+
+    /// <summary>An instruction about the recording rather than a piece of media: a cut or a blank.</summary>
+    public bool HasNoMedia => Mode is IngestMode.Cut or IngestMode.Blank;
 
     /// <summary>True when the media is not playing at its recorded rate.</summary>
     public bool Stretched => Math.Abs(Speed - 1) > 0.0001;
@@ -199,6 +214,34 @@ public static class IngestPlacement
     }
 
     /// <summary>
+    /// Plans deleting a scene by blanking it: the marked range, in ruler frames, goes to air as
+    /// black and silence for its whole length. Unlike a cut it covers the range rather than taking
+    /// it out, so <see cref="IngestPlan.ShiftsAfterBy"/> is zero and nothing after it moves.
+    /// </summary>
+    public static bool TryPlanBlank(long? markIn, long? markOut, out IngestPlan plan, out string? problem)
+    {
+        plan = default;
+        problem = null;
+
+        if (markIn is not { } from || markOut is not { } to || to <= from)
+        {
+            problem = "Deleting a scene needs a marked range. Mark in and out first.";
+            return false;
+        }
+
+        from = Math.Max(0, from);
+
+        if (to <= from)
+        {
+            problem = "The marked range is before the start of the day.";
+            return false;
+        }
+
+        plan = new IngestPlan(IngestMode.Blank, from, to - from, to - from, 1, 0);
+        return true;
+    }
+
+    /// <summary>
     /// What a plan does, in a sentence, for the timeline block and the log.
     ///
     /// Written from the plan rather than from the mode, so it states what will actually happen
@@ -209,7 +252,7 @@ public static class IngestPlacement
     {
         string length = $"{plan.Frames:N0} frames ({new Timecode(plan.Frames, rate)})";
 
-        string tracks = plan.Mode == IngestMode.Cut ? "" : plan.Tracks switch
+        string tracks = plan.HasNoMedia ? "" : plan.Tracks switch
         {
             IngestTracks.VideoOnly => plan.Mode == IngestMode.Insert
                 ? "video only, silent - "
@@ -247,6 +290,10 @@ public static class IngestPlacement
             IngestMode.Cut =>
                 $"{plan.Covers:N0} frames ({new Timecode(plan.Covers, rate)}) taken out; " +
                 $"everything after moves {plan.Covers:N0} frames earlier",
+
+            IngestMode.Blank =>
+                $"{length} of black and silence in place of the recording; " +
+                "the timeline and the delay are unchanged",
 
             _ => length,
         };

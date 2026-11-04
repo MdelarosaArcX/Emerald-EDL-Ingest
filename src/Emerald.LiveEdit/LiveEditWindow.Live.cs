@@ -75,14 +75,18 @@ public partial class LiveEditWindow
     private void WireLive()
     {
         LiveAir.Shared.Changed += OnLiveAirChanged;
+        TidalLock.Shared.Changed += OnTidalLockChanged;
         ActivityLog.Shared.Line += OnLiveLogLine;
+        EdlLogger.Shared.LockState = LockState;
         ShowLive();
     }
 
     private void UnwireLive()
     {
         LiveAir.Shared.Changed -= OnLiveAirChanged;
+        TidalLock.Shared.Changed -= OnTidalLockChanged;
         ActivityLog.Shared.Line -= OnLiveLogLine;
+        EdlLogger.Shared.Flush(TimeSpan.FromSeconds(2));
 
         // Owned by this window, so WPF may already be closing it as this one closes.
         try { _logWindow?.Close(); }
@@ -129,6 +133,8 @@ public partial class LiveEditWindow
 
     private void OnLiveAirChanged(LiveAir air) => Dispatcher.BeginInvoke(() =>
     {
+        LogLiveLock(air);
+
         switch (air.State)
         {
             case LiveAirState.CountingDown when _liveTx is null:
@@ -141,6 +147,7 @@ public partial class LiveEditWindow
         }
 
         ShowLive();
+        ShowEdlState();
         Draw();
         DrawOnAir();
     });
@@ -162,13 +169,13 @@ public partial class LiveEditWindow
         _liveRate = line.FrameRate;
         _liveStartedAt = air.RecordingStartedAt ?? PipelineState.Shared.RecordingStartedAt;
 
-        PushCues();
+        PushCues("going live");
 
         LiveAirTransmitter tx;
 
         try
         {
-            tx = new LiveAirTransmitter(air.BoardIndex, air.Ports, line, air.Delay, ffmpeg, () => LiveAir.Shared.Cues,
+            tx = new LiveAirTransmitter(air.BoardIndex, air.Ports, line, air.Delay, ffmpeg, LiveAir.Shared.CuesForAir,
                                         () => LiveAir.Shared.AudioEdits);
         }
         catch (DelayLineException ex)
@@ -258,12 +265,32 @@ public partial class LiveEditWindow
     // ------------------------------------------------------------------ the timeline's EDL
 
     /// <summary>
-    /// Hands the transmitter the timeline as it now stands: every ingest placement and deleted
-    /// scene, in the recording's own frames. Called on every edit, and replaces the list whole.
+    /// The timeline has changed: the ledger is told, so every edit is logged as made, changed or
+    /// removed whether or not anything is live - and while live, playback is sent the whole EDL as
+    /// a new version, as a conform when an edit has reached the no edit zone. Called on every edit,
+    /// undo and redo. <paramref name="why"/> goes into the log.
     /// </summary>
-    private void PushCues()
+    private void PushCues(string why = "timeline changed")
     {
-        if (LiveAir.Shared.State is LiveAirState.Off or LiveAirState.Failed) return;
+        _edl.Sync(EdlEdits(), why);
+        SendEdl(EdlSubmissionKind.Update, why);
+    }
+
+    // ------------------------------------------------------------------ the EDL and its log
+
+    /// <summary>Every edit and every send, from the marks to playback taking it. See <see cref="EdlLedger"/>.</summary>
+    private readonly EdlLedger _edl = new(EdlLogger.Shared);
+
+    /// <summary>
+    /// Sends the EDL as it stands to playback, if Live Edit is live: the cues in the recording's
+    /// own frames, which is the number every frame in the delay carries.
+    /// </summary>
+    private void SendEdl(EdlSubmissionKind kind, string why)
+    {
+        // Only once there is a transmitter to pick it up: armed and waiting for the recorder
+        // there is none, and a revision sent then would be reported unacknowledged. Going live
+        // sends the EDL as the transmitter starts.
+        if (!LiveAir.Shared.Active) return;
 
         _liveStartedAt ??= LiveAir.Shared.RecordingStartedAt ?? PipelineState.Shared.RecordingStartedAt;
 
@@ -278,7 +305,7 @@ public partial class LiveEditWindow
             cues.Add(new LiveCue(
                 overlay.Id,
                 plan.Mode,
-                plan.Mode == IngestMode.Cut ? null : overlay.Path,
+                plan.HasNoMedia ? null : overlay.Path,
                 DayToRecording(plan.StartFrame),
                 ToRecording(plan.Frames),
                 ToRecording(plan.Covers),
@@ -287,12 +314,208 @@ public partial class LiveEditWindow
                 overlay.GainDb));
         }
 
-        LiveAir.Shared.SetCues(cues);
-
-        LiveAir.Shared.SetAudioEdits(_audioEdits
+        List<AudioEdit> levels = _audioEdits
             .Select(e => new AudioEdit(DayToRecording(e.StartFrame), ToRecording(e.Frames), e.GainDb))
-            .ToList());
+            .ToList();
+
+        EdlReceipt receipt = _edl.Send(LiveAir.Shared, kind, cues, levels, ConformZone(), DateTime.UtcNow, why);
+
+        if (!receipt.Taken && receipt.Verdict is not (EdlVerdict.NotLive or EdlVerdict.Stale))
+            Refuse($"PLAYBACK REFUSED THE EDL - version {receipt.Version}: {receipt.Reason} " +
+                   $"Air stays on version {_edl.AcknowledgedVersion}. Undo the change, or edit further ahead.");
+
+        ShowEdlState();
     }
+
+    /// <summary>
+    /// Where air is, and the conform line: everything from air to the line is the no edit zone,
+    /// and an edit whose first frame has reached the line is conformed. Null when nothing is on air.
+    /// </summary>
+    private (long Air, long Line)? ConformZone() =>
+        LiveAir.Shared.State is LiveAirState.OnAir or LiveAirState.Draining && OnAirFrame() is { } air
+            ? (air, air + NoTouchFrames)
+            : null;
+
+    /// <summary>
+    /// Every tick while live: an edit reaching the no edit zone is logged and conformed, and the
+    /// revision in flight is checked for playback's acknowledgement - and sent again, as the latest
+    /// state at a new version, if playback has not picked it up in time.
+    /// </summary>
+    private void FollowEdl()
+    {
+        if (!LiveAir.Shared.Active) return;
+
+        if (ConformZone() is { } zone)
+        {
+            _edl.NoteZone(zone.Air, zone.Line);
+
+            if (_edl.DueForConform(zone.Air, zone.Line).Count > 0)
+                SendEdl(EdlSubmissionKind.Conform, "an edit reached the no edit zone");
+        }
+
+        long acknowledged = _edl.AcknowledgedVersion;
+        bool failing = _edl.Failing;
+
+        if (_edl.Poll(LiveAir.Shared, DateTime.UtcNow))
+            SendEdl(EdlSubmissionKind.Retry, "playback had not acknowledged the last version");
+
+        if (_edl.AcknowledgedVersion == acknowledged && _edl.Failing == failing) return;
+
+        // A conform confirmed changes how its deleted scene is drawn.
+        ShowEdlState();
+        Draw();
+    }
+
+    /// <summary>The operator's way to send the EDL again by hand, once automatic retries have stopped.</summary>
+    private void ResendEdl()
+    {
+        if (!LiveAir.Shared.Active)
+        {
+            Refuse("Nothing is live from Live Edit, so there is no playback to send the EDL to.");
+            return;
+        }
+
+        SendEdl(EdlSubmissionKind.Retry, "resent by the operator");
+    }
+
+    /// <summary>Where the EDL stands with playback, beside the delay.</summary>
+    private void ShowEdlState()
+    {
+        if (!LiveAir.Shared.Active || _edl.Latest is null)
+        {
+            EdlStateText.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        (string text, string brush, string tip) =
+            _edl.Failing
+                ? ($"EDL v{_edl.Pending?.Version} NOT ACKNOWLEDGED", "Bad",
+                   $"Playback has not picked up version {_edl.Pending?.Version}; air is on version {_edl.AcknowledgedVersion}. " +
+                   "Ctrl+Shift+E sends the EDL again.")
+            : _edl.Pending is { } pending
+                ? ($"EDL v{pending.Version} sent", "Warn", $"Waiting for playback to pick up version {pending.Version}.")
+            : ($"EDL v{_edl.AcknowledgedVersion} ✓", "Ok",
+               $"Playback is on version {_edl.AcknowledgedVersion}, the latest. Ctrl+Shift+E sends it again.");
+
+        EdlStateText.Text = text;
+        EdlStateText.Foreground = Brush(brush);
+        EdlStateText.ToolTip = tip;
+        EdlStateText.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>The timeline's edits, as the ledger follows them: what each covers, from which capture files.</summary>
+    private List<EdlEditInfo> EdlEdits()
+    {
+        List<IngestItem> items = IngestItems();
+        var edits = new List<EdlEditInfo>();
+
+        foreach (Overlay overlay in _overlays)
+        {
+            if (overlay.Plan is not { } plan) continue;
+
+            (long from, long to) = RulerSpan(overlay, items);
+
+            EdlSelection selection = plan.Mode switch
+            {
+                IngestMode.Blank => SelectionOf(from, to, items),
+
+                // A cut takes no time on the ruler; what it covers is the recording it removes.
+                IngestMode.Cut => SelectionOf(from, from + plan.Covers, items),
+
+                _ => new EdlSelection(from, to, _rate,
+                                      new[] { new EdlSourceRange(overlay.Path, 0, Math.Max(0, plan.Frames - 1), from, to - 1) },
+                                      plan.HasAudio ? $"the item's own sound at {overlay.GainDb:+0.0;-0.0;0.0} dB" : "no sound of its own"),
+            };
+
+            edits.Add(new EdlEditInfo(overlay.Id, plan.Mode, selection, overlay.Path, $"{plan}|{overlay.GainDb}"));
+        }
+
+        return edits;
+    }
+
+    /// <summary>
+    /// A range of the ruler, <c>[from, to)</c>, with the capture files it falls in - every file it
+    /// touches when it crosses a segment boundary, and exactly which of their frames.
+    /// </summary>
+    private EdlSelection SelectionOf(long from, long to, List<IngestItem>? items = null)
+    {
+        items ??= IngestItems();
+
+        long first = IngestTimeline.At(from, items).CapturedFrame;
+        long last = to > from ? IngestTimeline.At(to - 1, items).CapturedFrame : first - 1;
+
+        IReadOnlyList<EdlSourceRange> sources = EdlSources.Resolve(first, last,
+            _placed.Select(p => new EdlSegment(p.Clip.Path, p.StartFrame, p.Frames)));
+
+        // The sound that goes with it: every track the files carry, which a deleted scene silences.
+        var tracks = _placed
+            .Where(p => sources.Any(s => s.File == p.Clip.Path))
+            .SelectMany(p => p.Clip.Info?.Audio ?? Array.Empty<MediaAudioStream>())
+            .Select(a => $"{a.Label} ({a.Channels} ch {a.Codec})")
+            .Distinct()
+            .ToList();
+
+        string audio = tracks.Count > 0
+            ? $"{tracks.Count} recording track(s): {string.Join(", ", tracks)}"
+            : "the recording's sound (tracks not read)";
+
+        return new EdlSelection(from, to, _rate, sources, audio);
+    }
+
+    /// <summary>Logs a mark, with the frames and files of the range when both marks are down.</summary>
+    private void LogMark(bool inPoint, bool cleared)
+    {
+        EdlSelection? range = _markIn is { } a && _markOut is { } b && b > a ? SelectionOf(a, b) : null;
+        long at = inPoint ? _markIn ?? _at : _markOut ?? _at;
+
+        string? file = _placed.FirstOrDefault(p => p.Holds(IngestTimeline.At(at, IngestItems()).CapturedFrame))?.Clip.Path;
+
+        EdlLogEntry entry = new EdlLogEntry
+        {
+            Action = inPoint ? EdlAction.MarkIn : EdlAction.MarkOut,
+            Rate = _rate,
+            MarkIn = _markIn is { } i ? Stamp(i) : null,
+            MarkOut = _markOut is { } o ? Stamp(o) : null,
+            StartFrame = _markIn,
+            SourceFiles = file is null ? Array.Empty<string>() : new[] { file },
+            Message = cleared
+                ? $"mark {(inPoint ? "in" : "out")} cleared at {Stamp(_at)}."
+                : $"mark {(inPoint ? "in" : "out")} at {Stamp(at)} (frame {at:N0})" +
+                  (range is { } r ? $"; the range is {r.DurationFrames:N0} frames ({r.DurationSeconds:0.###} s)" +
+                                    (r.SpansFiles ? $" across {r.SourceFiles.Count} capture files" : "") : "") + ".",
+        }.With(range);
+
+        EdlLogger.Shared.Write(entry);
+    }
+
+    /// <summary>The locks, as every EDL log line records them.</summary>
+    private static string LockState()
+    {
+        LiveAir air = LiveAir.Shared;
+
+        string live = air.State == LiveAirState.Off
+            ? "live edit: off"
+            : $"live edit: {air.State.ToString().ToLowerInvariant()}, delay {TidalLock.Describe(air.Delay)}, " +
+              $"holding {air.DelayFrames:N0} frames, EDL v{air.AppliedVersion}";
+
+        return $"{live}; tidal lock: {TidalLock.Shared.State.ToString().ToLowerInvariant()}";
+    }
+
+    private void OnTidalLockChanged(TidalLock _) => Dispatcher.BeginInvoke(() =>
+        EdlLogger.Shared.Write(new EdlLogEntry
+        {
+            Action = EdlAction.LockChanged,
+            Message = $"tidal lock is {TidalLock.Shared.State.ToString().ToLowerInvariant()}.",
+        }));
+
+    private void LogLiveLock(LiveAir air) =>
+        EdlLogger.Shared.Write(new EdlLogEntry
+        {
+            Action = EdlAction.LockChanged,
+            UpdatedVersion = air.AppliedVersion > 0 ? air.AppliedVersion : null,
+            Message = $"Live Edit's transmission is {air.State.ToString().ToLowerInvariant()}" +
+                      (air.Detail.Length > 0 ? $": {air.Detail}" : "."),
+        });
 
     /// <summary>Frames at this ruler's rate, as frames of the recording on air.</summary>
     private long ToRecording(long frames) =>
@@ -506,88 +729,120 @@ public partial class LiveEditWindow
     private void DeleteScene_Click(object sender, RoutedEventArgs e) => DeleteScene();
 
     /// <summary>
-    /// Takes the marked range out of what goes to air: the transmitter skips straight over it,
-    /// and the delay shrinks by its length.
+    /// Deletes the marked range from air - as black picture and silence for exactly its length,
+    /// not by taking it out. Nothing is removed: the captured files are untouched, the timeline
+    /// keeps its length, nothing after the range moves, and the delay stays as it is. What changes
+    /// is the EDL, which from here tells playback not to play those frames.
+    ///
+    /// <b>Changing a deleted scene.</b> With one selected - or with marks that overlap one - Delete
+    /// changes that scene to the marked range instead of making another. That is how a deletion is
+    /// lengthened or shortened, including after its first frame has been conformed: whatever has
+    /// not reached the conform line can still move. Shortening one plays the original frames it
+    /// gives back.
     /// </summary>
     private void DeleteScene()
     {
         if (_markIn is not { } from || _markOut is not { } to || to <= from) return;
 
-        if (!Editable(from))
+        List<IngestItem> items = IngestItems();
+
+        // The deleted scene this changes, if it is a change: the one selected, if the marks reach
+        // it, or else the only one the marks overlap.
+        List<Overlay> overlapped = _overlays
+            .Where(o => o.IsBlank && RulerSpan(o, items) is var span && span.From <= to && span.To >= from)
+            .ToList();
+
+        Overlay? target = _selected is { IsBlank: true } chosen && overlapped.Contains(chosen)
+            ? chosen
+            : overlapped.Count == 1 ? overlapped[0] : null;
+
+        if (target is null && overlapped.Count > 1)
         {
-            Refuse("NO EDIT ZONE - a scene can only be deleted ahead of the next ten seconds of air.");
+            Refuse("The marked range runs over more than one deleted scene. Select the one to change, or mark a range that reaches only one.");
             return;
         }
 
-        List<IngestItem> items = IngestItems();
-
-        // Over an ingest item there is no recording to take out - and taking out the recording
-        // under one would leave it nowhere to sit.
-        if (_overlays.Any(o => o.Plan is { Mode: not IngestMode.Cut } plan &&
-                               IngestTimeline.RulerStart(new IngestItem(o.Path, plan), items) is var at &&
-                               at < to && at + o.Frames > from))
+        if (overlapped.Any(o => o != target && RulerSpan(o, items) is var span && span.From < to && span.To > from))
         {
-            Refuse("The marked range runs into an ingest item. Delete the scene either side of it.");
+            Refuse("The marked range runs into another deleted scene. Change that one, or mark around it.");
+            return;
+        }
+
+        // Over an ingest item the picture is already the item's, and under an insert or a cut the
+        // ruler is not the recording - so a deleted scene sits on the recording alone.
+        if (_overlays.Any(o => o.Plan is { Mode: not IngestMode.Blank } plan &&
+                               RulerSpan(o, items) is var span &&
+                               (plan.Mode == IngestMode.Cut ? span.From > from && span.From < to : span.From < to && span.To > from)))
+        {
+            Refuse("The marked range runs into an ingest item or a scene cut. Delete the scene either side of it.");
             return;
         }
 
         long capturedFrom = IngestTimeline.At(from, items).CapturedFrame;
-        long capturedTo = IngestTimeline.At(to, items).CapturedFrame;
 
-        if (!IngestPlacement.TryPlanCut(capturedFrom, capturedTo, out IngestPlan plan, out string? problem))
+        if (!IngestPlacement.TryPlanBlank(capturedFrom, capturedFrom + (to - from), out IngestPlan plan, out string? problem))
         {
             Refuse(problem!);
             return;
         }
 
-        // The transmitter skips through the delay buffer to the far side, so the far side has to
-        // be in it: a scene longer than the delay would be a jump to frames not recorded yet.
-        if (DelayCounterFrames() is { } delay && plan.Covers > delay - _rate)
+        if (target is { Plan: { } before })
         {
-            Refuse($"That scene is {new Timecode(plan.Covers, _rate)} long and the delay is {new Timecode(delay, _rate)}. " +
-                   "A deleted scene has to be shorter than the delay.");
-            return;
+            if (Equals(before, plan)) return;
+
+            // Only what changes has to be ahead of the line. A scene whose start has been
+            // conformed can still be lengthened or shortened while its end has not reached it.
+            if (EdlDiff.EarliestChange(before, plan) is { } changed &&
+                IngestTimeline.RulerFrameOf(changed, items) is var changedAt && !Editable(changedAt))
+            {
+                Refuse($"NO EDIT ZONE - that change would alter air at {Stamp(changedAt)}, which has gone out or is about to. " +
+                       "A deleted scene can be changed only where air has not reached the conform line.");
+                return;
+            }
+
+            Remember($"changing the deleted scene at {Stamp(RulerSpan(target, items).From)}");
+
+            target.StartFrame = plan.StartFrame;
+            target.Plan = plan;
+        }
+        else
+        {
+            if (!Editable(from))
+            {
+                Refuse("NO EDIT ZONE - a scene can only be deleted ahead of the next ten seconds of air.");
+                return;
+            }
+
+            target = new Overlay
+            {
+                Path = "",
+                StartFrame = plan.StartFrame,
+                Plan = plan,
+            };
+
+            Remember($"deleting the scene at {Stamp(from)}");
+
+            _overlays.Add(target);
         }
 
-        var cut = new Overlay
-        {
-            Path = "",
-            StartFrame = plan.StartFrame,
-            Frames = 0,
-            Plan = plan,
-        };
-
-        Remember($"deleting the scene at {Stamp(from)}");
-
-        _overlays.Add(cut);
-        _selected = cut;
+        _selected = target;
         _selectedSound = false;
         _audioPiece = null;
         _markIn = _markOut = null;
 
-        // What it does to the delay, and when: air reaches the scene, skips it, and is that much
-        // closer behind the recorder from then on.
-        string effect = "";
-
-        if (LiveAir.Shared.Active && HeldDelayFrames() is { } heldNow && OnAirFrame() is { } air)
-        {
-            long changeAt = IngestTimeline.RulerStart(new IngestItem(cut.Path, plan), IngestItems());
-            long after = Math.Max(0, heldNow + PendingDelayChange());
-            var wait = TimeSpan.FromSeconds(Math.Max(0, changeAt - air) / (double)_rate);
-
-            effect = $"; the delay goes from {new Timecode(heldNow, _rate)} to {new Timecode(after, _rate)} " +
-                     $"when air reaches it, in {FormatWait(wait)} (about {DateTime.Now + wait:HH:mm:ss})";
-        }
-
-        ActivityLog.Shared.Ok(LogSource.LiveEdit,
-            $"EDL  scene deleted at {Stamp(from)} - {IngestPlacement.Describe(plan, _rate)}{effect}.",
-            @event: "liveedit.scenedeleted", correlation: cut.Id);
-
-        PushCues();
+        PushCues(overlapped.Contains(target) ? "deleted scene changed" : "scene deleted");
+        FollowAudioLevel(force: true);
         Draw();
         DrawOnAir();
         ShowPosition();
         ShowLayer();
+    }
+
+    /// <summary>Where a placement sits on the ruler, start included and end not.</summary>
+    private static (long From, long To) RulerSpan(Overlay overlay, List<IngestItem> items)
+    {
+        long at = IngestTimeline.RulerStart(new IngestItem(overlay.Path, overlay.Plan!.Value), items);
+        return (at, at + overlay.Frames);
     }
 
     /// <summary>
@@ -669,9 +924,14 @@ public partial class LiveEditWindow
 
                 string @in = onAir is { } a && x.At >= a ? new Timecode(x.At - a, _rate).ToString() : "-";
 
-                string what = plan.Mode == IngestMode.Cut
-                    ? "scene deleted"
-                    : $"{x.Overlay.Name}  ({plan.Mode.ToString().ToLowerInvariant()})";
+                string what = plan.Mode switch
+                {
+                    IngestMode.Cut => "scene cut",
+                    IngestMode.Blank => _edl.Edit(x.Overlay.Id) is { ConformedVersion: { } v }
+                        ? $"scene deleted - black and silence (conformed, EDL v{v})"
+                        : "scene deleted - black and silence",
+                    _ => $"{x.Overlay.Name}  ({plan.Mode.ToString().ToLowerInvariant()})",
+                };
 
                 long length = plan.Mode == IngestMode.Cut ? plan.Covers : plan.Frames;
 

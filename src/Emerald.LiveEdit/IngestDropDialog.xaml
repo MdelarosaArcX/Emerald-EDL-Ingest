@@ -14,6 +14,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <TextBlock Grid.Row="0" Text="PLACE INGEST MEDIA" Foreground="{StaticResource Ok}"
@@ -73,9 +74,29 @@
             </RadioButton>
         </StackPanel>
 
+        <!-- Where on the timeline it starts. Filled in with where it was dropped, because a drop
+             with the pointer is rarely frame accurate and the operator usually has a timecode in
+             mind. The two range modes start at mark in, so for them it shows that and is locked. -->
+        <StackPanel Grid.Row="3" Margin="0,16,0,0">
+            <TextBlock Text="PLACE AT" Foreground="{StaticResource Muted}" FontSize="10.5"
+                       FontWeight="Bold"/>
+            <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                <TextBox x:Name="StartBox" Width="130" Height="28" FontSize="12.5" Padding="9,0"
+                         FontFamily="Consolas" VerticalContentAlignment="Center"
+                         TextChanged="Start_Changed"
+                         ToolTip="Timeline timecode HH:MM:SS:FF, or a frame number. Frames are exact."/>
+                <Button x:Name="DropPointButton" Content="Drop point" Margin="8,0,0,0"
+                        Style="{StaticResource GhostButton}" Height="28" Padding="10,0"
+                        Click="DropPoint_Click"
+                        ToolTip="Put the timecode back to where the file was dropped"/>
+                <TextBlock x:Name="StartHint" Margin="10,0,0,0" VerticalAlignment="Center"
+                           FontSize="11" Foreground="{StaticResource Muted}"/>
+            </StackPanel>
+        </StackPanel>
+
         <!-- Which of the file's tracks go to air. Separate from the mode because it is a separate
              question: an audio-only insert is still an insert, and grows the delay just the same. -->
-        <StackPanel Grid.Row="3" Margin="0,16,0,0">
+        <StackPanel Grid.Row="4" Margin="0,16,0,0">
             <TextBlock Text="TRACKS" Foreground="{StaticResource Muted}" FontSize="10.5"
                        FontWeight="Bold"/>
             <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
@@ -94,7 +115,7 @@
         <!-- What the chosen option will actually do at this length. Recomputed as the choice
              changes, because "sped up to 1.42x" is the fact that decides it and the option's
              name does not carry it. -->
-        <Border Grid.Row="4" Margin="0,16,0,0" Padding="11,9" CornerRadius="4"
+        <Border Grid.Row="5" Margin="0,16,0,0" Padding="11,9" CornerRadius="4"
                 Background="#1F242D" BorderBrush="{StaticResource Line}" BorderThickness="1">
             <StackPanel>
                 <TextBlock x:Name="EffectText" FontSize="11.5" TextWrapping="Wrap"
@@ -104,7 +125,7 @@
             </StackPanel>
         </Border>
 
-        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right"
+        <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right"
                     Margin="0,16,0,0">
             <Button Content="Cancel" Style="{StaticResource GhostButton}" Width="92"
                     Height="30" IsCancel="True" Click="Cancel_Click"/>

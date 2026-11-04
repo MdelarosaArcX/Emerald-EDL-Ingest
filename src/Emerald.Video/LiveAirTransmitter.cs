@@ -55,8 +55,9 @@ public sealed class LiveAirTransmitter : IDisposable
     private long _target;
 
     /// <param name="cues">
-    /// Read every frame for the current list of cues. Live Edit replaces the list whole on every
-    /// edit, so each read is one consistent schedule.
+    /// Read every frame for the current list of cues: the newest EDL revision taken, whole, so
+    /// each read is one consistent schedule. Reading it is what acknowledges that revision - see
+    /// <see cref="LiveAir.CuesForAir"/> - so this is called from the frame loop and nowhere else.
     /// </param>
     /// <param name="audioEdits">
     /// Read every frame for the levels set on the recording's own sound. Not the cues' media:
@@ -140,6 +141,9 @@ public sealed class LiveAirTransmitter : IDisposable
         var prepared = new Dictionary<string, Task<CueMedia?>>();
         CueMedia? playing = null;
 
+        // The deleted scene going out as black, if one is: only so its start and end are said once each.
+        LiveCue? blanking = null;
+
         // Already the delay behind the recorder, when the line has been filling since before going
         // live: straight on air rather than black while it fills again.
         long readSeq = Math.Max(0, _line.FramesWritten - Interlocked.Read(ref _target));
@@ -182,6 +186,10 @@ public sealed class LiveAirTransmitter : IDisposable
             {
                 long written = _line.FramesWritten;
                 long target = Interlocked.Read(ref _target);
+
+                // The newest EDL, read every pass - while filling and holding as well as on air -
+                // because reading it is what tells Live Edit this transmitter has its version.
+                IReadOnlyList<LiveCue> cues = _cues();
 
                 // ---------------------------------------------------- a cue's media on air
                 if (playing is { } job)
@@ -350,7 +358,6 @@ public sealed class LiveAirTransmitter : IDisposable
                 }
 
                 long recording = into.RecordingFrame;
-                IReadOnlyList<LiveCue> cues = _cues();
 
                 Prepare(recording, lookahead, cues, done, prepared);
 
@@ -407,8 +414,34 @@ public sealed class LiveAirTransmitter : IDisposable
                             $"EDL  {cue.Name} could not be played to air - the recording carried on instead.");
                 }
 
+                // ---------------------------------------------------- a deleted scene
+                // Black and silence in this frame's place, for this frame only - asked again of
+                // the newest EDL every frame, so a deleted scene lengthened or shortened while it
+                // is on air ends exactly where it now ends. The recording frame is used up all
+                // the same, so the delay does not move.
+                LiveCue? blank = LiveCues.BlankAt(recording, cues);
+
+                if (blank?.Id != blanking?.Id)
+                {
+                    if (blanking is { } ended)
+                        Cue(ended, LogLevel.Ok, "done",
+                            $"EDL  deleted scene finished on air - back to the recording at frame {recording:N0}.");
+
+                    if (blank is { } starting)
+                        Cue(starting, LogLevel.Ok, "playing",
+                            $"EDL  deleted scene to air as black and silence at recording frame {recording:N0}, " +
+                            $"through frame {starting.EndFrame - 1:N0} ({new Timecode(starting.EndFrame - recording, _format.FrameRate)}); " +
+                            "the delay is unchanged.");
+
+                    blanking = blank;
+                }
+
                 // ---------------------------------------------------- the recording frame
-                if (!PushWithAudio(output, into))
+                bool pushed = blank is null
+                    ? PushWithAudio(output, into)
+                    : PushBlack(output, black, left, right, fileChannels);
+
+                if (!pushed)
                 {
                     Report(DelayPhase.Failed, $"{Ports} stopped accepting frames.", written);
                     return;
@@ -652,6 +685,20 @@ public sealed class LiveAirTransmitter : IDisposable
         }
 
         return output.PushFrame(frame.Video, _channels);
+    }
+
+    /// <summary>
+    /// A frame of a deleted scene: black picture, and silence on every channel for the same frame's
+    /// worth of samples, so the sound stays exactly as long as the picture. The level starts from
+    /// nothing when the recording comes back, ramped up over its first frame rather than clicking in.
+    /// </summary>
+    private bool PushBlack(ISdiOutput output, byte[] black, short[] left, short[] right, List<short[]> channels)
+    {
+        Array.Clear(left);
+        Array.Clear(right);
+        _gain = 0;
+
+        return output.PushFrame(black, channels);
     }
 
     /// <summary>

@@ -146,8 +146,18 @@ public partial class LiveEditWindow
 
             if (now is null || !Equals(now.Plan, state.Plan) || !now.GainDb.Equals(state.GainDb))
             {
+                // A deleted scene that only changed length changes air from its nearer end, not
+                // from its start - which may already have been conformed.
+                if (now?.Plan is { Mode: IngestMode.Blank } current && plan.Mode == IngestMode.Blank &&
+                    EdlDiff.EarliestChange(plan, current) is { } changed)
+                {
+                    long at = IngestTimeline.RulerFrameOf(changed, items);
+                    earliest = earliest is { } e ? Math.Min(e, at) : at;
+                    continue;
+                }
+
                 Consider(state.Overlay, plan);
-                if (now?.Plan is { } current) Consider(now, current);
+                if (now?.Plan is { } other) Consider(now, other);
             }
         }
 
@@ -183,7 +193,7 @@ public partial class LiveEditWindow
         if (_selected is { } selected && !_overlays.Contains(selected)) _selected = null;
         _audioPiece = null;
 
-        PushCues();
+        PushCues("undo or redo");
         FollowAudioLevel(force: true);
 
         Draw();

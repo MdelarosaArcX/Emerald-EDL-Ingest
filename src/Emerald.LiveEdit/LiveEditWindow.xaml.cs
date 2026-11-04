@@ -449,6 +449,11 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private void FollowTheDate()
     {
+        // Air is followed whatever day was chosen. A ruler that was showing the on-air mark when
+        // the delay carried it past midnight goes with it, even if the operator had gone to that
+        // day by hand - they were looking at air, and air is now on the next day's folder.
+        if (FollowAir()) return;
+
         if (!_followToday) return;
 
         DateTime today = DateTime.Today;
@@ -470,6 +475,54 @@ public partial class LiveEditWindow : Window
         if (_placed.Any(p => p.Pending)) return;
 
         RollOver(today, chase: _chasing, playFrom: null);
+    }
+
+    /// <summary>The day the on-air mark was last seen on this ruler, until it leaves it.</summary>
+    private DateTime? _airWasOn;
+
+    /// <summary>
+    /// Rolls the ruler on when the on-air mark has left it for a later day, and it was on this
+    /// ruler the last time anyone looked. True when it rolled.
+    ///
+    /// Not while something is being played by hand: the end of its last segment carries the
+    /// playing over (see Player_Ended), and the ruler moving out from under it would be worse.
+    /// </summary>
+    private bool FollowAir()
+    {
+        if (OnAirFrame() is not null)
+        {
+            _airWasOn = _day.Date;
+            return false;
+        }
+
+        if (_airWasOn != _day.Date || AirDayPastRuler() is not { } airDay) return false;
+        if (_playing && !_chasing) return false;
+        if (_placed.Any(p => p.Pending)) return false;
+
+        _airWasOn = null;
+
+        // Now on the day air is on, which from here on is the one to follow.
+        _followToday = airDay == DateTime.Today;
+
+        RollOver(airDay, chase: _chasing, playFrom: null);
+        return true;
+    }
+
+    /// <summary>
+    /// The day the on-air mark is on when it is past the end of this ruler - the delay has
+    /// carried it over midnight into the next day's folder - or null when it is not.
+    /// </summary>
+    private DateTime? AirDayPastRuler()
+    {
+        if (PipelineState.Shared.OnAirAt is { } airedAt && airedAt.Date > _day.Date)
+            return airedAt.Date;
+
+        // Live Edit's own transmission: still going, just past the end of this ruler's day.
+        if (LiveAir.Shared.Active && LiveAir.Shared.Position is { RecordingFrame: >= 0 } live &&
+            _liveStartedAt is not null && RecordingToDay(live.RecordingFrame) is var day && day >= _oneDay)
+            return _day.Date.AddDays(day / _oneDay);
+
+        return null;
     }
 
     /// <summary>
@@ -842,6 +895,10 @@ public partial class LiveEditWindow : Window
 
         if (byHand) _followToday = day.Date == DateTime.Today;
 
+        // Where air was seen belongs to the ruler being left. Kept, a day chosen by hand would be
+        // rolled straight off again if air had been on it earlier and has since moved on.
+        if (byHand) _airWasOn = null;
+
         // The bookmarks of the day being left, in case one was typed and not yet written.
         SaveBookmarks();
 
@@ -998,10 +1055,12 @@ public partial class LiveEditWindow : Window
     ///
     /// Audio only laid over the recording is left out: there the recording's picture carries on,
     /// as it does on air, and the item's sound comes from the sound player beside it (see
-    /// FollowIngestSound). Never an insert or a cut, so leaving it out moves nothing on the ruler.
+    /// FollowIngestSound). A deleted scene is left out too: the recording plays on under it, as it
+    /// does on air, and FollowAudioLevel covers the picture and silences it. Neither is ever an
+    /// insert or a cut, so leaving them out moves nothing on the ruler.
     /// </summary>
     private List<IngestItem> PlayedItems() => _overlays
-        .Where(o => o.Plan is not null && !SoundOverRecording(o))
+        .Where(o => o.Plan is not null && !SoundOverRecording(o) && !o.IsBlank)
         .Select(o => new IngestItem(o.Path, o.Plan!.Value))
         .ToList();
 
@@ -1816,6 +1875,7 @@ public partial class LiveEditWindow : Window
         ShowCountdown();
         FollowAudioLevel();
         FollowIngestSound();
+        FollowEdl();
 
         // The segment still being recorded, playing from the delay line: the playhead runs on
         // its own clock, there being no player to read a position from.
@@ -2319,18 +2379,10 @@ public partial class LiveEditWindow : Window
         {
             // Still on air, just not on this ruler any more: the delay has carried the mark past
             // midnight into the new day's folder. Follow it there rather than stop.
-            if (PipelineState.Shared.OnAirAt is { } airedAt && airedAt.Date > _day.Date)
+            if (AirDayPastRuler() is { } airDay)
             {
-                RollOver(airedAt.Date, chase: true, playFrom: null);
-                return;
-            }
-
-            // The same for Live Edit's own transmission: still going, just past the end of this
-            // ruler's day.
-            if (LiveAir.Shared.Active && LiveAir.Shared.Position is { RecordingFrame: >= 0 } live &&
-                _liveStartedAt is not null && RecordingToDay(live.RecordingFrame) >= _oneDay)
-            {
-                RollOver(_day.AddDays(1), chase: true, playFrom: null);
+                _airWasOn = null;
+                RollOver(airDay, chase: true, playFrom: null);
                 return;
             }
 
@@ -2697,7 +2749,13 @@ public partial class LiveEditWindow : Window
     {
         public required string Path { get; init; }
         public required long StartFrame { get; set; }
-        public required long Frames { get; init; }
+
+        /// <summary>
+        /// How long it runs on the ruler: its plan's length - nothing for a cut, the whole marked
+        /// range for a deleted scene. Read from the plan rather than kept beside it, so a deleted
+        /// scene made longer or shorter is one value to change and one for undo to put back.
+        /// </summary>
+        public long Frames => Plan?.Frames ?? 0;
 
         public double GainDb { get; set; }
 
@@ -2710,11 +2768,20 @@ public partial class LiveEditWindow : Window
         /// </summary>
         public string Id { get; } = Guid.NewGuid().ToString("N");
 
-        public string Name => Plan is { Mode: IngestMode.Cut } ? "scene cut" : System.IO.Path.GetFileName(Path);
+        public string Name => Plan switch
+        {
+            { Mode: IngestMode.Cut } => "scene cut",
+            { Mode: IngestMode.Blank } => "deleted scene",
+            _ => System.IO.Path.GetFileName(Path),
+        };
+
         public long EndFrame => StartFrame + Frames;
 
-        /// <summary>Media rather than a scene cut.</summary>
-        public bool IsMedia => Plan is { Mode: not IngestMode.Cut };
+        /// <summary>Media rather than a scene cut or a deleted scene.</summary>
+        public bool IsMedia => Plan is { HasNoMedia: false };
+
+        /// <summary>A deleted scene: black and silence on air in place of the recording.</summary>
+        public bool IsBlank => Plan is { Mode: IngestMode.Blank };
 
         public bool HasVideo => Plan is { HasVideo: true };
         public bool HasAudio => Plan is { HasAudio: true };
@@ -2838,22 +2905,25 @@ public partial class LiveEditWindow : Window
         // it, and only one changes the speed - so there is no sensible default to assume on the
         // operator's behalf. Cancelling places nothing. A file dragged in from Explorer goes the
         // same way: there is no other kind of lane for it to land on.
-        if (!Editable(start))
-        {
-            Refuse("NO EDIT ZONE - ingest media can only be placed ahead of the next ten seconds of air.");
-            return;
-        }
+        //
+        // A drop inside the no edit zone is not refused here: the dialog starts at the drop point
+        // and says why it cannot go there, and the operator can type a timecode that can.
 
-        // In the recording's own frames, which is what a plan is in. On the ruler an insert
-        // earlier on has pushed everything along, so handing the dialog ruler frames placed
-        // the item - and later played it to air - that much late.
+        // The dialog speaks timeline timecode, which is what the operator reads off the ruler,
+        // and plans in the recording's own frames. On the ruler an insert earlier on has pushed
+        // everything along, so planning in ruler frames placed the item - and later played it
+        // to air - that much late.
         List<IngestItem> before = IngestItems();
         long Captured(long ruler) => IngestTimeline.At(ruler, before).CapturedFrame;
 
-        var ask = new IngestDropDialog(path, frames, Captured(start),
-                                       _markIn is { } mIn ? Captured(mIn) : null,
-                                       _markOut is { } mOut ? Captured(mOut) : null, _rate,
-                                       hasVideo, hasAudio)
+        string? RefusedAt(long ruler) =>
+            Editable(ruler)
+                ? null
+                : $"NO EDIT ZONE - {Stamp(ruler)} is in the next ten seconds of air, or before it." +
+                  (EditableFrom is { } from ? $" The earliest it can start is {Stamp(from)}." : "");
+
+        var ask = new IngestDropDialog(path, frames, start, _markIn, _markOut, _rate, _dayFrames,
+                                       Captured, RefusedAt, hasVideo, hasAudio)
         {
             Owner = this,
         };
@@ -2862,11 +2932,9 @@ public partial class LiveEditWindow : Window
 
         IngestPlan plan = ask.Plan;
 
-        // The two modes that take their place from the marks start at mark in, which can be
-        // somewhere other than where the pointer was.
-        long rulerStart = plan.Mode is IngestMode.FitToFill or IngestMode.Replace && _markIn is { } markedIn
-            ? markedIn
-            : start;
+        // Where the operator typed, or mark in for the two modes that take their place from the
+        // marks. Checked again because air has moved on while the dialog was open.
+        long rulerStart = ask.RulerStart;
 
         if (!Editable(rulerStart))
         {
@@ -2884,7 +2952,6 @@ public partial class LiveEditWindow : Window
         {
             Path = path,
             StartFrame = plan.StartFrame,
-            Frames = plan.Frames,
             Plan = plan,
         };
 
@@ -2903,7 +2970,7 @@ public partial class LiveEditWindow : Window
                 : "."),
             @event: "liveedit.ingestplaced", correlation: placed.Id, file: path);
 
-        PushCues();
+        PushCues("ingest media placed");
         Draw();
         DrawOnAir();
         ShowLayer();
@@ -3000,7 +3067,7 @@ public partial class LiveEditWindow : Window
 
         overlay.GainDb = level;
 
-        PushCues();
+        PushCues("ingest level changed");
         FollowAudioLevel(force: true);
         Draw();
         ShowLayer();
@@ -3020,26 +3087,35 @@ public partial class LiveEditWindow : Window
 
         if (!Editable(at))
         {
-            Refuse($"NO EDIT ZONE - {overlay.Name} has gone to air or is about to, so it cannot be deleted.");
+            Refuse(overlay.IsBlank
+                ? "NO EDIT ZONE - the start of that deleted scene has gone to air or been conformed, so it cannot be put " +
+                  "back whole. To give back its end, move Mark Out earlier and press Delete Scene."
+                : $"NO EDIT ZONE - {overlay.Name} has gone to air or is about to, so it cannot be deleted.");
             return;
         }
 
-        Remember(placed.Mode == IngestMode.Cut ? "restoring a deleted scene" : $"removing {overlay.Name}");
+        Remember(placed.HasNoMedia ? "restoring a deleted scene" : $"removing {overlay.Name}");
 
         _overlays.Remove(overlay);
         _selected = null;
         _selectedSound = false;
 
-        ActivityLog.Shared.Info(LogSource.LiveEdit,
-            placed.Mode == IngestMode.Cut
-                ? $"EDL  deleted scene restored - {placed.Covers:N0} frames go back to air; the delay grows by that much."
-                : $"EDL  {overlay.Name} taken off the timeline" +
-                  (placed.Mode == IngestMode.Insert ? $"; the delay shrinks by {new Timecode(placed.Frames, _rate)}." : "."),
-            @event: "liveedit.ingestremoved", correlation: overlay.Id, file: overlay.Path);
+        if (overlay.IsBlank) _markIn = _markOut = null;
 
-        PushCues();
+        // A deleted scene going is logged by the EDL ledger, with the frames it gives back.
+        if (!overlay.IsBlank)
+            ActivityLog.Shared.Info(LogSource.LiveEdit,
+                placed.Mode == IngestMode.Cut
+                    ? $"EDL  deleted scene restored - {placed.Covers:N0} frames go back to air; the delay grows by that much."
+                    : $"EDL  {overlay.Name} taken off the timeline" +
+                      (placed.Mode == IngestMode.Insert ? $"; the delay shrinks by {new Timecode(placed.Frames, _rate)}." : "."),
+                @event: "liveedit.ingestremoved", correlation: overlay.Id, file: overlay.Path);
+
+        PushCues("removed from the timeline");
         Draw();
         DrawOnAir();
+        ShowPosition();
+        FollowAudioLevel(force: true);
         ShowLayer();
     }
 
@@ -3062,6 +3138,22 @@ public partial class LiveEditWindow : Window
         {
             LayerText.Text = $"AUDIO  {overlay.Name}  {overlay.GainDb:+0.0;-0.0;0.0} dB   [ ] level   Del removes the item";
             LayerText.Foreground = Brush("Warn");
+            return;
+        }
+
+        if (overlay.IsBlank)
+        {
+            string standing = _edl.Edit(overlay.Id) switch
+            {
+                { Conform: EdlConformStatus.Conformed, ConformedVersion: { } v } => $"CONFORMED in EDL v{v}",
+                { Conform: EdlConformStatus.Conforming, ConformVersion: { } v } => $"CONFORMING in EDL v{v}",
+                { Conform: EdlConformStatus.Rejected } => "CONFORM REFUSED by playback",
+                _ => "not yet conformed",
+            };
+
+            LayerText.Text = $"DELETED SCENE  {IngestPlacement.Describe(plan, _rate)} - {standing}" +
+                             "   move a mark and press Delete Scene to change it, Del puts it back";
+            LayerText.Foreground = Brush("Bad");
             return;
         }
 
@@ -3226,12 +3318,8 @@ public partial class LiveEditWindow : Window
             }
         }
 
-        ActivityLog.Shared.Info(LogSource.App,
-            cleared
-                ? $"MARK  {(inPoint ? "in" : "out")} cleared at {Stamp(_at)} in Live Edit."
-                : $"MARK  {(inPoint ? "in" : "out")} at {Stamp(_at)} in Live Edit" +
-                  (_loaded is { } l ? $" ({l.Clip.Name})" : "") + ".",
-            @event: "liveedit.mark", file: _loaded?.Clip.Path);
+        // Into the EDL log, with the frames and capture files of the range once both are down.
+        LogMark(inPoint, cleared);
 
         Draw();
         ShowPosition();
@@ -3303,6 +3391,7 @@ public partial class LiveEditWindow : Window
             case Key.Z when Keyboard.Modifiers == ModifierKeys.Control: Undo(); break;
             case Key.Y when Keyboard.Modifiers == ModifierKeys.Control: Redo(); break;
             case Key.Z when Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift): Redo(); break;
+            case Key.E when Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift): ResendEdl(); break;
 
             // Cuts the sound at the playhead, as a razor would.
             case Key.C when Keyboard.Modifiers == ModifierKeys.None: CutAudio(); break;
@@ -3506,6 +3595,18 @@ public partial class LiveEditWindow : Window
             _selected = cut;
             _selectedSound = false;
             _audioPiece = null;
+        }
+        else if (_overlays.FirstOrDefault(o => o.IsBlank && HoldsOnRuler(o, under)) is { } blank)
+        {
+            // A deleted scene is picked up with its marks on it, so changing it is moving a mark
+            // and pressing Delete Scene again - and Del puts the whole of it back.
+            _selected = blank;
+            _selectedSound = false;
+            _audioPiece = null;
+
+            (long from, long to) = RulerSpan(blank, IngestItems());
+            _markIn = from;
+            _markOut = to;
         }
         else if (_selected is { IsMedia: false })
         {
@@ -4003,6 +4104,7 @@ public partial class LiveEditWindow : Window
         DrawMarkCard(width, start, span);
 
         GreyCovered(TrackCanvas, width, start, span, height, sound: false);
+        DrawBlanks(TrackCanvas, width, start, span, height, sound: false);
 
         DrawCuts(width, start, span, height);
         DrawBookmarks(width, start, span, height);
