@@ -59,6 +59,31 @@ public static class RangePlan
     }
 
     /// <summary>
+    /// The parts of a range cut from a recording's masters, which run longer than its proxies.
+    ///
+    /// <paramref name="masters"/> is the recording's masters laid out on the clock by their own
+    /// lengths; one with no frames is still being written. The range is first narrowed to
+    /// <paramref name="coveredFrom"/>..<paramref name="coveredTo"/>, the span the recording's
+    /// proxies cover, so two recordings overlapping on the clock are never cut twice - and the
+    /// range is narrowed rather than the masters, so each part's offset is still from the start of
+    /// its own file.
+    ///
+    /// <paramref name="waitsForOpen"/> is true when the range reaches into the master still being
+    /// written. The parts are then what is ready so far, and an export should wait.
+    /// </summary>
+    public static IReadOnlyList<RangePart> FromMasters(
+        IReadOnlyList<(string Path, long StartFrame, long Frames)> masters,
+        long coveredFrom, long coveredTo, long inFrame, long outFrame, out bool waitsForOpen)
+    {
+        long from = Math.Max(inFrame, coveredFrom);
+        long to = Math.Min(outFrame, coveredTo);
+
+        waitsForOpen = to > from && masters.Any(m => m.Frames <= 0 && m.StartFrame < to);
+
+        return Parts(masters.Where(m => m.Frames > 0).ToList(), from, to);
+    }
+
+    /// <summary>
     /// A name for an exported range that an operator does not have to think about.
     ///
     /// The recording it came from and the timecode it starts at, which together are unique and
@@ -115,7 +140,8 @@ public static class RangeExport
     public static ExportResult Write(string ffmpegPath, string storeRoot, string name,
                                      string metadata, IReadOnlyList<RangePart> parts,
                                      int frameRate, string extension,
-                                     Action<string>? progress = null)
+                                     Action<string>? progress = null,
+                                     CancellationToken cancel = default)
     {
         if (parts.Count == 0) return new ExportResult(false, "", "The range covers no media.");
         if (name.Length == 0) return new ExportResult(false, "", "The export has no name.");
@@ -182,10 +208,23 @@ public static class RangeExport
             if (ffmpeg is null)
                 return new ExportResult(false, "", "ffmpeg could not be started.");
 
-            string complaints = ffmpeg.StandardError.ReadToEnd();
-            ffmpeg.WaitForExit();
+            string complaints;
+
+            // Called off - its window closed, say: the cut is stopped rather than left to run on
+            // with nobody to see it finish, and what it had written is not left as an export.
+            using (cancel.Register(() => Stop(ffmpeg)))
+            {
+                complaints = ffmpeg.StandardError.ReadToEnd();
+                ffmpeg.WaitForExit();
+            }
 
             try { File.Delete(list); } catch (IOException) { }
+
+            if (cancel.IsCancellationRequested)
+            {
+                try { File.Delete(output); } catch (IOException) { }
+                return new ExportResult(false, "", "Called off.");
+            }
 
             if (ffmpeg.ExitCode != 0 || !File.Exists(output))
                 return new ExportResult(false, "",
@@ -211,7 +250,7 @@ public static class RangeExport
             // a convenience on top of it.
             progress?.Invoke("writing the playable preview copy - this is the slow part");
 
-            WritePreview(ffmpegPath, output, frameRate);
+            WritePreview(ffmpegPath, output, frameRate, cancel);
 
             return new ExportResult(true, output, "");
         }
@@ -283,7 +322,7 @@ public static class RangeExport
     /// good export, and saying it failed would send somebody looking for a problem with media
     /// that is fine.
     /// </summary>
-    private static void WritePreview(string ffmpegPath, string exportPath, int frameRate)
+    private static void WritePreview(string ffmpegPath, string exportPath, int frameRate, CancellationToken cancel)
     {
         try
         {
@@ -309,6 +348,10 @@ public static class RangeExport
                          // picture, and 360 lines blown up to fill a viewer is what "very low
                          // quality" looks like.
                          "-c:v", "libx264",
+
+                         // Stated, as on the recording's own proxy: ffmpeg's default follows the
+                         // machine's CPU count, and memory follows the threads.
+                         "-threads", "6",
                          "-preset", "veryfast",
                          "-profile:v", "high",
                          "-crf", "20",
@@ -331,10 +374,23 @@ public static class RangeExport
 
             if (ffmpeg is null) return;
 
-            ffmpeg.StandardError.ReadToEnd();
-            ffmpeg.WaitForExit();
+            using (cancel.Register(() => Stop(ffmpeg)))
+            {
+                ffmpeg.StandardError.ReadToEnd();
+                ffmpeg.WaitForExit();
+            }
+
+            if (cancel.IsCancellationRequested)
+                try { File.Delete(PreviewPathFor(exportPath)); } catch (IOException) { }
         }
         catch (Exception) { }
+    }
+
+    private static void Stop(Process ffmpeg)
+    {
+        try { if (!ffmpeg.HasExited) ffmpeg.Kill(entireProcessTree: true); }
+        catch (InvalidOperationException) { }
+        catch (System.ComponentModel.Win32Exception) { }
     }
 
     /// <summary>Everything already exported, newest first, for the Ingest Media list.</summary>

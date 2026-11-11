@@ -15,4 +15,7 @@
     <ProjectReference Include="..\Emerald.Core\Emerald.Core.csproj" />
     <ProjectReference Include="..\Emerald.Video\Emerald.Video.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Emerald.Video.Tests" />
+  </ItemGroup>
 </Project>

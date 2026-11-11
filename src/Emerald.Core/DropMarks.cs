@@ -91,6 +91,12 @@ public sealed class DropMarks
         lock (_gate) return _marks.Where(m => m.At.Date == day.Date).ToList();
     }
 
+    /// <summary>Whether anything was recorded on one day, without copying what was.</summary>
+    public bool AnyOn(DateTime day)
+    {
+        lock (_gate) return _marks.Any(m => m.At.Date == day.Date);
+    }
+
     /// <summary>Everything recorded, oldest first.</summary>
     public IReadOnlyList<DropMark> All()
     {

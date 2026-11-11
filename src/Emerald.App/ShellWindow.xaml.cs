@@ -186,6 +186,8 @@ public partial class ShellWindow : Window
         };
 
         VideoBitrateCombo.ItemsSource = RecordingProfile.ProxyBitrates;
+        ProxyEncoderCombo.ItemsSource = RecordingProfile.ProxyEncoders;
+        DelayReadyCombo.ItemsSource = DelayReadyChoices;
         AudioBitrateCombo.ItemsSource = RecordingProfile.AudioBitrates;
         SampleRateCombo.ItemsSource = RecordingProfile.SampleRates;
         SegmentCombo.ItemsSource = RecordingProfile.SegmentLengths;
@@ -197,6 +199,7 @@ public partial class ShellWindow : Window
 
         Loaded += ShellWindow_Loaded;
         Closing += ShellWindow_Closing;
+        StateChanged += (_, _) => Volatile.Write(ref _minimised, WindowState == WindowState.Minimized);
     }
 
     // ------------------------------------------------------------------ startup
@@ -494,6 +497,8 @@ public partial class ShellWindow : Window
                              ?? FpsCombo.Items.OfType<FpsOption>().First(o => o.Rate == 25);
 
         Select(VideoBitrateCombo, RecordingProfile.ProxyBitrates, profile.ProxyBitrateKbps);
+        Select(ProxyEncoderCombo, RecordingProfile.ProxyEncoders, profile.GpuProxy);
+        Select(DelayReadyCombo, DelayReadyChoices, _settings.KeepDelayReady);
         Select(AudioBitrateCombo, RecordingProfile.AudioBitrates, profile.AudioBitrateKbps);
         Select(SampleRateCombo, RecordingProfile.SampleRates, profile.AudioSampleRate);
         Select(SegmentCombo, RecordingProfile.SegmentLengths, profile.SegmentSeconds);
@@ -511,7 +516,8 @@ public partial class ShellWindow : Window
         ProxyBitrateKbps: Value(VideoBitrateCombo, RecordingProfile.Default.ProxyBitrateKbps),
         AudioBitrateKbps: Value(AudioBitrateCombo, RecordingProfile.Default.AudioBitrateKbps),
         AudioSampleRate: Value(SampleRateCombo, RecordingProfile.Default.AudioSampleRate),
-        SegmentSeconds: Value(SegmentCombo, RecordingProfile.Default.SegmentSeconds));
+        SegmentSeconds: Value(SegmentCombo, RecordingProfile.Default.SegmentSeconds),
+        GpuProxy: Value(ProxyEncoderCombo, _settings.RecordingGpuProxy));
 
     private static T Value<T>(ComboBox box, T fallback) =>
         box.SelectedItem is RecordingOption<T> option ? option.Value : fallback;
@@ -557,8 +563,9 @@ public partial class ShellWindow : Window
         string proxy = profile.ProxyBitrateKbps > 0 ? $"{profile.ProxyBitrateKbps}k" : "auto";
 
         ProfileNote.Text =
-            $"{RecordingProfile.Label(RecordingProfile.SegmentLengths, profile.SegmentSeconds)} segments, written twice  ·  " +
-            $"low\\ half-size {RecordingProfile.LowRes.VideoLabel} {proxy}  ·  " +
+            $"{RecordingProfile.Label(RecordingProfile.SegmentLengths, profile.SegmentSeconds)} proxy segments, " +
+            $"{RecordingProfile.MasterSegmentSeconds / 60} min master  ·  " +
+            $"low\\ {(profile.GpuProxy ? "on the GPU if installed" : RecordingProfile.LowRes.VideoLabel)} {proxy}  ·  " +
             $"high\\ {RecordingProfile.HighRes.VideoLabel}  ·  " +
             $"{RecordingProfile.AudioLabel} {profile.AudioBitrateKbps}k " +
             $"{RecordingProfile.Label(RecordingProfile.SampleRates, profile.AudioSampleRate)}";
@@ -590,6 +597,9 @@ public partial class ShellWindow : Window
 
         RefreshClips();
     }
+
+    /// <summary>Read on the capture thread, which cannot ask the window itself.</summary>
+    private bool _minimised;
 
     private void RefreshClips()
     {
@@ -1695,6 +1705,10 @@ public partial class ShellWindow : Window
     /// </summary>
     private void OnCapturePreviewFrame(byte[] bgra, int width, int height)
     {
+        // Minimised: two megabytes copied and drawn for every frame, into a window nobody can see.
+        // The picture is back with the first frame after it is restored.
+        if (Volatile.Read(ref _minimised)) return;
+
         if (Interlocked.Exchange(ref _tapInFlight, 1) == 1) return;
 
         // Copied here, on the capture thread, because the recorder reuses its buffers and the
@@ -1807,7 +1821,7 @@ public partial class ShellWindow : Window
                  .OrderByDescending(g => g.Count())
                  .Select(g => $"{g.Count()} {g.Key}"));
 
-        int orphans = clips.Count(c => !c.HasMaster);
+        int orphans = clips.Count(c => c.MasterPath is null && !c.StillBeingWritten);
 
         if (summary.Length == 0 && orphans == 0) return;
 
@@ -1848,6 +1862,30 @@ public partial class ShellWindow : Window
     private const int StorageTicksApart = 20;
 
     private int _storageTicks;
+
+    private static readonly IReadOnlyList<RecordingOption<bool>> DelayReadyChoices = new[]
+    {
+        new RecordingOption<bool>(true, "On (instant air)"),
+        new RecordingOption<bool>(false, "Off (saves RAM)"),
+    };
+
+    /// <summary>
+    /// Whether a recording keeps a delay ring filling before anything is armed. The largest use of
+    /// memory in the application, and for a recording that never goes to air, no use at all.
+    /// </summary>
+    private void DelayReady_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (_loading || DelayReadyCombo.SelectedItem is not RecordingOption<bool> choice) return;
+
+        _settings.KeepDelayReady = choice.Value;
+        _settings.Save();
+
+        ActivityLog.Shared.Info(LogSource.Capture,
+            choice.Value
+                ? "Delay kept ready from the next recording: tidal lock and Go Live go to air as soon as they are armed."
+                : "No delay kept ready from the next recording: tidal lock and Go Live will fill their delay after they are armed.",
+            @event: "delay.readychoice");
+    }
 
     private void StorageLimit_Changed(object sender, SelectionChangedEventArgs e)
     {
@@ -2001,27 +2039,21 @@ public partial class ShellWindow : Window
                     : "unknown length";
 
                 // Name, size and where it is, in the line itself: the operator asked for all
-                // three to be readable without opening the detail. One line for each half,
-                // because they are two files in two folders and either can be the one wanted.
-                string proxyName = Path.GetFileName(segment.ProxyPath);
-                string proxyWhere = Path.GetDirectoryName(segment.ProxyPath) ?? "";
-
-                string master = segment.MasterPath is { } m
-                    ? $"master {Path.GetFileName(m)} {CompletedSegment.Size(segment.MasterBytes)} " +
-                      $"in {Path.GetDirectoryName(m)}"
-                    : "no master";
+                // three to be readable without opening the detail. A proxy and a master are
+                // announced apart, because the master runs five minutes and the proxy less.
+                string what = segment.IsMaster ? "master" : "segment";
+                string kind = segment.IsMaster ? "master" : "proxy";
 
                 ActivityLog.Shared.Ok(LogSource.Capture,
-                    $"SAVED segment {segment.Number} - {length}: " +
-                    $"proxy {proxyName} {CompletedSegment.Size(segment.ProxyBytes)} in {proxyWhere}; " +
-                    $"{master}; {CompletedSegment.Size(segment.TotalBytes)} in all.",
-                    @event: "capture.segment",
+                    $"SAVED {what} {segment.Number} - {length}: " +
+                    $"{kind} {Path.GetFileName(segment.Path)} {CompletedSegment.Size(segment.Bytes)} " +
+                    $"in {Path.GetDirectoryName(segment.Path)}.",
+                    @event: segment.IsMaster ? "capture.master" : "capture.segment",
                     correlation: session,
-                    file: segment.MasterPath ?? segment.ProxyPath,
-                    detail: $"segment {segment.Number}\n" +
+                    file: segment.Path,
+                    detail: $"{what} {segment.Number}\n" +
                             $"duration {segment.Duration?.TotalSeconds:F2} s\n" +
-                            $"proxy {segment.ProxyPath}\nproxy bytes {segment.ProxyBytes}\n" +
-                            $"master {segment.MasterPath ?? "-"}\nmaster bytes {segment.MasterBytes}");
+                            $"{kind} {segment.Path}\n{kind} bytes {segment.Bytes}");
             }
 
         });
@@ -2605,11 +2637,21 @@ public partial class ShellWindow : Window
         // Every module, by name. They are not owned windows — see ShowModule — so nothing
         // else closes them, and the EDL and the playback deck each need the chance to stop
         // playout and save their settings before the process goes.
-        _edl?.Close();
-        _liveEdit?.Close();
-        _ingest?.Close();
-        _playback?.Close();
-        _monitor?.Close();
+        CloseModule(_edl);
+        CloseModule(_liveEdit);
+        CloseModule(_ingest);
+        CloseModule(_playback);
+        CloseModule(_monitor);
+    }
+
+    /// <summary>
+    /// Closes a module that may already be closing. WPF throws if it is, and thrown from here
+    /// that took the whole process down, on 22 and 26 October, with the modules after it unsaved.
+    /// </summary>
+    private static void CloseModule(Window? module)
+    {
+        try { module?.Close(); }
+        catch (InvalidOperationException) { /* already on its way out */ }
     }
 
     private void SaveDeckSettings()

@@ -673,4 +673,24 @@ public sealed class EdlEditingTests
             try { Directory.Delete(folder, true); } catch { }
         }
     }
+
+    [Fact]
+    public void An_edit_let_go_of_after_it_aired_is_no_longer_held_and_is_not_logged_as_taken_off_air()
+    {
+        var log = new EdlLogger();
+        var ledger = new EdlLedger(log);
+        ledger.Sync(new[] { BlankEdit("old", 100, 200), BlankEdit("new", 9000, 9100) }, "test");
+
+        int logged = log.Entries.Count;
+
+        Assert.Equal(1, ledger.Forget(new[] { "old", "never-held" }));
+
+        Assert.Null(ledger.Edit("old"));
+        Assert.NotNull(ledger.Edit("new"));
+        Assert.Equal(logged, log.Entries.Count);
+
+        // And the next sync, which no longer mentions it, does not report it removed either.
+        ledger.Sync(new[] { BlankEdit("new", 9000, 9100) }, "test");
+        Assert.DoesNotContain(log.Entries, e => e.Action == EdlAction.EditDeleted);
+    }
 }

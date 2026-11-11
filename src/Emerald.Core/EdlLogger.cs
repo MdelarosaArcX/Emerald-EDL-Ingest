@@ -131,6 +131,18 @@ public sealed class EdlLogger
     // and a slow disk must not be felt there.
     private Task _writing = Task.CompletedTask;
 
+    /// <summary>
+    /// Appends that may wait on the disk at once. Each holds its whole entry, so a disk that has
+    /// stopped answering would otherwise be an entry kept in memory for every edit made since.
+    /// </summary>
+    public const int PendingLimit = 2000;
+
+    private int _pending;
+    private long _notWritten;
+
+    /// <summary>Entries not written to the file because too many were already waiting. Still in the activity record.</summary>
+    public long NotWritten => Interlocked.Read(ref _notWritten);
+
     public EdlLogger(ActivityLog? activity = null, Func<string?>? folder = null)
     {
         _activity = activity;
@@ -195,6 +207,13 @@ public sealed class EdlLogger
     {
         string path = Path.Combine(folder, $"edl-{at:yyyyMMdd}.jsonl");
 
+        if (Interlocked.Increment(ref _pending) > PendingLimit)
+        {
+            Interlocked.Decrement(ref _pending);
+            Interlocked.Increment(ref _notWritten);
+            return;
+        }
+
         lock (_gate)
         {
             _writing = _writing.ContinueWith(_ =>
@@ -202,6 +221,7 @@ public sealed class EdlLogger
                 try { File.AppendAllText(path, json + Environment.NewLine); }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
+                finally { Interlocked.Decrement(ref _pending); }
             }, TaskScheduler.Default);
         }
     }

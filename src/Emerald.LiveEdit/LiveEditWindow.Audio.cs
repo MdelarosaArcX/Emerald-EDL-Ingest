@@ -42,6 +42,35 @@ public partial class LiveEditWindow
     /// <summary>Waveforms read, by path - asked for every redraw, so kept here rather than checked against the disk.</summary>
     private readonly Dictionary<string, WavePeaks> _waves = new();
 
+    /// <summary>Kept below this without a look; past it, only what the timeline still shows is kept.</summary>
+    private const int WavesBeforeTrim = 1000;
+
+    /// <summary>
+    /// Forgets the waveforms of files not near the view: another day's, another recording's,
+    /// segments the storage limit has deleted, and the parts of today an hour or more either side
+    /// of what is on screen. They were kept for as long as the window was open, some twenty
+    /// megabytes for every day it stayed up; keeping the whole of today still let a day of short
+    /// segments run past the limit. A waveform scrolled back into view is read again.
+    /// </summary>
+    private void TrimWaves()
+    {
+        if (_waves.Count + _waveFailed.Count < WavesBeforeTrim) return;
+
+        long margin = 3600L * _rate;
+        long from = ViewStart - margin, to = ViewStart + ViewSpan + margin;
+
+        var shown = new HashSet<string>(
+            _placed.Where(p => p.EndFrame >= from && p.StartFrame <= to)
+                   .Select(p => p.Clip.Path)
+                   .Concat(_overlays.Select(o => o.Path)),
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (string path in _waves.Keys.Where(path => !shown.Contains(path)).ToList())
+            _waves.Remove(path);
+
+        _waveFailed.RemoveWhere(path => !shown.Contains(path));
+    }
+
     /// <summary>Two ffmpegs at a time: enough to fill a screen quickly, not enough to starve the recorder.</summary>
     private static readonly SemaphoreSlim WaveSlots = new(2);
 
@@ -372,7 +401,7 @@ public partial class LiveEditWindow
                 Fill = BlankFill,
                 Stroke = Brush(chosen ? "Tc" : "Bad"),
                 StrokeThickness = chosen ? 2 : 1,
-                StrokeDashArray = record?.Conform == EdlConformStatus.Conformed ? null : new DoubleCollection { 4, 2 },
+                StrokeDashArray = record?.Conform == EdlConformStatus.Conformed ? null : Dash42,
                 Margin = new Thickness(from, 0, 0, 0),
                 ToolTip = $"Deleted scene: {IngestPlacement.Describe(overlay.Plan!.Value, _rate)}\n" +
                           $"{Stamp(at)} to {Stamp(end)}\n" +
@@ -400,7 +429,7 @@ public partial class LiveEditWindow
                 Text = sound ? "SILENCE" : $"■ DELETED {new Timecode(end - at, _rate)}{state}",
                 Foreground = Brush(chosen ? "Tc" : "Bad"),
                 FontSize = 9.5,
-                FontFamily = new FontFamily("Consolas"),
+                FontFamily = Mono,
                 FontWeight = FontWeights.Bold,
                 IsHitTestVisible = false,
                 MaxWidth = Math.Max(0, to - from - 6),
@@ -550,7 +579,7 @@ public partial class LiveEditWindow
                            (plan.Tracks == IngestTracks.AudioOnly ? "   audio only" : ""),
                     Foreground = Brush(overlay.GainDb == 0 ? "Text" : "Warn"),
                     FontSize = 9.5,
-                    FontFamily = new FontFamily("Consolas"),
+                    FontFamily = Mono,
                     MaxWidth = Math.Max(20, to - from - 8),
                     TextTrimming = TextTrimming.CharacterEllipsis,
                     IsHitTestVisible = false,
@@ -566,7 +595,7 @@ public partial class LiveEditWindow
         {
             Text = "INGEST AUDIO",
             Foreground = Brush("Accent"),
-            FontFamily = new FontFamily("Consolas"),
+            FontFamily = Mono,
             FontSize = 9.5,
             IsHitTestVisible = false,
         };
@@ -595,10 +624,9 @@ public partial class LiveEditWindow
         using (StreamGeometryContext live = wave.Open())
         using (StreamGeometryContext past = aired.Open())
         {
-            foreach (Placed placed in _placed)
+            // Only the run of segments that can be on screen, found by halving.
+            foreach (Placed placed in Visible(_placed, items, start, span, _longestPlaced))
             {
-                if (!OnScreen(placed, items, start, span)) continue;
-
                 foreach (IngestTimeline.Piece piece in IngestTimeline.Split(placed.StartFrame, placed.Frames, items))
                 {
                     if (piece.RulerEnd < start || piece.RulerStart > start + span) continue;
@@ -685,7 +713,7 @@ public partial class LiveEditWindow
                 {
                     Text = edit.Muted ? "DELETED" : Db(edit.GainDb),
                     Foreground = Brush(edit.Muted ? "Bad" : "Warn"),
-                    FontFamily = new FontFamily("Consolas"),
+                    FontFamily = Mono,
                     FontSize = 9,
                     FontWeight = FontWeights.Bold,
                     IsHitTestVisible = false,
@@ -742,7 +770,7 @@ public partial class LiveEditWindow
         {
             Text = "AUDIO",
             Foreground = Brush("Ok"),
-            FontFamily = new FontFamily("Consolas"),
+            FontFamily = Mono,
             FontSize = 9.5,
             IsHitTestVisible = false,
         };
@@ -773,6 +801,9 @@ public partial class LiveEditWindow
 
             _ = Dispatcher.BeginInvoke(() =>
             {
+                // Read after the window closed: nothing to keep it for, or draw it on.
+                if (_closed) return;
+
                 _waveReading.Remove(path);
                 if (peaks is null) _waveFailed.Add(path);
                 else _waves[path] = peaks;

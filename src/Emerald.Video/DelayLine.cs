@@ -1,5 +1,6 @@
 using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Runtime.InteropServices;
 using Emerald.Core;
 
 namespace Emerald.Video;
@@ -71,6 +72,11 @@ public sealed class DelayFrameBuffer
 /// system decide how much stays resident - so a ten-second delay never really touches the
 /// disk while a five-minute one does not exhaust memory.
 ///
+/// <b>Why it trims what it has written.</b> Left to decide, the operating system keeps all of it:
+/// a ready line nothing is reading sat at 41 GB of working set, for frames nobody may ever ask
+/// for. So the writer gives pages back once they are behind everything that could want them
+/// soon. They stay in the file, and usually in the standby list, so a read still finds them.
+///
 /// <b>How it stays safe.</b> There is no lock on the hot path; a four-megabyte copy under a
 /// lock would put the transmitter's cadence at the mercy of the writer. Instead each slot
 /// carries its own sequence number, written last and checked twice by the reader: once
@@ -93,6 +99,15 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private const int OffFlags = 16;        // int
     private const int OffRecordingFrame = 24; // long
     private const int FlagAudioReal = 1;
+
+    // What stays in the working set. Seconds behind the writer, or behind the farthest reader
+    // with the margin added, so a reader never walks into pages trimmed just ahead of it.
+    private const int ResidentSeconds = 10;
+    private const int ReaderMarginSeconds = 2;
+
+    // A reader that has not been heard from for this long no longer holds its pages. Long enough
+    // to ride out a stalled transmitter, short enough that a scrub does not hold them for good.
+    private const long ReaderLapseMs = 2000;
 
     /// <summary>
     /// Four frames of stereo headroom. The SDK returns whatever audio the slot carried, which
@@ -145,8 +160,13 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private long _lastWriteTicks;
     private long _dropped;
     private long _dropSaidAt;
+    private long _trimmedThrough;
+    private long _readerDistance;
+    private long _readerSeenAt;
     private int _refs = 1;
     private int _disposed;
+    private readonly IDisposable _gauge;
+    private readonly IDisposable _heldGauge;
 
     public string Path { get; }
     public int Width { get; }
@@ -163,6 +183,9 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
     /// <summary>Frames the writer had to throw away because the ring could not take them.</summary>
     public long Dropped => Interlocked.Read(ref _dropped);
+
+    /// <summary>Frames before this one have been given back to the operating system. They can still be read.</summary>
+    public long TrimmedThrough => Volatile.Read(ref _trimmedThrough);
 
     /// <summary>Set when a write failed. The line seals itself rather than failing the recording.</summary>
     public string? Fault { get; private set; }
@@ -199,6 +222,14 @@ public sealed class DelayLine : IDelayLine, IDisposable
         _audioCapacity = AudioCapacityFor(format.FrameRate);
 
         _view.SafeMemoryMappedViewHandle.AcquirePointer(ref _base);
+
+        // Mapped, not private: only the part not yet trimmed shows in the working set.
+        long mapped = FileHeaderBytes + slotCount * stride;
+        _gauge = MemoryGauges.Register("Delay", $"ring mapped ({System.IO.Path.GetFileName(path)})", () => mapped);
+
+        // A target rather than a measurement: a reader's cold frames come back in until they are trimmed again.
+        _heldGauge = MemoryGauges.Register("Delay", $"ring held in memory, target ({System.IO.Path.GetFileName(path)})",
+            () => Math.Min(FramesWritten - TrimmedThrough, slotCount) * stride);
 
         // Eight frames of slack between the receiver and the disk - the same depth the
         // recorder allows its encoder, and for the same reason.
@@ -428,12 +459,52 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
             Volatile.Write(ref _lastWriteTicks, System.Diagnostics.Stopwatch.GetTimestamp());
             Volatile.Write(ref _written, seq + 1);
+
+            if ((seq + 1) % Math.Max(1, FrameRate) == 0) TrimBehind(seq + 1);
         }
         catch (Exception ex)
         {
             Fault ??= ex.Message;
             Seal();
         }
+    }
+
+    /// <summary>
+    /// Gives back the pages of frames nothing is about to read. On the writer's thread, once a
+    /// second of frames: a frame took about half a millisecond to trim when measured, so a second's
+    /// worth at 25 fits well inside the writer's eight frames of slack.
+    ///
+    /// The mark follows the target down as well as up. A reader armed far behind faults frames
+    /// back in that were already trimmed, and moving the mark back with it is what lets those
+    /// be trimmed again once the reader has passed them.
+    /// </summary>
+    private unsafe void TrimBehind(long written)
+    {
+        int rate = Math.Max(1, FrameRate);
+        long keep = (long)rate * ResidentSeconds;
+
+        if (Environment.TickCount64 - Volatile.Read(ref _readerSeenAt) <= ReaderLapseMs)
+            keep = Math.Max(keep, Volatile.Read(ref _readerDistance) + (long)rate * ReaderMarginSeconds);
+
+        long target = Math.Max(0, written - keep);
+        long from = Math.Max(Volatile.Read(ref _trimmedThrough), written - SlotCount);
+
+        if (target > from)
+        {
+            long first = from % SlotCount;
+            long count = target - from;
+            long toEnd = Math.Min(count, SlotCount - first);
+
+            // Round the end of the ring, it is two ranges. False with ERROR_NOT_LOCKED is how
+            // VirtualUnlock reports doing this on pages that were never locked, so there is no
+            // result to look at. If it did nothing, the pages stay resident and nothing is lost.
+            VirtualUnlock(_base + FileHeaderBytes + first * _stride, (nuint)(toEnd * _stride));
+
+            if (count > toEnd)
+                VirtualUnlock(_base + FileHeaderBytes, (nuint)((count - toEnd) * _stride));
+        }
+
+        Volatile.Write(ref _trimmedThrough, target);
     }
 
     /// <summary>
@@ -449,7 +520,20 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// </summary>
     public void Offer(CapturedFrame frame)
     {
-        if (_queue is null || _queue.IsAddingCompleted) return;
+        // Inside the try: a line let go of altogether has no queue to ask, and a throw from here
+        // would stop the frame reaching the lines subscribed after this one.
+        try
+        {
+            if (_queue is null || _queue.IsAddingCompleted) return;
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
+        // The queue's claim on the picture, taken before the writer can reach it and given back
+        // on every way out of here that did not hand the frame over.
+        frame.Retain();
 
         try
         {
@@ -459,10 +543,13 @@ public sealed class DelayLine : IDelayLine, IDisposable
                 return;
             }
         }
-        catch (InvalidOperationException)
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
         {
+            frame.Release();
             return;                       // sealed between the check and the add
         }
+
+        frame.Release();
 
         long dropped = Interlocked.Increment(ref _dropped);
 
@@ -486,8 +573,18 @@ public sealed class DelayLine : IDelayLine, IDisposable
         try
         {
             foreach (CapturedFrame frame in _queue!.GetConsumingEnumerable())
-                Write(frame.Video, frame.VideoBytes, frame.Audio, frame.AudioBytes, frame.AudioReal,
-                      frame.Sequence);
+            {
+                // Copied into the ring, and the buffer is then free for a later frame.
+                try
+                {
+                    Write(frame.Video, frame.VideoBytes, frame.Audio, frame.AudioBytes, frame.AudioReal,
+                          frame.Sequence);
+                }
+                finally
+                {
+                    frame.Release();
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -532,6 +629,8 @@ public sealed class DelayLine : IDelayLine, IDisposable
         if (sequence >= written) return DelayReadResult.NotYetWritten;
         if (sequence < written - SlotCount) return DelayReadResult.Lapped;
 
+        NoteReader(written - sequence);
+
         byte* slot = SlotAt(sequence);
 
         if (Volatile.Read(ref *(long*)(slot + OffSequence)) != sequence) return DelayReadResult.Lapped;
@@ -568,6 +667,23 @@ public sealed class DelayLine : IDelayLine, IDisposable
         into.Sequence = sequence;
         into.RecordingFrame = recordingFrame;
         return DelayReadResult.Ok;
+    }
+
+    /// <summary>
+    /// Remembers how far behind the farthest reader is, so its pages are not trimmed from in front
+    /// of it. Several readers share a line at different distances: a nearer one only takes over
+    /// once the farther has gone quiet. No lock, on the transmitter's path; two readers racing here
+    /// can only leave a figure one read out of date, and the margin covers that.
+    /// </summary>
+    private void NoteReader(long distance)
+    {
+        long now = Environment.TickCount64;
+
+        if (distance < Volatile.Read(ref _readerDistance) &&
+            now - Volatile.Read(ref _readerSeenAt) <= ReaderLapseMs) return;
+
+        Volatile.Write(ref _readerDistance, distance);
+        Volatile.Write(ref _readerSeenAt, now);
     }
 
     public DelayFrameBuffer NewBuffer() => new(FrameBytes, _audioCapacity);
@@ -659,6 +775,9 @@ public sealed class DelayLine : IDelayLine, IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
+        _gauge.Dispose();
+        _heldGauge.Dispose();
+
         // Let the writer finish what it has in hand before the mapping goes away underneath it.
         try { _queue?.CompleteAdding(); } catch (ObjectDisposedException) { }
         if (_writer is { IsAlive: true }) _writer.Join(TimeSpan.FromSeconds(5));
@@ -671,7 +790,14 @@ public sealed class DelayLine : IDelayLine, IDisposable
             _base = null;
         }
 
-        _view.Dispose();
+        // The view's handle closed by hand, because disposing the accessor first flushes all of it:
+        // every frame in the ring written to disk, for a file deleted three lines down. Measured at
+        // 37 s and 5.9 GB on the system disk for a ring of 4 GB, and a ready line is ten times that.
+        _view.SafeMemoryMappedViewHandle.Dispose();
+
+        // Which then complains that the handle it wanted to flush is closed.
+        try { _view.Dispose(); } catch (ObjectDisposedException) { }
+
         _mmf.Dispose();
         _file.Dispose();
 
@@ -686,4 +812,8 @@ public sealed class DelayLine : IDelayLine, IDisposable
         delay.TotalMinutes >= 1 && delay.TotalSeconds % 60 == 0
             ? $"{delay.TotalMinutes:F0} min"
             : $"{delay.TotalSeconds:F0} s";
+
+    // On a range that was never locked, this takes the pages out of the working set.
+    [DllImport("kernel32.dll")]
+    private static extern unsafe bool VirtualUnlock(void* address, nuint size);
 }

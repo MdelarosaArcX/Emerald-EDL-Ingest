@@ -120,6 +120,12 @@ public partial class LiveEditWindow
     /// <summary>Every tick: lets the held picture go once the file after it is showing.</summary>
     private void SettleHeld()
     {
+        // The line's recording has ended and nothing here is showing it. This window's claim was
+        // the last thing keeping a ring of tens of gigabytes mapped, and its file on the disk,
+        // until the window closed - with the next recording wanting a ring of its own.
+        if (!_held && HeldView.Visibility != Visibility.Visible && _heldPicture.Line is { IsSealed: true })
+            _heldPicture.Dispose();
+
         if (_held || _heldLeftAt is not { } left) return;
 
         if (_open || DateTime.UtcNow - left > TimeSpan.FromSeconds(3)) HideHeld();

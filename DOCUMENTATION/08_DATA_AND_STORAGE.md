@@ -109,9 +109,10 @@ There is no delete code, so the database grows with history. Removing a finished
 | `recordingStorageLimitGb` | 0 | Rolling store cap, 0 for none |
 | `recordingVideoBitrateKbps` | 0 | Proxy bitrate, 0 leaves it to the encoder |
 | `recordingAudioBitrateKbps`, `recordingAudioSampleRate` | 192, 48000 | Audio |
-| `recordingSegmentSeconds`, `recordingSegmentChosen` | 30, false | Segment length |
+| `recordingSegmentSeconds`, `recordingSegmentChosen` | 30, false | Proxy segment length. The master is always 5 minutes and is not affected. |
+| `recordingGpuProxy` | true | Auto: encode the proxy on an NVIDIA or Intel card if one works, otherwise on the CPU. False is CPU only. |
 | `liveBoardIndex`, `livePorts`, `liveDelaySeconds`, `liveDelayStart`, `liveHeadroomSeconds` | 0, empty, 120, 0, 300 | Last Go Live. `liveDelayStart` is a number: 0 Fixed, 1 FromFirstSegment, 2 WhenFirstSegmentReady. |
-| `keepDelayReady` | true | Keep a ring filling while recording, about 6 GB a minute at 1080p25 |
+| `keepDelayReady` | true | Keep a ring filling while recording, about 6 GB a minute at 1080p25 written to the ring file. About 10 s of it stays in memory unless a reader is further behind. Set from **Delay ready** on the Capture deck, and applies from the next recording. Off means no ring until something is armed, and air is black while the delay fills. |
 | `softwareRendering` | false | WPF software mode |
 | `edlRecordWhileOnAir` | false | EDL records the RX during playout |
 | `monitorApi`, `monitorApiPort` | false, 8787 | Remote monitoring |
@@ -119,8 +120,9 @@ There is no delete code, so the database grows with history. Removing a finished
 | `ingestBoardIndex`, `ingestPort`, `ingestSom`, `ingestDuration`, `ingestDirectory`, `ingestMetadata`, `ingestTimingMode`, `ingestMockMode` | 0, `RX0`, `01:00:00:00`, `00:15:00:00`, empty, empty, `duration`, false | Last ingest form values. `ingestSom` is the timecode stamped into the clip. `ingestDirectory` empty means the default media folder. `ingestTimingMode` is `duration` or `eom`. `ingestMockMode` simulates boards and the recorder. |
 | `tidalLockRingFolder` | empty | Empty means `%LOCALAPPDATA%\Emerald\delay` |
 | `logFolder`, `logRetentionDays` | empty, 14 | Empty means `%APPDATA%\Emerald\logs`. 0 means today only, negative keeps everything. |
+| `memoryDiagnostics` | false | For developers. Writes a memory snapshot to the log folder every 10 s. `EMERALD_MEMORY_LOG=1` does the same without changing settings. |
 
-`recordingVideoBitrateKbps` (0, 1500, 3000, 5000, 8000), `recordingAudioBitrateKbps` (128, 192, 256, 320), `recordingAudioSampleRate` (48000, 44100, 32000) and `recordingSegmentSeconds` (10, 15, 30, 60, 120, 300, 600) accept only those values. Anything else in the file silently falls back to 0, 192, 48000 and 30.
+`recordingVideoBitrateKbps` (0, 1500, 3000, 5000, 8000), `recordingAudioBitrateKbps` (128, 192, 256, 320), `recordingAudioSampleRate` (48000, 44100, 32000) and `recordingSegmentSeconds` (10, 15, 30, 60, 120, 300) accept only those values. Anything else in the file silently falls back to 0, 192, 48000 and 30.
 
 No passwords, keys or tokens are stored in settings.
 
@@ -171,6 +173,7 @@ The store is `captureFolder`, or `MediaLibrary.DefaultFolder` if that is blank. 
 | `%APPDATA%\Emerald\ingest.db-wal`, `ingest.db-shm` | SQLite WAL companions | SQLite | SQLite | Managed by SQLite |
 | `%APPDATA%\Emerald\logs\emerald-*.jsonl` | JSONL, 32 MiB a file | `ActivityLog` | `ActivityLog.ReadDay` | `logRetentionDays`, default 14, at startup only |
 | Same folder, `edl-*.jsonl` | JSONL | `EdlLogger` | External tools | **None** |
+| Same folder, `memory-*.jsonl` | JSONL, one snapshot a line, a few MB a day | `MemoryMonitor`, only when switched on | External tools | **None** |
 | `%APPDATA%\Emerald\bookmarks\yyyy-MM-dd.json` | JSON, not atomic | `BookmarkBook` | `BookmarkBook` | Deleted when the day's book is emptied |
 | `%LOCALAPPDATA%\Emerald\delay\tidal-*.ring` | Memory-mapped, pre-extended | `DelayLine` | Transmitters, `HeldPicture` | Deleted on last release. Orphans swept at startup. |
 | `<store>\low` and `high` segments | MP4, MOV | ffmpeg | `MediaLibrary`, `SegmentWatch` | `StorageWarden`; manual in Live Edit |
@@ -219,10 +222,11 @@ Added audio tracks carry an ffmpeg stream `title`. Exports have a JSON sidecar: 
 
 1. Runs only from the capture deck, every 20 ticks (about 10 s) while the deck is recording. The code also intends a sweep on a limit change (`StorageLimit_Changed`), but that handler never runs because of the `_loading` issue, so a lowered limit takes effect only once a deck recording is running.
 2. Counts every file under `low` and `high`. Exports, snapshots and root files are not counted.
-3. Groups playable files into segments by write time, rounded to the second, within 1 second. It does not group by name.
+3. Groups each recording folder's files by time: each master with the proxies whose start falls inside it, both laid end to end on their own lengths. A proxy with no master is a group of its own. Old flat files without folders are still grouped by write time, rounded to the second, within 1 second.
+   - Picture lengths are read once per file and remembered, so a sweep does not reopen the whole store.
 4. Excludes files younger than 2 minutes.
-5. Deletes oldest first until at or under the limit, always keeping at least 3 eligible segments.
-6. Records each deletion in `pruned.ledger`. A locked file is left for the next sweep.
+5. Deletes oldest first until at or under the limit, always keeping at least 3 eligible groups (15 minutes of a recording in folders).
+6. Records each deletion in `pruned.ledger`, with each file's own length: the master's in `high\<folder>`, the proxy's in `low\<folder>`. A locked file is left for the next sweep.
 
 Folders are never removed, so old recording folders can remain holding only a ledger.
 
@@ -236,7 +240,7 @@ Folders are never removed, so old recording folders can remain holding only a le
 |---|---|
 | Ring files | Last `Release`, or `SweepOrphans` at startup |
 | Old activity logs | Startup |
-| Unreadable clip in Live Edit | `MonitorDelete_Click`, after a Yes/No, removes the file, master, sidecar and preview |
+| Unreadable clip in Live Edit | `MonitorDelete_Click`, after a Yes/No, removes the file, sidecar and preview. The master goes with it only when that master holds nothing but this proxy (recordings cut alike); a 5-minute master shared with other proxies stays for the storage limit. |
 | Empty next-day folders | When a recording stops in the last 10 seconds before midnight |
 
 ## Temporary files

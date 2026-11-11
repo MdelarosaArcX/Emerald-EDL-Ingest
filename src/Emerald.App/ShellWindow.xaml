@@ -821,6 +821,8 @@
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
                                     </Grid.RowDefinitions>
 
                                     <TextBlock Grid.Row="0" Grid.Column="0" Text="Board"
@@ -985,6 +987,24 @@
                                         <TextBlock x:Name="StorageNote" Foreground="{StaticResource IpDim}"
                                                    FontSize="9" Margin="0,3,0,0" TextWrapping="Wrap"/>
                                     </StackPanel>
+
+                                    <TextBlock Grid.Row="14" Grid.Column="0" Text="Proxy&#x0a;encoder"
+                                               Style="{StaticResource IpLabel}" Margin="0,3,8,0"
+                                               VerticalAlignment="Top"/>
+                                    <ComboBox x:Name="ProxyEncoderCombo" Grid.Row="14" Grid.Column="1"
+                                              Style="{StaticResource IpMiniCombo}" Margin="0,3,0,0"
+                                              Width="126" HorizontalAlignment="Left" VerticalAlignment="Top"
+                                              SelectionChanged="Profile_Changed"
+                                              ToolTip="Auto finds an NVIDIA or Intel card at the start of each recording and uses the best encoder that works and that Windows here can play back: HEVC, then H.264. With no usable card the proxy goes on the CPU. The log says which, and why. The DNxHD master is always on the CPU."/>
+
+                                    <TextBlock Grid.Row="15" Grid.Column="0" Text="Delay&#x0a;ready"
+                                               Style="{StaticResource IpLabel}" Margin="0,3,8,0"
+                                               VerticalAlignment="Top"/>
+                                    <ComboBox x:Name="DelayReadyCombo" Grid.Row="15" Grid.Column="1"
+                                              Style="{StaticResource IpMiniCombo}" Margin="0,3,0,0"
+                                              Width="126" HorizontalAlignment="Left" VerticalAlignment="Top"
+                                              SelectionChanged="DelayReady_Changed"
+                                              ToolTip="On keeps the last minutes of the recording in a delay ring, about 6 GB of RAM a minute, so tidal lock and Go Live go to air as soon as they are armed. Off uses none of that until something is armed, but air is black while the delay fills, and Live Edit cannot show the newest frames from the ring until then. Takes effect on the next recording."/>
                                 </Grid>
                             </StackPanel>
                         </Border>

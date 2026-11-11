@@ -103,7 +103,11 @@ Run it from the repository root, in Git Bash or another shell with gawk. It is s
 
 **Encoder arguments.** All in `RecordingProfile.EncoderArguments`. Tests in `tests/Emerald.Video.Tests` assert the argument list, so change them together. To test by hand, reproduce the [command](05_MEDIA_PROCESSING.md#ffmpeg-commands) with a file input.
 
-**Adding an output.** Add a `RecordingOutput` to `RecordingProfile.Outputs`. `MediaLibrary`, `StorageWarden` and `IngestRecorder` assume low and high, and `IngestRecorder` maps `[0]` to proxy and `[1]` to master, so check each.
+**Segment lengths.** The proxy is cut at `RecordingProfile.SegmentSeconds` (the deck's setting) and the master at `RecordingProfile.MasterSegmentSeconds` (300). `SegmentSecondsFor(output)` picks between them. Never assume a proxy and a master with the same number hold the same picture: use `CapturedClip.Masters`, or `StoreIndex.MastersOf(folder)` for a cut.
+
+**Listing the store.** Keep a `StoreIndex` and call `Refresh()` rather than calling `MediaLibrary.List` repeatedly: a refresh reads only new or just-closed files, and returns whether anything changed. `MediaLibrary.List` is a one-shot index, fine for an occasional listing.
+
+**Adding an output.** Add a `RecordingOutput` to `RecordingProfile.Outputs`. `MediaLibrary`, `StoreIndex`, `StorageWarden` and `IngestRecorder` assume low and high, and `IngestRecorder` maps `[0]` to proxy and `[1]` to master, so check each.
 
 **Decoding for air.** `FrameSource` and `AudioSource`. `ReadFrame`'s position is in **samples**.
 
@@ -139,9 +143,33 @@ See [troubleshooting](10_TROUBLESHOOTING.md#hardware-checks), and add:
 | Tests fail on disk space | Set `TEMP` to a drive with room. |
 | Tests fail, ffmpeg not found | Put it on `PATH`. |
 | UI freezes | Look for a synchronous `Stop`, `Join` or ffprobe on the UI thread. |
+| Memory looks high or keeps growing | Turn on the memory record (below) and compare `PrivateBytes` over time. Working set alone mostly shows the delay ring. |
 | Log line missing | `ActivityLog` isn't flushed at exit. Also check `Transient`. |
 
 **Attaching a debugger:** Debug build with `run.bat Debug`, then attach, or set `Emerald.App` as the startup project with arguments `--edl`. Remember a running instance captures later launches.
+
+## Watching memory
+
+`MemoryMonitor` (`src/Emerald.Core/MemoryMonitor.cs`) reports what the process, its ffmpeg children and each module hold.
+
+- **On request:** open the Monitor window's remote page server and fetch `/api/memory`. See [the API](07_API_AND_COMMUNICATION.md).
+- **As a record:** set `"memoryDiagnostics": true` in `settings.json`, or start Emerald with `EMERALD_MEMORY_LOG=1`. A snapshot goes to `memory-yyyyMMdd.jsonl` in the log folder every 10 s. It is off by default.
+- **Adding a figure:** `MemoryGauges.Register("Module", "name", () => value)` returns an `IDisposable`; dispose it when the thing goes away. The function is called from the monitor's thread, so it must be cheap and must not touch UI objects.
+- **Naming a child process:** call `MemoryGauges.NameChild(process.Id, "role")` after `Process.Start`.
+
+What to read in a snapshot:
+
+| Field | Meaning |
+|---|---|
+| `PrivateBytes` | Memory only this process holds. The one to watch for a leak. |
+| `WorkingSetBytes` | Includes mapped ring pages, so it rises to the ring's size and stays. Not a leak. |
+| `ManagedHeapBytes`, `LargeObjectHeapBytes` | The .NET heap. A frame buffer is on the large object heap. |
+| `Gen2Collections`, `GcPauseMsTotal` | Should barely move during a recording now that frame buffers are reused. |
+| `AllocatedBytesPerSecond` | About 99 MB/s before the frame pool; well under 1 MB/s for the recording path after. |
+| `PrivateOutsideManagedHeapBytes` | Native memory: WPF, media players, the SDK. |
+| Gauge `frame buffers released twice (must be 0)` | Anything but 0 is an ownership fault in `FramePool` callers. |
+
+**Frame buffers have an owner count.** A handler of `SdiCapture.Frame` may read the picture until it returns. To queue it, call `frame.Retain()` before handing it on and `frame.Release()` once the other thread has read it, exactly once. See `DelayLine.Offer` and `FramePoolTests`.
 
 ## Testing
 

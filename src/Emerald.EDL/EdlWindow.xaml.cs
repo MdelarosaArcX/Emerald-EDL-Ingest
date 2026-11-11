@@ -1443,7 +1443,7 @@ public partial class EdlWindow : Window
         else
         {
             CaptureFolderHint.Text =
-                $"Recording here while a message is on air, in {_settings.RecordingSegmentSeconds / 60}-minute " +
+                $"Recording here while a message is on air, in {Emerald.Video.RecordingProfile.Label(Emerald.Video.RecordingProfile.SegmentLengths, _settings.RecordingSegmentSeconds)} " +
                 $"files, in a folder per recording. {FreeSpace(folder)}";
             CaptureFolderHint.Foreground = Brush("Muted", "#6B7382");
         }

@@ -108,4 +108,45 @@ public sealed class LiveCuesTests
 
         Assert.Equal(new[] { "soon" }, ready);
     }
+
+    [Fact]
+    public void An_insert_can_fire_only_at_its_frame_or_a_few_past_it()
+    {
+        LiveCue insert = Insert("i", 1000);
+
+        Assert.True(LiveCues.CanStillFire(insert, 900, NoneDone));
+        Assert.True(LiveCues.CanStillFire(insert, 1000 + LiveCues.InsertGrace, NoneDone));
+
+        // Still inside its own length, which is why it is still listed for opening - but it
+        // will never play now, and decoders opened for it are closed.
+        Assert.False(LiveCues.CanStillFire(insert, 1000 + LiveCues.InsertGrace + 1, NoneDone));
+        Assert.Contains(insert, LiveCues.ToPrepare(1000 + LiveCues.InsertGrace + 1, 150, new[] { insert }, NoneDone));
+    }
+
+    [Fact]
+    public void An_overlay_can_fire_until_its_range_has_gone_by()
+    {
+        LiveCue overlay = Overlay("o", 1000, 500);
+
+        Assert.True(LiveCues.CanStillFire(overlay, 1499, NoneDone));
+        Assert.False(LiveCues.CanStillFire(overlay, 1500, NoneDone));
+    }
+
+    [Fact]
+    public void A_cue_that_is_done_cannot_fire_again()
+    {
+        Assert.False(LiveCues.CanStillFire(Overlay("o", 1000), 900, new HashSet<string> { "o" }));
+    }
+
+    [Fact]
+    public void Whatever_is_due_can_still_fire()
+    {
+        // The two rules must agree: a cue the transmitter is about to take must never be one
+        // whose decoders were just closed as unwanted.
+        var cues = new[] { Insert("i", 1000), Overlay("o", 2000, 500) };
+
+        for (long frame = 900; frame < 2600; frame++)
+            if (LiveCues.Due(frame, cues, NoneDone) is { } due)
+                Assert.True(LiveCues.CanStillFire(due, frame, NoneDone), $"{due.Id} at {frame}");
+    }
 }

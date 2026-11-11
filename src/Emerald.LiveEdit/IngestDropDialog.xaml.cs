@@ -29,6 +29,7 @@ public partial class IngestDropDialog : Window
     private readonly long? _markIn, _markOut;
     private readonly int _rate;
     private readonly long _dayFrames;
+    private readonly DateTime _day;
     private readonly Func<long, long> _captured;
     private readonly Func<long, string?> _refused;
     private readonly bool _ready;
@@ -39,10 +40,11 @@ public partial class IngestDropDialog : Window
     /// <param name="dropFrame">The timeline frame the file was dropped at - where it goes unless another is typed.</param>
     /// <param name="markIn">Mark in, in timeline frames.</param>
     /// <param name="markOut">Mark out, in timeline frames.</param>
+    /// <param name="day">The date the timeline's frames count from.</param>
     /// <param name="captured">Turns a timeline frame into the recording's own frame, which is what a plan is in.</param>
     /// <param name="refused">Why nothing may start at a timeline frame, or null when something may.</param>
     public IngestDropDialog(string path, long ingestFrames, long dropFrame,
-                            long? markIn, long? markOut, int rate, long dayFrames,
+                            long? markIn, long? markOut, int rate, long dayFrames, DateTime day,
                             Func<long, long> captured, Func<long, string?> refused,
                             bool hasVideo = true, bool hasAudio = true)
     {
@@ -64,6 +66,7 @@ public partial class IngestDropDialog : Window
         _markOut = markOut;
         _rate = rate;
         _dayFrames = dayFrames;
+        _day = day;
         _captured = captured;
         _refused = refused;
 
@@ -202,6 +205,12 @@ public partial class IngestDropDialog : Window
 
         Plan = plan;
         RulerStart = start;
+
+        // Past midnight the ruler reads the same time twice, so which one this is gets said.
+        long oneDay = 86_400L * _rate;
+
+        if (_dayFrames > oneDay)
+            StartHint.Text += $", {_day.AddDays(start / oneDay):ddd d MMM}";
 
         EffectText.Foreground = (System.Windows.Media.Brush)FindResource("Text");
         EffectText.Text =

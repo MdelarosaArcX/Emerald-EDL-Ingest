@@ -174,4 +174,63 @@ public sealed class RangePlanTests
         Assert.Empty(RangeExport.List(
             System.IO.Path.Combine(System.IO.Path.GetTempPath(), "emerald-no-such-store"), null));
     }
+
+    // Five-minute masters at 25 from the top of the hour, as the recorder cuts them now; the
+    // proxies, thirty seconds each, cover all of it.
+    private static readonly (string, long, long)[] Masters =
+    {
+        ("m1.mov", 0, 7500),
+        ("m2.mov", 7500, 7500),
+        ("m3.mov", 15000, 7500),
+    };
+
+    [Fact]
+    public void A_range_is_cut_from_the_masters_at_their_own_offsets()
+    {
+        // 4:00 to 6:00: the last minute of the first master and the first of the second. Planned
+        // on the proxies' starts this came out of the wrong minutes of each file.
+        var parts = RangePlan.FromMasters(Masters, 0, 22500, 6000, 9000, out bool waits);
+
+        Assert.False(waits);
+        Assert.Equal(new[] { new RangePart("m1.mov", 6000, 1500), new RangePart("m2.mov", 0, 1500) }, parts);
+    }
+
+    [Fact]
+    public void A_range_into_the_master_being_recorded_waits_for_it()
+    {
+        (string, long, long)[] recording =
+        {
+            ("m1.mov", 0, 7500),
+            ("m2.mov", 7500, 0),     // still being written
+        };
+
+        var parts = RangePlan.FromMasters(recording, 0, 9000, 7000, 8000, out bool waits);
+
+        Assert.True(waits);
+        Assert.Equal(new RangePart("m1.mov", 7000, 500), Assert.Single(parts));
+    }
+
+    [Fact]
+    public void A_range_wholly_inside_finished_masters_does_not_wait_for_the_open_one()
+    {
+        (string, long, long)[] recording =
+        {
+            ("m1.mov", 0, 7500),
+            ("m2.mov", 7500, 0),
+        };
+
+        RangePlan.FromMasters(recording, 0, 9000, 1000, 2000, out bool waits);
+
+        Assert.False(waits);
+    }
+
+    [Fact]
+    public void Only_the_span_the_recordings_proxies_cover_is_cut_and_offsets_stay_from_the_file_start()
+    {
+        // The recording's proxies end at 5:20. A range to 6:00 takes the master to 5:20 only, and
+        // the part of the second master still starts at its own frame 0.
+        var parts = RangePlan.FromMasters(Masters, 0, 8000, 7000, 9000, out _);
+
+        Assert.Equal(new[] { new RangePart("m1.mov", 7000, 500), new RangePart("m2.mov", 0, 500) }, parts);
+    }
 }

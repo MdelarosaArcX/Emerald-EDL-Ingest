@@ -78,6 +78,7 @@ sequenceDiagram
 | GET | `/api/state` | 200, JSON |
 | GET | `/api/log?since=&limit=` | 200, JSON. Defaults: since 0, limit 500. |
 | GET | `/api/transmitted` | 200, JSON |
+| GET | `/api/memory` | 200, JSON. For developers: one memory snapshot. |
 | GET | anything else | 404, `no such thing here` |
 | | unparseable request line | 400, `bad request` |
 | other | any | 405, `read-only` |
@@ -140,6 +141,33 @@ HEAD is routed like GET, and it wrongly returns a body too.
 ```
 
 `timecode`, `event`, `id`, `path` and `detail` are omitted when null. `id` is the correlation ID. `file` is always present and is `""` when the line names no file. `lastSeq` is the newest line in the log, not the newest line returned. `Seq` restarts from 1 each time the process starts. Transient lines are included, though they are not in the log file.
+
+### GET /api/memory
+
+One `MemorySnapshot` (`src/Emerald.Core/MemoryMonitor.cs`), taken when asked. Sizes are bytes. It never asks for a garbage collection.
+
+```json
+{
+  "At": "2026-11-06T03:10:00+11:00", "UptimeSeconds": 3120,
+  "WorkingSetBytes": 44249481216, "PrivateBytes": 534773760,
+  "ManagedHeapBytes": 61865984, "ManagedCommittedBytes": 98566144,
+  "Gen0Bytes": 0, "Gen1Bytes": 1048576, "Gen2Bytes": 20971520,
+  "LargeObjectHeapBytes": 37748736, "PinnedHeapBytes": 0, "FragmentedBytes": 2097152,
+  "PrivateOutsideManagedHeapBytes": 436207616,
+  "Gen0Collections": 25, "Gen1Collections": 4, "Gen2Collections": 0,
+  "GcPauseMsTotal": 39.0, "GcPausePercent": 0.0,
+  "AllocatedBytesTotal": 364904448, "AllocatedBytesPerSecond": 209715,
+  "Handles": 1310, "Threads": 37,
+  "Children": [{ "Id": 512, "Name": "ffmpeg", "Role": "capture encoder", "PrivateBytes": 380633088, "WorkingSetBytes": 347078656, "Threads": 37 }],
+  "Gauges": [{ "Module": "Delay", "Name": "ring mapped (tidal-21716-....ring)", "Value": 44132466688, "Unit": "bytes" }]
+}
+```
+
+The values above are an example of the shape, not a measurement.
+
+- `WorkingSetBytes` includes every touched page of a delay ring, which is a mapped file. `PrivateBytes` is the figure to watch for growth.
+- `Children` lists only ffmpeg and ffprobe processes this process started. `Role` is `capture encoder`, `video decoder`, `audio decoder` or `unnamed`.
+- `Gauges` are what modules report about themselves: ring bytes mapped, idle frame buffers, cache entry counts, Live Edit's segments, waveforms and open players. The managed heap itself can't be divided by module without a profiler.
 
 ### GET /api/transmitted
 

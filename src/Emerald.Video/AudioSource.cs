@@ -152,6 +152,8 @@ public sealed class AudioSource : IDisposable
         try { ffmpeg = Process.Start(info); }
         catch (Exception ex) { ffmpeg = null; why = ex.Message; }
 
+        if (ffmpeg is not null) MemoryGauges.NameChild(ffmpeg.Id, "audio decoder");
+
         if (ffmpeg is null)
         {
             // A track that will not decode becomes silence on air. That used to happen without
@@ -258,22 +260,22 @@ public sealed class AudioSource : IDisposable
     // ------------------------------------------------------------------ playout
 
     /// <summary>
-    /// Fills one frame of audio for the video frame sitting at <paramref name="framePosition"/>
+    /// Fills one frame of audio for the video frame sitting at <paramref name="samplePosition"/>
     /// samples from the start, shifted by <paramref name="offsetMs"/>. Positive delays audio
     /// (reads back in time), negative advances it (reads ahead). Anything not yet decoded, or
     /// before the start of the file, comes out as silence rather than stalling picture.
     /// </summary>
-    public void ReadFrame(short[] left, short[] right, long framePosition, int offsetMs)
+    public void ReadFrame(short[] left, short[] right, long samplePosition, int offsetMs)
     {
         Array.Clear(left);
         Array.Clear(right);
 
         long offsetSamples = (long)offsetMs * SampleRate / 1000;
-        long want = framePosition - offsetSamples;
+        long want = samplePosition - offsetSamples;
 
         lock (_gate)
         {
-            _playPosition = framePosition;
+            _playPosition = samplePosition;
             _lastReadEnd = want + left.Length;
 
             long oldest = Math.Max(0, _written - _capacity);
@@ -289,6 +291,14 @@ public sealed class AudioSource : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// The sound that goes with video frame <paramref name="frame"/>, counted from where the source
+    /// was opened. For a caller that counts frames: <see cref="ReadFrame"/> counts samples, and a
+    /// frame number given to it reads the same fraction of a second over and over.
+    /// </summary>
+    public void ReadVideoFrame(short[] left, short[] right, long frame, int offsetMs = 0) =>
+        ReadFrame(left, right, frame * SamplesPerFrame, offsetMs);
 
     /// <summary>
     /// True once the decoder has run out and everything decoded has actually been read.

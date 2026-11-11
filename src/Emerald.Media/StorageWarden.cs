@@ -54,7 +54,8 @@ public static class StorageWarden
     public static readonly TimeSpan TooRecent = TimeSpan.FromMinutes(2);
 
     /// <summary>
-    /// The fewest segment pairs to keep whatever the limit says.
+    /// The fewest segments to keep whatever the limit says. A master and the proxies it holds
+    /// count as one, so for a recording in folders this is fifteen minutes.
     ///
     /// A limit smaller than a single segment would otherwise delete each file as it was
     /// finished and leave the store permanently empty, which is not a rolling window — it is
@@ -127,20 +128,150 @@ public static class StorageWarden
     }
 
     /// <summary>
-    /// Every recording in the store, oldest first, with both halves gathered together.
+    /// Every recording in the store, oldest first, each master gathered with the proxies whose
+    /// time falls inside it.
+    ///
+    /// The master is cut at five minutes and the proxy shorter, so "the two halves" of a segment
+    /// are one master and the several proxies it holds the picture of. Gathered by time - each
+    /// laid end to end on its own lengths, as the timeline lays them - and not by when the files
+    /// were last written, which put a master with whichever single proxy happened to close in the
+    /// same second and left the rest to go on their own, ahead of the master that held them.
+    /// </summary>
+    private static List<Segment> Oldest(string root, DateTime now)
+    {
+        var all = new List<Segment>(Loose(root));
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        string low = RecordingProfile.FolderFor(RecordingProfile.LowRes, root);
+        string high = RecordingProfile.FolderFor(RecordingProfile.HighRes, root);
+
+        foreach (string name in RecordingFolders(low).Union(RecordingFolders(high), StringComparer.OrdinalIgnoreCase))
+        {
+            DateTime rolled = RecordingSequence.FolderStartedAt(name)!.Value;
+
+            List<Piece> proxies = Pieces(Path.Combine(low, name), rolled, seen);
+            List<Piece> masters = Pieces(Path.Combine(high, name), rolled, seen);
+
+            var groups = masters.Select(m =>
+            {
+                var group = new Segment(m.Written);
+                group.Add(m.Path, m.Bytes, m.Written, m.Runs);
+                return (Master: m, Group: group);
+            }).ToList();
+
+            foreach (Piece proxy in proxies)
+            {
+                // The master its start falls in. One straddling a boundary goes with the earlier.
+                int at = groups.FindLastIndex(g => g.Master.Starts <= proxy.Starts);
+
+                if (at >= 0 && (groups[at].Master.Runs is not { } runs || proxy.Starts < groups[at].Master.Starts + runs))
+                {
+                    groups[at].Group.Add(proxy.Path, proxy.Bytes, proxy.Written, proxy.Runs);
+                    continue;
+                }
+
+                // A proxy with no master: recorded without one, or its master already gone.
+                var alone = new Segment(proxy.Written);
+                alone.Add(proxy.Path, proxy.Bytes, proxy.Written, proxy.Runs);
+                all.Add(alone);
+            }
+
+            all.AddRange(groups.Select(g => g.Group));
+        }
+
+        // What was read of files that are gone is no use to anybody.
+        lock (Lengths)
+            foreach (string gone in Lengths.Keys.Where(k => !seen.Contains(k)).ToList())
+                Lengths.Remove(gone);
+
+        return all.Where(s => s.Written + TooRecent < now).OrderBy(s => s.Written).ToList();
+    }
+
+    /// <summary>One file of a recording folder, placed on the clock.</summary>
+    private sealed record Piece(string Path, long Bytes, DateTime Written, DateTime Starts, TimeSpan? Runs);
+
+    /// <summary>
+    /// The picture lengths read so far, so a sweep reads only a file it has not seen. A sweep runs
+    /// every time a segment closes, over a store of tens of thousands of files.
+    /// </summary>
+    private static readonly Dictionary<string, (long Bytes, long Ticks, TimeSpan? Runs)> Lengths =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>A recording folder's files in numbered order, each placed end to end on its own length.</summary>
+    private static List<Piece> Pieces(string directory, DateTime rolled, HashSet<string> seen)
+    {
+        var files = new List<(FileInfo File, TimeSpan? Runs)>();
+
+        try
+        {
+            if (!Directory.Exists(directory)) return new List<Piece>();
+
+            foreach (FileInfo file in new DirectoryInfo(directory).EnumerateFiles())
+            {
+                if (!MediaScanner.IsPlayable(file.Name)) continue;
+
+                seen.Add(file.FullName);
+                files.Add((file, LengthOf(file)));
+            }
+        }
+        catch (IOException) { return new List<Piece>(); }
+        catch (UnauthorizedAccessException) { return new List<Piece>(); }
+
+        files.Sort((a, b) => (RecordingSequence.NumberIn(a.File.Name) ?? 0).CompareTo(RecordingSequence.NumberIn(b.File.Name) ?? 0));
+
+        DateTime[] starts = StoreIndex.LayEndToEnd(
+            files.Select(f => (f.File.FullName, f.Runs ?? TimeSpan.Zero)).ToList(), rolled);
+
+        return files.Select((f, i) => new Piece(f.File.FullName, f.File.Length, f.File.LastWriteTimeUtc, starts[i], f.Runs))
+                    .ToList();
+    }
+
+    private static TimeSpan? LengthOf(FileInfo file)
+    {
+        lock (Lengths)
+            if (Lengths.TryGetValue(file.FullName, out var known) &&
+                known.Bytes == file.Length && known.Ticks == file.LastWriteTimeUtc.Ticks)
+                return known.Runs;
+
+        // The picture's length, as the timeline lays segments end to end by (see MediaInfo.Runs).
+        TimeSpan? runs = MediaCodec.ReadPictureDuration(file.FullName) ?? MediaCodec.ReadDuration(file.FullName);
+        if (runs is { } r && r <= TimeSpan.Zero) runs = null;
+
+        lock (Lengths) Lengths[file.FullName] = (file.Length, file.LastWriteTimeUtc.Ticks, runs);
+        return runs;
+    }
+
+    private static IEnumerable<string> RecordingFolders(string directory)
+    {
+        try
+        {
+            if (!Directory.Exists(directory)) return Array.Empty<string>();
+
+            return Directory.EnumerateDirectories(directory)
+                .Select(Path.GetFileName)
+                .OfType<string>()
+                .Where(n => RecordingSequence.FolderStartedAt(n) is not null)
+                .ToList();
+        }
+        catch (IOException) { return Array.Empty<string>(); }
+        catch (UnauthorizedAccessException) { return Array.Empty<string>(); }
+    }
+
+    /// <summary>
+    /// The old flat files, from before recordings had folders, with both halves gathered together.
     ///
     /// Paired by the timestamp in the name rather than by exact filename, for the same reason
     /// <see cref="MediaLibrary"/> does: ffmpeg stamps each output when that muxer opens it, so
     /// the two halves of one recording routinely differ by a second.
     /// </summary>
-    private static List<Segment> Oldest(string root, DateTime now)
+    private static IEnumerable<Segment> Loose(string root)
     {
         var byTime = new SortedDictionary<DateTime, Segment>();
 
         Gather(RecordingProfile.FolderFor(RecordingProfile.LowRes, root));
         Gather(RecordingProfile.FolderFor(RecordingProfile.HighRes, root));
 
-        return byTime.Values.Where(s => s.Written + TooRecent < now).ToList();
+        return byTime.Values;
 
         void Gather(string folder)
         {
@@ -148,7 +279,7 @@ public static class StorageWarden
             {
                 if (!Directory.Exists(folder)) return;
 
-                foreach (string path in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
+                foreach (string path in Directory.EnumerateFiles(folder, "*", SearchOption.TopDirectoryOnly))
                 {
                     if (!MediaScanner.IsPlayable(path)) continue;
 
@@ -169,7 +300,7 @@ public static class StorageWarden
                         byTime[key] = existing;
                     }
 
-                    existing.Add(path, info.Length, info.LastWriteTimeUtc);
+                    existing.Add(path, info.Length, info.LastWriteTimeUtc, null);
                 }
             }
             catch (IOException) { }
@@ -180,18 +311,18 @@ public static class StorageWarden
             new(when.Ticks - when.Ticks % TimeSpan.TicksPerSecond, when.Kind);
     }
 
-    /// <summary>One recording: its proxy, its master, and what deleting both would free.</summary>
+    /// <summary>One recording: its master, the proxies it holds, and what deleting them would free.</summary>
     private sealed class Segment
     {
-        private readonly List<(string Path, long Bytes)> _files = new();
+        private readonly List<(string Path, long Bytes, TimeSpan? Runs)> _files = new();
 
         public Segment(DateTime written) => Written = written;
 
         public DateTime Written { get; private set; }
 
-        public void Add(string path, long bytes, DateTime written)
+        public void Add(string path, long bytes, DateTime written, TimeSpan? runs)
         {
-            _files.Add((path, bytes));
+            _files.Add((path, bytes, runs));
 
             // A pair is as old as its younger half, not its older one: the master is usually
             // closed a moment after the proxy, and judging the pair on the proxy alone could
@@ -199,25 +330,31 @@ public static class StorageWarden
             if (written > Written) Written = written;
         }
 
-        /// <summary>Deletes both halves and returns what was actually freed.</summary>
+        /// <summary>Deletes every file of it and returns what was actually freed.</summary>
         public long Delete()
         {
             long freed = 0;
 
-            // Read before the files go: once they have, nothing knows how long this segment ran,
-            // and every segment after it would be placed that much too early. The picture's
-            // length, as the timeline lays segments end to end by (see MediaInfo.Runs).
-            TimeSpan? length = _files.Select(f => MediaCodec.ReadPictureDuration(f.Path) ?? MediaCodec.ReadDuration(f.Path))
-                                     .FirstOrDefault(d => d is { } t && t > TimeSpan.Zero);
+            // Oldest first within each folder, so the ledger, which keeps only the last one
+            // deleted, moves forward through them.
+            var files = _files
+                .OrderBy(f => Path.GetDirectoryName(f.Path), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(f => RecordingSequence.NumberIn(Path.GetFileName(f.Path)) ?? 0)
+                .ToList();
 
-            foreach ((string path, long bytes) in _files)
+            foreach ((string path, long bytes, TimeSpan? known) in files)
             {
+                // Read before the file goes: once it has, nothing knows how long it ran, and every
+                // file after it in its folder would be placed that much too early. Each file's own
+                // length - the master's is not the proxy's any more.
+                TimeSpan? length = known ?? MediaCodec.ReadPictureDuration(path) ?? MediaCodec.ReadDuration(path);
+
                 try
                 {
                     File.Delete(path);
                     freed += bytes;
 
-                    if (length is { } ran &&
+                    if (length is { } ran && ran > TimeSpan.Zero &&
                         Path.GetDirectoryName(path) is { } folder &&
                         RecordingSequence.FolderStartedAt(Path.GetFileName(folder)) is not null &&
                         RecordingSequence.NumberIn(Path.GetFileName(path)) is { } number)

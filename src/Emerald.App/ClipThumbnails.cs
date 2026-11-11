@@ -70,7 +70,7 @@ public static class ClipThumbnails
         foreach (string a in new[]
         {
             "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-ss", "1", "-i", clipPath, "-frames:v", "1",
+            "-threads", "2", "-ss", "1", "-i", clipPath, "-frames:v", "1",
             "-vf", $"scale={Width}:-1", destination,
         }) info.ArgumentList.Add(a);
 

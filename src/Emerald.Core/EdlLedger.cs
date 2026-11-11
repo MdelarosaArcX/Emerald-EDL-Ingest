@@ -365,6 +365,13 @@ public sealed class EdlLedger
     /// <summary>Forgets the edits, as when the day changes. Versions carry on, so nothing older can come back.</summary>
     public void Clear(string why) => Sync(Array.Empty<EdlEditInfo>(), why);
 
+    /// <summary>
+    /// Lets go of edits that ended long ago, without logging them as removed: nobody took them off
+    /// air, they simply finished. Live Edit lets go of an edit a day after it ended, so what it
+    /// holds stops growing for as long as the window is open. Returns how many were held.
+    /// </summary>
+    public int Forget(IEnumerable<string> editIds) => editIds.Count(id => _edits.Remove(id));
+
     // ------------------------------------------------------------------ the pieces
 
     private EdlRevision Issue(IEdlPlayback playback, EdlSubmissionKind kind,

@@ -21,8 +21,11 @@ public sealed class SegmentLengthReachesFfmpegTests
         RecordingAudioSampleRate = 48000,
     });
 
-    /// <summary>The value given to ffmpeg's -segment_time, read off the command itself.</summary>
-    private static string SegmentTimeArgument(RecordingProfile profile)
+    /// <summary>The proxy's -segment_time, read off the command itself. The proxy is the first output.</summary>
+    private static string SegmentTimeArgument(RecordingProfile profile) => SegmentTimes(profile)[0];
+
+    /// <summary>Every -segment_time on the command, in output order: proxy, then master.</summary>
+    private static List<string> SegmentTimes(RecordingProfile profile)
     {
         List<string> args = profile.EncoderArguments(
             new CaptureFormat("1080i50", 1920, 1080, 25),
@@ -32,11 +35,15 @@ public sealed class SegmentLengthReachesFfmpegTests
             inputSampleRate: 48000,
             names: RecordingSequence.Next(new DateTime(2026, 10, 8, 9, 0, 0), "media")).ToList();
 
-        int at = args.IndexOf("-segment_time");
+        List<string> found = args
+            .Select((a, i) => (a, i))
+            .Where(p => p.a == "-segment_time" && p.i + 1 < args.Count)
+            .Select(p => args[p.i + 1])
+            .ToList();
 
-        Assert.True(at >= 0 && at + 1 < args.Count, "the command has no -segment_time");
+        Assert.True(found.Count == 2, $"expected a -segment_time for each output, found {found.Count}");
 
-        return args[at + 1];
+        return found;
     }
 
     [Fact]
@@ -80,5 +87,33 @@ public sealed class SegmentLengthReachesFfmpegTests
         Assert.Equal("30", SegmentTimeArgument(For(7)));
         Assert.Equal("30", SegmentTimeArgument(For(0)));
         Assert.Equal("30", SegmentTimeArgument(For(-1)));
+    }
+
+    [Theory]
+    [InlineData(10)]
+    [InlineData(30)]
+    [InlineData(120)]
+    [InlineData(300)]
+    public void The_master_is_cut_at_five_minutes_whatever_the_proxy_is_set_to(int proxy)
+    {
+        List<string> times = SegmentTimes(For(proxy));
+
+        Assert.Equal(proxy.ToString(), times[0]);
+        Assert.Equal("300", times[1]);
+    }
+
+    [Fact]
+    public void No_proxy_length_on_offer_is_longer_than_a_master()
+    {
+        // A proxy longer than a master would straddle several of them, and the export and the
+        // storage limit both count on it lying inside at most two.
+        Assert.All(RecordingProfile.SegmentLengths,
+                   o => Assert.InRange(o.Value, 1, RecordingProfile.MasterSegmentSeconds));
+    }
+
+    [Fact]
+    public void A_saved_ten_minute_proxy_falls_back_rather_than_outrunning_the_master()
+    {
+        Assert.Equal("30", SegmentTimeArgument(For(600)));
     }
 }

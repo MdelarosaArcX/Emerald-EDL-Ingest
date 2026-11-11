@@ -485,4 +485,28 @@ public sealed class IngestTimelineTests
     {
         Assert.Equal((0L, long.MaxValue), IngestTimeline.RunAround(5000, None));
     }
+
+    [Fact]
+    public void A_list_handed_over_already_in_order_gives_the_answers_an_unordered_one_does()
+    {
+        // The timeline walks an ordered list as it is rather than sorting it again; the answers
+        // must be the same as for the same items in any order.
+        IngestItem[] ordered =
+        {
+            Item(IngestMode.Insert, ingest: 250, drop: 1000, path: "a.mov"),
+            Item(IngestMode.Overlay, ingest: 500, drop: 3000, path: "b.mov"),
+            Item(IngestMode.Insert, ingest: 100, drop: 6000, path: "c.mov"),
+        };
+
+        IngestItem[] shuffled = { ordered[2], ordered[0], ordered[1] };
+
+        for (long frame = 0; frame < 8000; frame += 37)
+        {
+            Assert.Equal(IngestTimeline.At(frame, shuffled), IngestTimeline.At(frame, ordered));
+            Assert.Equal(IngestTimeline.RulerFrameOf(frame, shuffled), IngestTimeline.RulerFrameOf(frame, ordered));
+        }
+
+        foreach (IngestItem item in ordered)
+            Assert.Equal(IngestTimeline.RulerStart(item, shuffled), IngestTimeline.RulerStart(item, ordered));
+    }
 }

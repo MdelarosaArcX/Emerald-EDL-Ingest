@@ -146,6 +146,85 @@ public sealed class FramePickTests
         Refuse("25:00:00");
     }
 
+    // A recording that ran on to half past one the next morning.
+    private const long TwoDayRuler = Day + 90_000 + 45_000;
+
+    private static long PickLong(string text, long from)
+    {
+        Assert.True(FramePick.TryParse(text, Rate, TwoDayRuler, from, out long frame, out string? error),
+                    error);
+        return frame;
+    }
+
+    [Fact]
+    public void Past_midnight_a_time_means_the_one_on_the_ruler_nearest_the_playhead()
+    {
+        long tenPast = 10 * 1500;
+
+        // Dropped at five past midnight, the next morning.
+        Assert.Equal(Day + tenPast, PickLong("00:10:00:00", from: Day + 7500));
+
+        // Dropped just before midnight, about something ten minutes on.
+        Assert.Equal(Day + tenPast, PickLong("00:10:00:00", from: Day - 1500));
+
+        // And it still reaches back over midnight.
+        Assert.Equal(Day - 1500, PickLong("23:59:00:00", from: Day + 7500));
+
+        // The same time from the start of the ruler is the first one.
+        Assert.Equal(tenPast, PickLong("00:10:00:00", from: 0));
+    }
+
+    [Fact]
+    public void The_time_the_ruler_shows_at_a_frame_past_midnight_comes_back_as_that_frame()
+    {
+        // What the PLACE AT and go-to boxes are filled in with: the time of day, wrapped.
+        foreach (long frame in new[] { Day, Day + 1, Day + 7512, TwoDayRuler - 1, Day - 1, 0L, 45_000L })
+        {
+            string shown = new Timecode(frame % Day, Rate).ToString();
+
+            Assert.Equal(frame, PickLong(shown, from: frame));
+        }
+    }
+
+    [Fact]
+    public void A_time_with_no_frames_past_midnight_is_on_the_same_day_as_the_playhead()
+    {
+        Assert.Equal(Day + 10 * 1500, PickLong("00:10:00", from: Day + 7500));
+    }
+
+    [Fact]
+    public void Minutes_and_seconds_alone_work_past_midnight()
+    {
+        // Refused before, because the hour the playhead is in reads 24.
+        Assert.Equal(Day + 10 * 1500, PickLong("10:00", from: Day + 7500));
+    }
+
+    [Fact]
+    public void Hours_past_23_name_the_place_on_the_ruler_outright()
+    {
+        Assert.Equal(Day + 10 * 1500, PickLong("24:10:00:00", from: 0));
+        Assert.Equal(Day + 10 * 1500 + 3, PickLong("24:10:00:03", from: 0));
+        Assert.Equal(Day + 10 * 1500, PickLong("24:10:00", from: 0));
+    }
+
+    [Fact]
+    public void Hours_past_the_end_of_the_ruler_are_refused_and_say_where_it_ends()
+    {
+        // A ruler of one day does not reach them at all.
+        Assert.Contains("23:59:59:24", Refuse("24:10:00:00"));
+
+        Assert.False(FramePick.TryParse("26:00:00:00", Rate, TwoDayRuler, 77, out long frame, out string? error));
+        Assert.Equal(77, frame);
+        Assert.Contains("25:29:59:24", error);
+    }
+
+    [Fact]
+    public void On_a_ruler_of_one_day_a_time_is_that_time_wherever_the_playhead_is()
+    {
+        Assert.Equal(15_000, Pick("00:10:00:00", from: Day - 1));
+        Assert.Equal(Day - 1500, Pick("23:59:00:00", from: 0));
+    }
+
     [Fact]
     public void A_frame_number_at_or_past_the_rate_is_refused_in_a_timecode()
     {

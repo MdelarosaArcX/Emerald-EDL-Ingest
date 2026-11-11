@@ -95,6 +95,7 @@ public partial class App : Application
         DelayLine.SweepOrphans(TidalLockRingFolder(Settings));
 
         StartActivityLog();
+        StartMemoryMonitor();
 
         // Before the first window exists: the render mode is the process's, and is read when
         // the first one is created.
@@ -123,6 +124,28 @@ public partial class App : Application
     /// process down with nothing but a Windows event-log entry, which is no use to an operator
     /// standing in front of a dark transmitter.
     /// </summary>
+    /// <summary>
+    /// What the caches hold, for whoever asks; and the ten-second record, for a developer who
+    /// asked for it. Asking costs nothing until then: a gauge is only read when a snapshot is taken.
+    /// </summary>
+    private static void StartMemoryMonitor()
+    {
+        MemoryGauges.Register("Media", "probes remembered", () => Emerald.Media.MediaProbe.Remembered, "count");
+        MemoryGauges.Register("Media", "codecs remembered", () => Emerald.Media.MediaCodec.Remembered, "count");
+        MemoryGauges.Register("Media", "waveforms remembered", () => Emerald.Media.Waveform.Remembered, "count");
+
+        if (!Settings.MemoryDiagnostics &&
+            Environment.GetEnvironmentVariable(MemoryMonitor.EnvironmentSwitch) != "1")
+            return;
+
+        string folder = Settings.LogFolderOrDefault;
+        MemoryMonitor.Start(folder, TimeSpan.FromSeconds(10));
+
+        ActivityLog.Shared.Info(LogSource.App,
+            $"Memory use is being recorded every 10 s to {folder} (memory-yyyyMMdd.jsonl).",
+            @event: "app.memorylog");
+    }
+
     private void StartActivityLog()
     {
         ActivityLog log = ActivityLog.Shared;
@@ -261,6 +284,7 @@ public partial class App : Application
         // The clock outlives every window, so it is closed here rather than by whichever
         // module happened to be shut last.
         TimecodeLink.Shutdown();
+        MemoryMonitor.Stop();
 
         _listener?.Cancel();
         _listener?.Dispose();

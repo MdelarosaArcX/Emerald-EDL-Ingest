@@ -25,6 +25,7 @@ public partial class BookmarkDialog : Window
     private readonly BookmarkBook _book;
     private readonly int _rate;
     private readonly long _dayFrames;
+    private readonly long _playhead;
 
     /// <summary>True when anything was added, amended or removed, so the caller knows to save.</summary>
     public bool Changed { get; private set; }
@@ -39,6 +40,7 @@ public partial class BookmarkDialog : Window
         _book = book;
         _rate = rate;
         _dayFrames = dayFrames;
+        _playhead = playhead;
 
         DayText.Text = $"{day:ddd d MMM yyyy}  -  times are frames of the day, at {rate} fps";
 
@@ -87,10 +89,13 @@ public partial class BookmarkDialog : Window
         if (MarkList.SelectedItem is Row) GoTo_Click(sender, e);
     }
 
-    /// <summary>The frame the timecode field names, or null with the reason shown.</summary>
-    private long? Frame()
+    /// <summary>
+    /// The frame the timecode field names, or null with the reason shown. Past midnight a time
+    /// means the one nearest <paramref name="near"/>.
+    /// </summary>
+    private long? Frame(long near)
     {
-        if (FramePick.TryParse(TimecodeBox.Text, _rate, _dayFrames, 0,
+        if (FramePick.TryParse(TimecodeBox.Text, _rate, _dayFrames, near,
                                out long frame, out string? problem))
             return frame;
 
@@ -100,7 +105,7 @@ public partial class BookmarkDialog : Window
 
     private void Add_Click(object sender, RoutedEventArgs e)
     {
-        if (Frame() is not { } frame) return;
+        if (Frame(_playhead) is not { } frame) return;
 
         // Said rather than silently overwritten: two bookmarks cannot share a frame, and an
         // operator adding one where one already is has probably mistyped the timecode.
@@ -123,7 +128,7 @@ public partial class BookmarkDialog : Window
     private void Update_Click(object sender, RoutedEventArgs e)
     {
         if (MarkList.SelectedItem is not Row row) return;
-        if (Frame() is not { } frame) return;
+        if (Frame(row.Frame) is not { } frame) return;
 
         // A moved bookmark is a remove and an add, because the frame is its identity.
         if (frame != row.Frame && _book.At(frame) is not null)

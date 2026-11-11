@@ -4,21 +4,25 @@ using Emerald.Video;
 
 namespace Emerald.Media;
 
-/// <summary>One segment of a continuous recording, once both halves of it are on the disk.</summary>
+/// <summary>
+/// One file of a continuous recording, once ffmpeg has finished it: a proxy segment, or a master.
+///
+/// The two are announced apart. A master runs five minutes and a proxy far less, so a proxy has
+/// no master of its own to wait for - holding it back until "its" master closed would have kept
+/// the newest proxies unannounced for up to five minutes.
+/// </summary>
 public sealed record CompletedSegment(
+    /// <summary>Counted from 1 for this recording, proxies and masters each on their own count.</summary>
     int Number,
 
-    /// <summary>The number in the filename, which is the year's running count rather than 1,2,3.</summary>
+    /// <summary>The number in the filename.</summary>
     long Sequence,
-    string ProxyPath,
-    long ProxyBytes,
-    string? MasterPath,
-    long MasterBytes,
-    TimeSpan? Duration)
+    string Path,
+    long Bytes,
+    TimeSpan? Duration,
+    bool IsMaster = false)
 {
-    public string Name => Path.GetFileNameWithoutExtension(ProxyPath);
-
-    public long TotalBytes => ProxyBytes + MasterBytes;
+    public string Name => System.IO.Path.GetFileNameWithoutExtension(Path);
 
     public static string Size(long bytes) => bytes >= 1L << 30
         ? $"{bytes / (double)(1L << 30):F2} GB"
@@ -26,18 +30,14 @@ public sealed record CompletedSegment(
 }
 
 /// <summary>
-/// Notices each segment of a running recording as ffmpeg finishes it.
+/// Notices each file of a running recording as ffmpeg finishes it.
 ///
 /// The recorder itself cannot say when a segment is done: it hands frames to one ffmpeg that
 /// cuts the files on its own clock, and nothing comes back. So this looks at the store instead.
-/// A segment is finished when its movie header is on the disk — the header is written last, so
+/// A file is finished when its movie header is on the disk — the header is written last, so
 /// its presence is the one thing that cannot be true of a file still being recorded. That
 /// makes the test structural rather than a guess from timestamps or from a newer sibling
 /// having appeared, and it is eight milliseconds a file.
-///
-/// Both halves have to be there. The proxy and the master are cut by the same ffmpeg but
-/// closed by two muxers, and the master — twenty times the size — can be a moment behind.
-/// A segment announced with only its proxy would then be announced at half its size.
 /// </summary>
 public sealed class SegmentWatch
 {
@@ -46,7 +46,11 @@ public sealed class SegmentWatch
     private readonly DateTime _sinceUtc;
 
     private readonly HashSet<string> _announced = new(StringComparer.OrdinalIgnoreCase);
+
+    private const int ForgetEvery = 2000;
+    private int _forgetAt = ForgetEvery;
     private int _number;
+    private int _masterNumber;
 
     /// <param name="root">The store: the folder the low and high subfolders live in.</param>
     /// <param name="namePrefix">What the recording's files are called before the timestamp.</param>
@@ -68,63 +72,76 @@ public sealed class SegmentWatch
     public long HighestSequence { get; private set; } = -1;
 
     /// <summary>
-    /// The segments finished since the last call, oldest first. Cheap enough to call on a
-    /// tick: only files not yet announced are opened, and a file without its header yet is
-    /// rejected in the first few atoms.
+    /// The files finished since the last call, proxies first and then masters, each oldest first.
+    /// Cheap enough to call on a tick: only files not yet announced are opened, and a file
+    /// without its header yet is rejected in the first few atoms.
     /// </summary>
     public IReadOnlyList<CompletedSegment> Poll()
     {
-        string low = RecordingProfile.FolderFor(RecordingProfile.LowRes, _root);
-
-        // Inside this recording's own folder when there is one, so a second recorder writing
-        // at the same time into its own folder is never mistaken for this one's segments.
-        if (_recordingFolder is not null) low = Path.Combine(low, _recordingFolder);
         var done = new List<CompletedSegment>();
 
-        IEnumerable<string> candidates;
-
-        try
-        {
-            if (!Directory.Exists(low)) return done;
-
-            candidates = Directory.EnumerateFiles(low, $"{_prefix}_*.{RecordingProfile.LowRes.Extension}")
-                .Where(p => !_announced.Contains(p))
-                .Where(p => SafeWriteTimeUtc(p) >= _sinceUtc.AddSeconds(-2))
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-        }
-        catch (IOException) { return done; }
-        catch (UnauthorizedAccessException) { return done; }
-
-        MediaLibrary.MasterIndex? masters = null;
-
-        foreach (string proxy in candidates)
+        foreach (string proxy in Candidates(RecordingProfile.LowRes))
         {
             // Not finished: the header is not there yet. Look again next time.
             if (MediaCodec.ReadDuration(proxy) is not { } duration) continue;
 
-            masters ??= new MediaLibrary.MasterIndex(_root);
-            string? master = masters.For(proxy);
-
-            // The proxy is closed but the master is not. The next poll will find both.
-            if (master is not null && MediaCodec.ReadFourCc(master) is null) continue;
-
-            _announced.Add(proxy);
-
-            long sequence = RecordingSequence.NumberIn(Path.GetFileName(proxy)) ?? -1;
+            long sequence = Announce(proxy);
             if (sequence > HighestSequence) HighestSequence = sequence;
 
-            done.Add(new CompletedSegment(
-                Number: ++_number,
-                Sequence: sequence,
-                ProxyPath: proxy,
-                ProxyBytes: SafeLength(proxy),
-                MasterPath: master,
-                MasterBytes: master is null ? 0 : SafeLength(master),
-                Duration: duration));
+            done.Add(new CompletedSegment(++_number, sequence, proxy, SafeLength(proxy), duration));
+        }
+
+        foreach (string master in Candidates(RecordingProfile.HighRes))
+        {
+            if ((MediaCodec.ReadPictureDuration(master) ?? MediaCodec.ReadDuration(master)) is not { } duration)
+                continue;
+
+            long sequence = Announce(master);
+
+            done.Add(new CompletedSegment(++_masterNumber, sequence, master, SafeLength(master), duration,
+                                          IsMaster: true));
         }
 
         return done;
+    }
+
+    /// <summary>This recording's files of one output not yet announced, in name order.</summary>
+    private List<string> Candidates(RecordingOutput output)
+    {
+        string folder = RecordingProfile.FolderFor(output, _root);
+
+        // Inside this recording's own folder when there is one, so a second recorder writing
+        // at the same time into its own folder is never mistaken for this one's segments.
+        if (_recordingFolder is not null) folder = Path.Combine(folder, _recordingFolder);
+
+        try
+        {
+            if (!Directory.Exists(folder)) return new List<string>();
+
+            return Directory.EnumerateFiles(folder, $"{_prefix}_*.{output.Extension}")
+                .Where(p => !_announced.Contains(p))
+                .Where(p => SafeWriteTimeUtc(p) >= _sinceUtc.AddSeconds(-2))
+                .OrderBy(p => RecordingSequence.NumberIn(Path.GetFileName(p)) ?? 0)
+                .ThenBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (IOException) { return new List<string>(); }
+        catch (UnauthorizedAccessException) { return new List<string>(); }
+    }
+
+    private long Announce(string path)
+    {
+        _announced.Add(path);
+
+        // A recording that runs for days announces thousands, and the storage limit has long
+        // since deleted most of them. Those can never be candidates again.
+        if (_announced.Count >= _forgetAt)
+        {
+            _announced.RemoveWhere(p => !File.Exists(p));
+            _forgetAt = Math.Max(ForgetEvery, _announced.Count * 2);
+        }
+
+        return RecordingSequence.NumberIn(Path.GetFileName(path)) ?? -1;
     }
 
     private static DateTime SafeWriteTimeUtc(string path)

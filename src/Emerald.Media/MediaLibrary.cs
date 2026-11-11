@@ -24,10 +24,24 @@ public sealed record CapturedClip(
     /// When this segment begins, worked out across its recording folder rather than from its own
     /// name. Null for a clip that could not be placed. See <see cref="StartsAt"/>.
     /// </summary>
-    DateTime? Starts = null)
+    DateTime? Starts = null,
+
+    /// <summary>
+    /// The masters this proxy's span of the clock falls in: one, or two where it straddles a
+    /// master boundary. Null for a clip not laid out by <see cref="StoreIndex"/>, such as an old
+    /// flat file paired by name, where <see cref="MasterPath"/> alone says it.
+    /// </summary>
+    IReadOnlyList<MasterSegment>? Masters = null)
 {
-    /// <summary>True when this is the proxy of a pair and its master is on disk beside it.</summary>
-    public bool HasMaster => MasterPath is not null;
+    /// <summary>
+    /// True when every master holding this proxy's picture is on disk and finished, so the picture
+    /// can be cut from the master. A master runs five minutes and the proxy far less, so for most
+    /// of each five minutes the newest proxies have a master that is still being written.
+    /// </summary>
+    public bool HasMaster => MasterPath is not null && (Masters is null || Masters.All(m => !m.Open));
+
+    /// <summary>A master holding part of this proxy is still being written.</summary>
+    public bool MasterStillBeingWritten => Masters is { } masters && masters.Any(m => m.Open);
 
     /// <summary>
     /// What the master is, for a column: the codec when one was found, or why not.
@@ -45,6 +59,7 @@ public sealed record CapturedClip(
     public string MasterText =>
         StillBeingWritten ? "recording in-progress"
         : MasterPath is null ? "no master"
+        : MasterStillBeingWritten ? "master in-progress"
         : MasterCodec ?? "master, codec unread";
 
 
@@ -136,69 +151,40 @@ public static class MediaLibrary
     /// </summary>
     public static IReadOnlyList<CapturedClip> List(string folder, string? ffprobePath, int frameRate = 25)
     {
-        var clips = new List<CapturedClip>();
-        var masters = new MasterIndex(folder);
+        // A listing is an index read once. Live Edit keeps its own and refreshes it instead,
+        // which opens only what has changed.
+        var index = new StoreIndex(folder, ffprobePath, frameRate);
+        index.Refresh(full: true);
+        return index.Clips;
+    }
 
-        // The proxies first, then anything sitting loose in the store — recordings made before
-        // the store grew its two halves. The masters are deliberately not listed: they are the
-        // same pictures at a size that would make the strip crawl, and each is reachable from
-        // the proxy that stands for it.
-        //
-        // The proxy folder is walked all the way down, because a recording writes into a folder
-        // of its own inside it. The store root is walked ONE level only: it contains the proxy
-        // and master folders, and descending would list every proxy a second time and every
-        // master as though it were a clip of its own.
-        Collect(RecordingProfile.FolderFor(RecordingProfile.LowRes, folder), isProxy: true,
-                SearchOption.AllDirectories);
-
-        Collect(folder, isProxy: false, SearchOption.TopDirectoryOnly);
-
-        clips.Sort((a, b) => b.Recorded.CompareTo(a.Recorded));
-        return Accumulate(clips, frameRate);
-
-        void Collect(string from, bool isProxy, SearchOption depth)
+    /// <summary>
+    /// One file of a listing, or null if it has gone.
+    ///
+    /// <b>Gone is ordinary.</b> A store at its limit loses its oldest segment every time one closes,
+    /// and the oldest is the first one read. Letting that end the listing is what showed an empty
+    /// timeline on opening Live Edit: every file after the missing one was dropped with it.
+    /// </summary>
+    internal static CapturedClip? ClipAt(string path, MasterIndex? masters, string? ffprobePath, int frameRate)
+    {
+        try
         {
-            try
-            {
-                if (!Directory.Exists(from)) return;
+            var file = new FileInfo(path);
 
-                string[] paths = Directory.EnumerateFiles(from, "*", depth)
-                                          .Where(MediaScanner.IsPlayable)
-                                          .ToArray();
+            // Only the recorder's own segments are read directly. Anything else in the store came
+            // from somewhere else and may be laid out any way at all.
+            MediaInfo? info = RecordingFolder(path) is not null && masters is not null
+                ? MediaProbe.ProbeSegment(ffprobePath, path, frameRate)
+                : MediaProbe.Probe(ffprobePath, path, frameRate);
 
-                // The probes first, several at once, so the loop below finds them answered. Only
-                // the first listing has many to do - after that MediaProbe remembers every closed
-                // file - but a store of hundreds of short segments was a minute of one ffprobe
-                // after another before the timeline showed anything.
-                if (ffprobePath is not null)
-                    Parallel.ForEach(paths, new ParallelOptions { MaxDegreeOfParallelism = 6 },
-                                     path => MediaProbe.Probe(ffprobePath, path, frameRate));
+            string? master = masters?.For(path);
 
-                foreach (string path in paths)
-                {
-                    if (!MediaScanner.IsPlayable(path)) continue;
-
-                    var file = new FileInfo(path);
-
-                    // A segment still being written has no usable duration yet; probing it is
-                    // harmless but pointless, so it is listed bare until the recorder moves on.
-                    MediaInfo? info = ffprobePath is null ? null : MediaProbe.Probe(ffprobePath, path, frameRate);
-
-                    string? master = isProxy ? masters.For(path) : null;
-
-                    clips.Add(new CapturedClip(path, file.Name, file.LastWriteTime, file.Length, info,
-                                               master,
-                                               master is null ? null : MediaCodec.Read(master)));
-                }
-            }
-            catch (IOException)
-            {
-                // A store on a disconnected drive lists as empty rather than taking the UI down.
-            }
-            catch (UnauthorizedAccessException)
-            {
-            }
+            return new CapturedClip(path, file.Name, file.LastWriteTime, file.Length, info,
+                                    master,
+                                    master is null ? null : MediaCodec.Read(master));
         }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
     }
 
     /// <summary>
@@ -253,75 +239,10 @@ public static class MediaLibrary
 
 
     /// <summary>
-    /// Fills in each segment's exact start, folder by folder.
-    ///
-    /// Within a per-recording folder the segments are numbered, so the first begins when the
-    /// folder says the recording rolled and every one after it begins where the last ended. That
-    /// is frame-exact, and it is the reason the naming moved: a timestamp in a filename is
-    /// written to the second and is therefore up to a second wrong, which shows at frame zoom.
-    ///
-    /// Done here, once per listing, rather than left to each caller — a start that is exact for
-    /// the timeline and approximate for the clip list would be two answers to one question.
-    /// Ordered by the number rather than by name, because a count past six digits is wider and
-    /// would otherwise sort before the narrower ones.
-    /// </summary>
-    private static IReadOnlyList<CapturedClip> Accumulate(List<CapturedClip> clips, int frameRate)
-    {
-        var placed = new Dictionary<string, CapturedClip>();
-
-        foreach (IGrouping<string, CapturedClip> group in clips
-                     .Where(c => RecordingFolder(c.Path) is not null)
-                     .GroupBy(c => RecordingFolder(c.Path)!))
-        {
-            if (RecordingSequence.FolderStartedAt(group.Key) is not { } rolled) continue;
-
-            List<CapturedClip> ordered = group
-                .OrderBy(c => RecordingSequence.NumberIn(Path.GetFileName(c.Path)) ?? 0)
-                .ToList();
-
-            // The first segment left is not always the first recorded: the storage limit deletes
-            // from the front. It starts after everything deleted before it, not when the folder
-            // rolled - placed at the roll, every segment slid back by what had gone, and the
-            // newest ones landed an hour behind air.
-            DateTime at = rolled;
-
-            if (RecordingSequence.NumberIn(Path.GetFileName(ordered[0].Path)) is { } first &&
-                first > RecordingSequence.FirstNumber &&
-                Path.GetDirectoryName(ordered[0].Path) is { } dir)
-                at = rolled + PruneLedger.StartOf(first, PruneLedger.Read(dir), Typical(ordered));
-
-            foreach (CapturedClip clip in ordered)
-            {
-                placed[clip.Path] = clip with { Starts = at };
-
-                // A segment still open has no length to read, so the run stops being exact from
-                // there on. It is the last one anyway, so there is nothing after it to be wrong.
-                if (clip.Info is { } info && info.Duration > TimeSpan.Zero) at += info.Runs;
-            }
-        }
-
-        return placed.Count == 0
-            ? clips
-            : clips.Select(c => placed.TryGetValue(c.Path, out CapturedClip? exact) ? exact : c).ToList();
-    }
-
-    /// <summary>
-    /// How long a segment of this recording usually runs - the middle one of the finished ones,
-    /// so a short first or last segment does not skew it. Fills a gap the ledger does not cover.
-    /// </summary>
-    private static TimeSpan Typical(List<CapturedClip> recording)
-    {
-        TimeSpan[] lengths = recording
-            .Select(c => c.Info?.Runs ?? TimeSpan.Zero)
-            .Where(d => d > TimeSpan.Zero)
-            .OrderBy(d => d)
-            .ToArray();
-
-        return lengths.Length == 0 ? TimeSpan.Zero : lengths[lengths.Length / 2];
-    }
-
-    /// <summary>
-    /// The masters in a store, indexed so a proxy can find its own.
+    /// The masters of the old flat store, indexed so a proxy can find its own by name or by the
+    /// time in its name. Recordings in folders are not paired this way any more: their masters
+    /// are placed on the clock by <see cref="StoreIndex"/>, because they are cut at a different
+    /// length from the proxies.
     ///
     /// Built once per listing rather than searched per proxy: a thousand proxies each scanning
     /// a thousand masters is a million comparisons for an answer that is the same every time.
@@ -331,17 +252,16 @@ public static class MediaLibrary
         private readonly Dictionary<string, string> _byName = new(StringComparer.OrdinalIgnoreCase);
         private readonly List<(DateTime Stamp, string Path)> _byTime = new();
 
-        public MasterIndex(string root)
+        /// <param name="folder">The master folder itself, <c>high</c>.</param>
+        public MasterIndex(string folder, SearchOption depth)
         {
-            string folder = RecordingProfile.FolderFor(RecordingProfile.HighRes, root);
 
             try
             {
                 if (!Directory.Exists(folder)) return;
 
                 foreach (string path in Directory.EnumerateFiles(
-                             folder, $"*.{RecordingProfile.HighRes.Extension}",
-                             SearchOption.AllDirectories))
+                             folder, $"*.{RecordingProfile.HighRes.Extension}", depth))
                 {
                     // Keyed by the recording folder as well as the name, because the numbers
                     // restart in no folder but two recordings can still hold the same number

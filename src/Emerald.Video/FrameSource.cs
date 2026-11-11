@@ -1,3 +1,4 @@
+using Emerald.Core;
 using Emerald.Deltacast;
 using System.Diagnostics;
 using System.IO;
@@ -98,6 +99,10 @@ public sealed class FrameSource : IDisposable
             info.ArgumentList.Add(som.TotalSeconds.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
         }
 
+        // Before -i, so it is the decoder's. Measured on this plant's own segments: half the memory
+        // of ffmpeg's one thread per logical CPU, at ten times real time on the proxy and nine on
+        // the master - which was five with every thread it wanted.
+        info.ArgumentList.Add("-threads"); info.ArgumentList.Add("4");
         info.ArgumentList.Add("-i"); info.ArgumentList.Add(mediaPath);
         info.ArgumentList.Add("-an");
         info.ArgumentList.Add("-vf"); info.ArgumentList.Add(filter);
@@ -107,6 +112,8 @@ public sealed class FrameSource : IDisposable
 
         Process ffmpeg = Process.Start(info)
             ?? throw new InvalidOperationException($"Could not start ffmpeg at {ffmpegPath}.");
+
+        MemoryGauges.NameChild(ffmpeg.Id, "video decoder");
 
         var source = new FrameSource(ffmpeg, mediaPath, format.FrameBytes);
 

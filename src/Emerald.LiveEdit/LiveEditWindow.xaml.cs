@@ -87,6 +87,9 @@ public partial class LiveEditWindow : Window
         (long)Math.Round((at - _day.Date).TotalSeconds * _rate);
 
     private readonly IReadOnlyList<ZoomLevel> _ladder;
+
+    /// <summary>The ladder narrowest first, sorted once rather than at every redraw.</summary>
+    private ZoomLevel[]? _ladderBySpan;
     private int _zoom;
 
     /// <summary>Every segment of the day being shown, in order, with its place on the clock.</summary>
@@ -112,11 +115,22 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private Action? _afterPlaced;
 
-    /// <summary>The segments of the recording in question, which is the subject of the counts.</summary>
-    private IEnumerable<Placed> Primary =>
-        _primaryFolder is null
-            ? _placed
-            : _placed.Where(p => string.Equals(p.Folder, _primaryFolder, StringComparison.OrdinalIgnoreCase));
+    /// <summary>
+    /// The segments of the recording in question, which is the subject of the counts. In start
+    /// order, and made once per layout: it was a filter over every segment, run again on every
+    /// tick by the lookups that use it.
+    /// </summary>
+    private IReadOnlyList<Placed> Primary => _primary;
+
+    private List<Placed> _primary = new();
+
+    /// <summary>The longest segment laid out, which bounds how far back a lookup has to look.</summary>
+    private long _longestPlaced;
+
+    /// <summary>The recording in question's end, total frames and whether it is still being written, per layout.</summary>
+    private long _primaryEnd, _primaryFrames;
+
+    private bool _primaryRecording;
 
     /// <summary>The day on the ruler. The store can hold several, and one ruler holds one.</summary>
     private DateTime _day = DateTime.Today;
@@ -172,23 +186,6 @@ public partial class LiveEditWindow : Window
     private bool _standbyReady;
 
     private long Span => _ladder[_zoom].SpanFrames;
-
-    /// <summary>
-    /// How far the recording in question runs, first segment to last, or zero if there is none.
-    ///
-    /// Grows by itself: the segment being written is in the layout at its assumed length, and a
-    /// new one appearing moves the end. So a view fitted to this follows a running recording
-    /// without being told to.
-    /// </summary>
-    private long RecordingExtent
-    {
-        get
-        {
-            List<Placed> of = Primary.ToList();
-
-            return of.Count == 0 ? 0 : of.Max(p => p.EndFrame) - of.Min(p => p.StartFrame);
-        }
-    }
 
     /// <summary>
     /// The window actually on screen — the one every x-position is worked out from.
@@ -307,15 +304,22 @@ public partial class LiveEditWindow : Window
         // viewport is therefore floored at a fiftieth of the day purely so there is something to
         // take hold of. It does not change what can be scrolled to: Value still runs the whole
         // range, and Value is what the window is drawn from.
-        TimeScroll.Maximum = _dayFrames - Span;
-        TimeScroll.ViewportSize = Math.Max(Span, _dayFrames / 50.0);
-        TimeScroll.LargeChange = Span;
-        TimeScroll.SmallChange = Math.Max(1, Span / 20);
+        //
+        // Each only when it differs: this runs on every tick while following air, and setting a
+        // scrollbar's properties lays it out again even to the same values.
+        double maximum = _dayFrames - Span, viewport = Math.Max(Span, _dayFrames / 50.0);
+        double large = Span, small = Math.Max(1, Span / 20);
+
+        if (TimeScroll.Maximum != maximum) TimeScroll.Maximum = maximum;
+        if (TimeScroll.ViewportSize != viewport) TimeScroll.ViewportSize = viewport;
+        if (TimeScroll.LargeChange != large) TimeScroll.LargeChange = large;
+        if (TimeScroll.SmallChange != small) TimeScroll.SmallChange = small;
 
         // Where the view actually is, which while the timeline is running is the transmitter's
         // anchor rather than the stored scroll. A thumb parked somewhere the view is not would
         // be a control lying about its own state.
-        TimeScroll.Value = Math.Clamp(ViewStart, TimeScroll.Minimum, TimeScroll.Maximum);
+        double value = Math.Clamp(ViewStart, TimeScroll.Minimum, TimeScroll.Maximum);
+        if (TimeScroll.Value != value) TimeScroll.Value = value;
     }
 
     private void TimeScroll_Scroll(object sender, System.Windows.Controls.Primitives.ScrollEventArgs e)
@@ -381,6 +385,14 @@ public partial class LiveEditWindow : Window
             // Raised from the capture and transmitter threads, so it hops to the dispatcher.
             DropMarks.Shared.Changed += OnDropsChanged;
 
+            _gauges = new[]
+            {
+                MemoryGauges.Register("LiveEdit", "segments on the timeline", () => _placed.Count, "count"),
+                MemoryGauges.Register("LiveEdit", "waveforms kept", () => _waves.Count, "count"),
+                MemoryGauges.Register("LiveEdit", "items placed", () => _overlays.Count, "count"),
+                MemoryGauges.Register("LiveEdit", "media players with a file open", () => Volatile.Read(ref _playersOpen), "count"),
+            };
+
             WireLive();
             ShowUndo();
 
@@ -402,13 +414,24 @@ public partial class LiveEditWindow : Window
     private readonly DispatcherTimer _watch =
         new(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(2) };
 
-    /// <summary>True while a fingerprint is being read, so two never overlap.</summary>
-    private bool _checking;
+    /// <summary>
+    /// The store as last read, kept rather than read again: a refresh opens only files that are
+    /// new or have just closed. Made again only when the capture folder changes.
+    /// </summary>
+    private StoreIndex? _store;
 
-    /// <summary>What the store looked like last time, so an unchanged store costs nothing.</summary>
-    private string _signature = "";
-
+    /// <summary>True while the store is being refreshed, so two never overlap.</summary>
     private bool _listing;
+
+    private StoreIndex Store()
+    {
+        string folder = MediaLibrary.FolderFor(_settings);
+
+        if (_store is null || !string.Equals(_store.Root, folder, StringComparison.OrdinalIgnoreCase))
+            _store = new StoreIndex(folder, MediaProbe.LocateFfprobe(Ffmpeg.Locate(_settings.FfmpegPath)));
+
+        return _store;
+    }
 
     /// <summary>
     /// Set while the clip list is being rebound after a refresh.
@@ -574,7 +597,6 @@ public partial class LiveEditWindow : Window
         string was = MediaLibrary.FolderFor(_settings);
 
         _settings.CaptureFolder = saved;
-        _signature = "";
 
         ActivityLog.Shared.Info(LogSource.App,
             $"Live Edit now reads capture media from {MediaLibrary.FolderFor(_settings)} " +
@@ -588,102 +610,109 @@ public partial class LiveEditWindow : Window
     {
         FollowTheDate();
 
-        if (_listing || _checking) return;
+        Volatile.Write(ref _playersOpen,
+                       (Player.Source is null ? 0 : 1) + (_standby.Source is null ? 0 : 1) + (Monitor.Source is null ? 0 : 1));
 
-        // A new output path is a new store: listed straight away rather than on its fingerprint.
+        // A new output path is a new store: listed straight away.
         if (FollowCaptureFolder()) { LoadClips(); return; }
 
-        _checking = true;
+        // An export waiting for its master, checked against what the last refresh found.
+        TryWaitingExport();
 
-        string folder = RecordingProfile.FolderFor(RecordingProfile.LowRes,
-                                                  MediaLibrary.FolderFor(_settings));
+        LetIdlePlayersGo();
+        TrimWaves();
 
-        // Off this thread. Walking hundreds of files every few seconds is small, but it is disk,
-        // and on this thread it is a stall in playback whenever the disk is busy recording.
-        Task.Run(() => Signature(folder))
-            .ContinueWith(t =>
-            {
-                _checking = false;
-
-                string now = t.IsFaulted ? "" : t.Result;
-                if (now == _signature || _listing) return;
-
-                _signature = now;
-                LoadClips();
-            }, TaskScheduler.FromCurrentSynchronizationContext());
+        // Only what has changed is opened, and only a change is laid out again. A segment still
+        // growing is not one: it is placed at the length it is going to be.
+        LoadClips(onlyIfChanged: true);
     }
+
+
+    /// <summary>The last moment anything was playing or following air, for letting idle players go.</summary>
+    private DateTime _activeAt = DateTime.UtcNow;
+
+    /// <summary>How long nothing has to happen before the players nobody is looking at are closed.</summary>
+    private static readonly TimeSpan IdlePlayers = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    /// A cheap fingerprint of the store: which files there are, and how big the closed ones are.
+    /// Closes the next segment held ready behind the player, and the small monitor, once nothing
+    /// has played or followed air for a while.
     ///
-    /// <b>The file being recorded is deliberately left out.</b> It grows every few hundred
-    /// milliseconds, so including its length would make the fingerprint change constantly and
-    /// turn this into a full ffprobe pass over the whole store every five seconds — the exact
-    /// cost the fingerprint exists to avoid. Its length is not wanted anyway: an open segment is
-    /// placed at its assumed length because there is no duration to read.
-    ///
-    /// What does change the fingerprint is a new segment appearing, and the previously-open one
-    /// closing — which is when it stops being the newest, and its final length enters the sum.
-    /// That is exactly one refresh per segment, which is once every couple of minutes.
+    /// Each is a decoder with a file open, and they stayed open for as long as the window did -
+    /// days, on a plant that leaves Live Edit up - holding files the storage limit then could not
+    /// delete. The big screen keeps its file, because it is showing the frame the operator left it
+    /// on; the one held ready is opened again the next time it is needed, and the monitor by
+    /// picking the file again.
     /// </summary>
-    private static string Signature(string folder)
+    private void LetIdlePlayersGo()
     {
-        try
+        DateTime now = DateTime.UtcNow;
+
+        if (_playing || _monitorPlaying || Following) { _activeAt = now; return; }
+        if (now - _activeAt < IdlePlayers) return;
+
+        if (_standby.Source is not null) DropStandby();
+
+        if (Monitor.Source is not null)
         {
-            if (!Directory.Exists(folder)) return "";
-
-            // Recursively, and that is the fix for a refresh that never happened.
-            //
-            // This read the top directory only, which was right when segments were written loose
-            // into it. They go into a folder per recording now, so the top directory holds
-            // nothing but directories - measured on this plant: 0 files here, 25 below - and the
-            // fingerprint was the constant "0". It never changed, so the five-second watch never
-            // listed the store, and a new segment appeared on the timeline only if somebody
-            // pressed Refresh. On air, that is the one thing nobody is watching the screen to do.
-            FileInfo[] files = new DirectoryInfo(folder).GetFiles("*", SearchOption.AllDirectories);
-
-            if (files.Length == 0) return "0";
-
-            long newestTicks = files.Max(f => f.LastWriteTimeUtc.Ticks);
-
-            long bytes = 0;
-            int counted = 0;
-
-            foreach (FileInfo file in files)
-            {
-                // Skip the one still being written to.
-                if (file.LastWriteTimeUtc.Ticks == newestTicks) continue;
-
-                bytes += file.Length;
-                counted++;
-            }
-
-            return $"{files.Length}|{counted}|{bytes}";
+            StopMonitor();
+            MonitorPlaceholder.Text = "closed after five minutes idle - pick the file again to preview it";
+            MonitorPlaceholder.Visibility = Visibility.Visible;
         }
-        catch (IOException) { return ""; }
-        catch (UnauthorizedAccessException) { return ""; }
     }
-
 
     // ------------------------------------------------------------------ the store
 
-    private void LoadClips()
+    private bool _listedOnce;
+
+    private IDisposable[] _gauges = Array.Empty<IDisposable>();
+
+    /// <summary>Players holding a file open, counted on this thread for the monitor to read from its own.</summary>
+    private int _playersOpen;
+
+    /// <summary>A listing was asked for while one was running: lay out whatever that one finds.</summary>
+    private bool _placeWanted;
+
+    /// <summary>
+    /// Brings the store up to date and lays the day out from it.
+    ///
+    /// <paramref name="onlyIfChanged"/> is the two-second watch: it walks only the folders that
+    /// could have changed and lays out again only when something did. Anything else - opening, a
+    /// new day, Refresh - walks every folder and always lays out.
+    /// </summary>
+    private void LoadClips(bool onlyIfChanged = false)
     {
-        if (_listing) return;
+        if (_listing)
+        {
+            if (!onlyIfChanged) _placeWanted = true;
+            return;
+        }
+
         _listing = true;
 
-        string folder = MediaLibrary.FolderFor(_settings);
+        StoreIndex store = Store();
+        string folder = store.Root;
 
-        StoreText.Text = $"reading {folder}...";
+        if (!onlyIfChanged) StoreText.Text = $"reading {folder}...";
 
-        // Probing every clip shells out to ffprobe once per file, which is too slow for the UI
-        // thread once the store has a few hours in it.
-        Task.Run(() => MediaLibrary.List(_settings))
+        var listing = System.Diagnostics.Stopwatch.StartNew();
+
+        // Off this thread: the first refresh of a store opens every file in it, and any refresh is
+        // disk, which on this thread is a stall in playback whenever the recorder is busy.
+        Task.Run(() => store.Refresh(full: !onlyIfChanged))
             .ContinueWith(t =>
             {
                 _listing = false;
 
-                IReadOnlyList<CapturedClip> clips = t.IsFaulted ? Array.Empty<CapturedClip>() : t.Result;
+                // Finished after the window closed: there is nothing left to lay it out on.
+                if (_closed) return;
+
+                bool wanted = !onlyIfChanged || _placeWanted;
+                _placeWanted = false;
+
+                if (!wanted && !t.IsFaulted && !t.Result) return;
+
+                IReadOnlyList<CapturedClip> clips = t.IsFaulted ? Array.Empty<CapturedClip>() : store.Clips;
 
                 // The selection is rebound with the list, so it is remembered across a refresh
                 // rather than jumping back to nothing every time a segment closes.
@@ -718,6 +747,15 @@ public partial class LiveEditWindow : Window
                 StoreText.Text = clips.Count == 0
                     ? $"No captures yet. Recordings land in {folder}."
                     : $"{clips.Count} clip{(clips.Count == 1 ? "" : "s")} in {folder}";
+
+                // The first, and any that was slow. Every ten seconds otherwise would be noise.
+                if (!_listedOnce || listing.ElapsedMilliseconds > 1000)
+                    ActivityLog.Shared.Info(LogSource.App,
+                        $"Live Edit listed {clips.Count} clips and laid out {_placed.Count} in " +
+                        $"{listing.ElapsedMilliseconds} ms.",
+                        @event: "liveedit.listed", file: folder);
+
+                _listedOnce = true;
 
                 if (t.IsFaulted)
                     ActivityLog.Shared.Warn(LogSource.App,
@@ -827,6 +865,17 @@ public partial class LiveEditWindow : Window
             .OrderBy(p => p.StartFrame)
             .ToList();
 
+        _primary = _primaryFolder is null
+            ? _placed
+            : _placed.Where(p => string.Equals(p.Folder, _primaryFolder, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        _longestPlaced = _placed.Count > 0 ? _placed.Max(p => p.Frames) : 0;
+        _primaryEnd = _primary.Count > 0 ? _primary.Max(p => p.EndFrame) : 0;
+        _primaryFrames = _primary.Sum(p => p.Frames);
+        _primaryRecording = _primary.Any(p => p.Pending);
+
+        TrimWaves();
+
         // A day, or as far as a recording on it has run past midnight.
         _dayFrames = Math.Max(_oneDay, _placed.Count > 0 ? _placed.Max(p => p.EndFrame) : 0);
 
@@ -902,11 +951,6 @@ public partial class LiveEditWindow : Window
         // The bookmarks of the day being left, in case one was typed and not yet written.
         SaveBookmarks();
 
-        // Forgotten, so the store is listed again for the new day even if no segment has closed.
-        // Without this a rollover past midnight could leave the ruler on a day whose clips were
-        // never read, waiting for a fingerprint change that had already happened.
-        _signature = "";
-
         // Everything placed on the timeline keeps its moment. Frames count from the ruler day's
         // midnight, so moving the day moves every placement by a day's worth the other way -
         // otherwise an insert dropped at 23:58 would sit at 23:58 of the new day, and go to air
@@ -934,6 +978,8 @@ public partial class LiveEditWindow : Window
 
         _audioPiece = null;
 
+        if (shift != 0) ForgetFinishedEdits();
+
         // The states held for undo are in the old day's frames.
         ForgetEdits();
 
@@ -945,6 +991,41 @@ public partial class LiveEditWindow : Window
 
         LoadBookmarks();
         LoadClips();
+    }
+
+    /// <summary>
+    /// Lets go of placed items, deleted scenes and sound edits that ended before the day before the
+    /// ruler's, in the new day's frames.
+    ///
+    /// They were only ever moved back a day at each midnight, never dropped, so a window left open
+    /// for a week carried every edit of the week - and every lookup of the timeline, several a
+    /// frame, walked and sorted all of them. The day before is kept, for reading back what went to
+    /// air overnight; anything older aired long since and cannot come round again.
+    /// </summary>
+    private void ForgetFinishedEdits()
+    {
+        long before = -_oneDay;
+
+        List<Overlay> finished = _overlays.Where(o => o.EndFrame <= before).ToList();
+        int sounds = _audioEdits.Count(a => a.EndFrame <= before);
+        int cuts = _audioCuts.Count(c => c < before);
+
+        if (finished.Count == 0 && sounds == 0 && cuts == 0) return;
+
+        foreach (Overlay overlay in finished)
+        {
+            _overlays.Remove(overlay);
+            _cueStatus.Remove(overlay.Id);
+        }
+
+        _edl.Forget(finished.Select(o => o.Id));
+        _audioEdits = _audioEdits.Where(a => a.EndFrame > before).ToList();
+        _audioCuts.RemoveWhere(c => c < before);
+
+        ActivityLog.Shared.Info(LogSource.App,
+            $"Live Edit let go of {finished.Count} placed item(s), {sounds} sound edit(s) and {cuts} sound cut(s) " +
+            "that ended before yesterday; they aired long ago.",
+            @event: "liveedit.forgotten");
     }
 
     /// <summary>
@@ -1005,8 +1086,31 @@ public partial class LiveEditWindow : Window
     /// operator would be watching the wrong feed with no way to tell.
     /// </summary>
     private Placed? ClipAt(long dayFrame) =>
-        Primary.FirstOrDefault(p => p.Holds(dayFrame))
-        ?? _placed.FirstOrDefault(p => p.Holds(dayFrame));
+        Holding(_primary, dayFrame, _longestPlaced) ?? Holding(_placed, dayFrame, _longestPlaced);
+
+    /// <summary>
+    /// The first segment, in start order, holding a frame: found by halving rather than by walking
+    /// the day, because it is asked several times a frame. <paramref name="longest"/> is how far
+    /// back a segment holding the frame can start, so overlapping recordings are still found.
+    /// </summary>
+    private static Placed? Holding(List<Placed> sorted, long dayFrame, long longest)
+    {
+        int lo = 0, hi = sorted.Count;
+
+        // The first starting after the frame; everything that can hold it is before that.
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >>> 1;
+            if (sorted[mid].StartFrame <= dayFrame) lo = mid + 1; else hi = mid;
+        }
+
+        int first = lo;
+
+        for (int i = lo - 1; i >= 0 && sorted[i].StartFrame > dayFrame - longest - 1; i--)
+            if (sorted[i].Holds(dayFrame)) first = i;
+
+        return first < lo ? sorted[first] : null;
+    }
 
     /// <summary>
     /// The segment that carries on from a frame: the one holding it, or the first to start within
@@ -1048,6 +1152,7 @@ public partial class LiveEditWindow : Window
     private List<IngestItem> IngestItems() => _overlays
         .Where(o => o.Plan is not null)
         .Select(o => new IngestItem(o.Path, o.Plan!.Value))
+        .OrderBy(i => i.Plan.StartFrame)
         .ToList();
 
     /// <summary>
@@ -1062,6 +1167,7 @@ public partial class LiveEditWindow : Window
     private List<IngestItem> PlayedItems() => _overlays
         .Where(o => o.Plan is not null && !SoundOverRecording(o) && !o.IsBlank)
         .Select(o => new IngestItem(o.Path, o.Plan!.Value))
+        .OrderBy(i => i.Plan.StartFrame)
         .ToList();
 
     /// <summary>Audio only, laid over the recording rather than inserted into it.</summary>
@@ -1081,6 +1187,35 @@ public partial class LiveEditWindow : Window
     /// Whether any of a segment can be in the window. Wide rather than exact: from where its first
     /// frame is on the ruler to where its end is, which takes in every insert inside it.
     /// </summary>
+    private static List<Placed> Visible(List<Placed> sorted, List<IngestItem> items, long start, long span, long longest)
+    {
+        // On the ruler a frame is never earlier than it is in the recording's own count, and later
+        // frames stay later: so the segments that can be on screen are one run of the list, found
+        // by halving at each end rather than by testing every segment of the day.
+        int First(Func<Placed, bool> past)
+        {
+            int lo = 0, hi = sorted.Count;
+
+            while (lo < hi)
+            {
+                int mid = (lo + hi) >>> 1;
+                if (past(sorted[mid])) hi = mid; else lo = mid + 1;
+            }
+
+            return lo;
+        }
+
+        int from = First(p => IngestTimeline.RulerFrameOf(p.StartFrame + longest, items) >= start);
+        int to = First(p => IngestTimeline.RulerFrameOf(p.StartFrame, items) > start + span);
+
+        var visible = new List<Placed>(Math.Max(0, to - from));
+
+        for (int i = from; i < to; i++)
+            if (OnScreen(sorted[i], items, start, span)) visible.Add(sorted[i]);
+
+        return visible;
+    }
+
     private static bool OnScreen(Placed placed, List<IngestItem> items, long start, long span) =>
         IngestTimeline.RulerFrameOf(placed.EndFrame, items) >= start &&
         IngestTimeline.RulerFrameOf(placed.StartFrame, items) <= start + span;
@@ -1154,7 +1289,7 @@ public partial class LiveEditWindow : Window
             PreviewPlaceholder.Text = want is null
                 ? $"Nothing recorded at {Stamp(_at)}"
                 : $"{want.Clip.Name}\n\nstill being recorded - it cannot be played until the " +
-                  $"recorder closes it, about every {_settings.RecordingSegmentSeconds / 60} min";
+                  $"recorder closes it, about every {RecordingProfile.Label(RecordingProfile.SegmentLengths, _settings.RecordingSegmentSeconds)}";
 
             PreviewPlaceholder.Visibility = Visibility.Visible;
 
@@ -2111,7 +2246,7 @@ public partial class LiveEditWindow : Window
     private long RecordingStartFrame =>
         Primary.Select(p => p.StartFrame).DefaultIfEmpty(0).Min();
 
-    private long RecordingFrames => Primary.Sum(p => p.Frames);
+    private long RecordingFrames => _primaryFrames;
 
     /// <summary>
     /// The position as a frame count, and the total <b>of this recording</b>.
@@ -2625,7 +2760,8 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private void DrawOneBar(double width, long start, long span, double height)
     {
-        List<Placed> of = Primary.OrderBy(p => p.StartFrame).ToList();
+        // Already in start order, and made once per layout.
+        IReadOnlyList<Placed> of = _primary;
 
         if (of.Count == 0) return;
 
@@ -2637,7 +2773,7 @@ public partial class LiveEditWindow : Window
         // The end of the last segment, not the sum of their lengths. Those differ the moment
         // there is a gap - a capture stopped and restarted - and the sum would draw a bar that
         // ended before the media did.
-        long recorded = IngestTimeline.RulerFrameOf(of.Max(p => p.EndFrame), items);
+        long recorded = IngestTimeline.RulerFrameOf(_primaryEnd, items);
 
         long? onAir = OnAirFrame();
 
@@ -2648,7 +2784,7 @@ public partial class LiveEditWindow : Window
         double a = Math.Max(0, (from - start) / (double)span * width);
         double b = Math.Min(width, (to - start) / (double)span * width);
 
-        bool recording = Primary.Any(p => p.Pending);
+        bool recording = _primaryRecording;
 
         // What has gone out, drawn solid - orange once there is a transmitter to have sent it,
         // the same as the past segments in the other view.
@@ -2658,7 +2794,7 @@ public partial class LiveEditWindow : Window
             Height = height,
             RadiusX = 3,
             RadiusY = 3,
-            Fill = onAir is null ? new SolidColorBrush(Color.FromRgb(0x23, 0x36, 0x4E)) : AiredFill,
+            Fill = onAir is null ? SegmentFill : AiredFill,
             Stroke = Brush(onAir is not null || recording ? "Warn" : "Accent"),
             StrokeThickness = 1,
             Margin = new Thickness(a, 0, 0, 0),
@@ -2678,7 +2814,7 @@ public partial class LiveEditWindow : Window
                     Height = height,
                     RadiusX = 3,
                     RadiusY = 3,
-                    Fill = new SolidColorBrush(Color.FromRgb(0x23, 0x36, 0x4E)),
+                    Fill = SegmentFill,
                     Stroke = Brush(recording ? "Warn" : "Accent"),
                     StrokeThickness = 1,
                     Margin = new Thickness(b, 0, 0, 0),
@@ -2697,7 +2833,7 @@ public partial class LiveEditWindow : Window
 
             Foreground = Brush(recording ? "Warn" : "Text"),
             FontSize = 10.5,
-            FontFamily = new FontFamily("Consolas"),
+            FontFamily = Mono,
         };
 
         Canvas.SetLeft(label, a + 6);
@@ -2719,7 +2855,7 @@ public partial class LiveEditWindow : Window
                                        : segment.Clip.DisplayName,
                 Foreground = Brush(segment.Pending ? "Warn" : "Muted"),
                 FontSize = 9.5,
-                FontFamily = new FontFamily("Consolas"),
+                FontFamily = Mono,
                 MaxWidth = Math.Max(60, width / 2 - 20),
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 ToolTip = $"{segment.Clip.Name}\n{Stamp(segment.StartFrame)} - {Stamp(segment.EndFrame)}",
@@ -2922,13 +3058,23 @@ public partial class LiveEditWindow : Window
                 : $"NO EDIT ZONE - {Stamp(ruler)} is in the next ten seconds of air, or before it." +
                   (EditableFrom is { } from ? $" The earliest it can start is {Stamp(from)}." : "");
 
-        var ask = new IngestDropDialog(path, frames, start, _markIn, _markOut, _rate, _dayFrames,
+        DateTime askedOn = _day;
+
+        var ask = new IngestDropDialog(path, frames, start, _markIn, _markOut, _rate, _dayFrames, _day,
                                        Captured, RefusedAt, hasVideo, hasAudio)
         {
             Owner = this,
         };
 
         if (ask.ShowDialog() != true) return;
+
+        // The ruler can roll over midnight behind the dialog. Its frames count from the day it
+        // was opened on, so taken as they are the item would go to air twenty-four hours late.
+        if (_day.Date != askedOn.Date)
+        {
+            Refuse($"Nothing placed - the timeline moved to {_day:ddd d MMM} while that was open. Drop it again.");
+            return;
+        }
 
         IngestPlan plan = ask.Plan;
 
@@ -3799,7 +3945,9 @@ public partial class LiveEditWindow : Window
     {
         if (span == current.SpanFrames) return current.TickFrames;
 
-        foreach (ZoomLevel rung in _ladder.OrderBy(r => r.SpanFrames))
+        _ladderBySpan ??= _ladder.OrderBy(r => r.SpanFrames).ToArray();
+
+        foreach (ZoomLevel rung in _ladderBySpan)
             if (rung.SpanFrames >= span) return rung.TickFrames;
 
         return current.TickFrames;
@@ -3825,9 +3973,13 @@ public partial class LiveEditWindow : Window
         // twenty-five times a second and be unreadable.
         if (!_playing) FollowDetails();
 
-        // There is nothing to export until both marks are set the right way round.
-        ExportButton.IsEnabled = _markIn is { } mIn && _markOut is { } mOut && mOut > mIn;
-        DeleteSceneButton.IsEnabled = ExportButton.IsEnabled;
+        // There is nothing to export until both marks are set the right way round. Waiting for a
+        // master, the button is the way to call the wait off, so it stays live.
+        bool marked = _markIn is { } mIn && _markOut is { } mOut && mOut > mIn;
+        DeleteSceneButton.IsEnabled = marked;
+
+        if (_waitingExport is not null) ShowWaitingExport(banner: false);
+        else ExportButton.IsEnabled = marked && !_exporting;
 
         ShowGoTo();
     }
@@ -3841,6 +3993,26 @@ public partial class LiveEditWindow : Window
     /// </summary>
     /// <summary>What has already gone to air: a dark orange, the warning colour, behind the Warn outline.</summary>
     private static readonly Brush AiredFill = Frozen(new SolidColorBrush(Color.FromRgb(0x5C, 0x3A, 0x10)));
+
+    // Made once and frozen. Each was a new brush for every block of every redraw, hundreds a time.
+    private static readonly Brush SegmentFill = Frozen(new SolidColorBrush(Color.FromRgb(0x23, 0x36, 0x4E)));
+    private static readonly Brush MarkedRangeFill = Frozen(new SolidColorBrush(Color.FromArgb(0x50, 0x4A, 0xD1, 0x95)));
+    private static readonly Brush IngestItemFill = Frozen(new SolidColorBrush(Color.FromArgb(0x55, 0x3B, 0x82, 0xF6)));
+    private static readonly Brush TagBackground = Frozen(new SolidColorBrush(Color.FromArgb(0xD0, 0x10, 0x14, 0x19)));
+    private static readonly Brush CardBackground = Frozen(new SolidColorBrush(Color.FromArgb(0xE6, 0x10, 0x16, 0x1D)));
+
+    private static readonly FontFamily Mono = new("Consolas");
+
+    private static readonly DoubleCollection Dash32 = FrozenDash(3, 2);
+    private static readonly DoubleCollection Dash23 = FrozenDash(2, 3);
+    private static readonly DoubleCollection Dash42 = FrozenDash(4, 2);
+
+    private static DoubleCollection FrozenDash(double on, double off)
+    {
+        var dash = new DoubleCollection { on, off };
+        dash.Freeze();
+        return dash;
+    }
 
     private static Brush Frozen(Brush brush)
     {
@@ -3940,10 +4112,15 @@ public partial class LiveEditWindow : Window
         // playback - the redraw shares the thread that drives the player.
         IEnumerable<Placed> inOrder = !_infinite
             ? Enumerable.Empty<Placed>()
-            : _placed
-                .Where(p => OnScreen(p, items, start, span))
+            : Visible(_placed, items, start, span, _longestPlaced)
                 .OrderBy(p => p.Folder == _primaryFolder)
                 .ThenBy(p => p.StartFrame);
+
+        // Segments narrower than a pixel or so, drawn as one block per run rather than one each.
+        // A whole day fitted to the screen is thousands of segments a fifth of a pixel wide, and a
+        // rectangle for every one, a dozen times a second, looks exactly like one block anyway.
+        double runFrom = -1, runTo = -1;
+        (bool Aired, bool Primary) runKind = default;
 
         foreach (Placed placed in inOrder)
         {
@@ -3979,8 +4156,50 @@ public partial class LiveEditWindow : Window
                 // skipped as out of range.
                 if (piece.RulerEnd < start || piece.RulerStart > start + span) continue;
 
+                double px0 = Math.Max(0, (piece.RulerStart - start) / (double)span * width);
+                double px1 = Math.Min(width, (piece.RulerEnd - start) / (double)span * width);
+
+                if (px1 - px0 < 1.5 && !current && !placed.Pending)
+                {
+                    (bool, bool) kind = (airedTo is { } air && piece.RulerEnd <= air,
+                                         _primaryFolder is null || placed.Folder == _primaryFolder);
+
+                    if (runFrom >= 0 && kind == runKind && px0 <= runTo + 1)
+                    {
+                        runTo = Math.Max(runTo, px1);
+                        continue;
+                    }
+
+                    FlushRun();
+                    (runFrom, runTo, runKind) = (px0, px1, kind);
+                    continue;
+                }
+
+                FlushRun();
                 DrawSegmentPiece(placed, piece, i == labelOn, current, width, start, span, height);
             }
+        }
+
+        FlushRun();
+
+        void FlushRun()
+        {
+            if (runFrom < 0) return;
+
+            TrackCanvas.Children.Add(new Rectangle
+            {
+                Width = Math.Max(1, runTo - runFrom),
+                Height = height,
+                RadiusX = 3,
+                RadiusY = 3,
+                Fill = runKind.Aired ? AiredFill : SegmentFill,
+                Stroke = (Brush)FindResource(runKind.Aired ? "Warn" : "Accent"),
+                StrokeThickness = 1,
+                Opacity = runKind.Primary ? 1.0 : 0.5,
+                Margin = new Thickness(runFrom, 0, 0, 0),
+            });
+
+            runFrom = runTo = -1;
         }
 
         void DrawSegmentPiece(Placed placed, IngestTimeline.Piece piece, bool labelled,
@@ -4009,9 +4228,9 @@ public partial class LiveEditWindow : Window
                 // A segment still being recorded is drawn as an outline with no fill: it is on
                 // the clock, it is where the recorder is, and it cannot be played yet.
                 Fill = placed.Pending
-                    ? new SolidColorBrush(Color.FromArgb(0x30, 0xF5, 0x9E, 0x0B))
+                    ? PendingBlockFill
                     : aired ? AiredFill
-                    : new SolidColorBrush(Color.FromRgb(0x23, 0x36, 0x4E)),
+                    : SegmentFill,
 
                 Stroke = (Brush)FindResource(placed.Pending || aired ? "Warn" : current ? "Ok" : "Accent"),
                 StrokeThickness = current ? 2 : 1,
@@ -4066,7 +4285,7 @@ public partial class LiveEditWindow : Window
                            (placed.Pending ? "  (assumed)" : ""),
                     Foreground = Brush(placed.Pending ? "Warn" : "Muted"),
                     FontSize = 9.5,
-                    FontFamily = new FontFamily("Consolas"),
+                    FontFamily = Mono,
                     MaxWidth = Math.Max(20, to - from - 12),
                     TextTrimming = TextTrimming.CharacterEllipsis,
                 };
@@ -4088,7 +4307,7 @@ public partial class LiveEditWindow : Window
                 {
                     Width = b - a,
                     Height = height,
-                    Fill = new SolidColorBrush(Color.FromArgb(0x50, 0x4A, 0xD1, 0x95)),
+                    Fill = MarkedRangeFill,
                     Margin = new Thickness(a, 0, 0, 0),
                 });
         }
@@ -4127,7 +4346,7 @@ public partial class LiveEditWindow : Window
             {
                 Text = label,
                 Foreground = Brush("Ok"),
-                FontFamily = new FontFamily("Consolas"),
+                FontFamily = Mono,
                 FontSize = 8.5,
                 FontWeight = FontWeights.Bold,
             };
@@ -4187,10 +4406,10 @@ public partial class LiveEditWindow : Window
                 Height = height,
                 RadiusX = 3,
                 RadiusY = 3,
-                Fill = aired ? AiredFill : new SolidColorBrush(Color.FromArgb(0x55, 0x3B, 0x82, 0xF6)),
+                Fill = aired ? AiredFill : IngestItemFill,
                 Stroke = Brush(chosen ? "Tc" : aired ? "Warn" : "Accent"),
                 StrokeThickness = chosen ? 2 : 1,
-                StrokeDashArray = plan.Stretched ? new DoubleCollection { 3, 2 } : null,
+                StrokeDashArray = plan.Stretched ? Dash32 : null,
                 Margin = new Thickness(from, 3, 0, 0),
                 ToolTip = $"{overlay.Name}\n{plan.Mode}: {IngestPlacement.Describe(plan, _rate)}",
             });
@@ -4209,7 +4428,7 @@ public partial class LiveEditWindow : Window
                         Fill = Brushes.Transparent,
                         Stroke = Brush("Muted"),
                         StrokeThickness = 1,
-                        StrokeDashArray = new DoubleCollection { 2, 3 },
+                        StrokeDashArray = Dash23,
                         Margin = new Thickness(to, 3, 0, 0),
                         ToolTip = "the rest of the marked range - the original plays on here",
                     });
@@ -4225,7 +4444,7 @@ public partial class LiveEditWindow : Window
 
                     Foreground = (Brush)FindResource("Text"),
                     FontSize = 9.5,
-                    FontFamily = new FontFamily("Consolas"),
+                    FontFamily = Mono,
                     MaxWidth = Math.Max(20, to - from - 8),
                     TextTrimming = TextTrimming.CharacterEllipsis,
                     IsHitTestVisible = false,
@@ -4241,7 +4460,7 @@ public partial class LiveEditWindow : Window
         {
             Text = "INGEST",
             Foreground = Brush("Accent"),
-            FontFamily = new FontFamily("Consolas"),
+            FontFamily = Mono,
             FontSize = 9.5,
             IsHitTestVisible = false,
         };
@@ -4280,7 +4499,7 @@ public partial class LiveEditWindow : Window
 
             var tag = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(0xD0, 0x10, 0x14, 0x19)),
+                Background = TagBackground,
                 CornerRadius = new CornerRadius(2),
                 Padding = new Thickness(3, 0, 3, 0),
                 IsHitTestVisible = false,
@@ -4289,7 +4508,7 @@ public partial class LiveEditWindow : Window
                     Text = $"✂ -{new Timecode(plan.Covers, _rate)}",
                     Foreground = Brush(chosen ? "Tc" : "Bad"),
                     FontSize = 9.5,
-                    FontFamily = new FontFamily("Consolas"),
+                    FontFamily = Mono,
                     FontWeight = FontWeights.Bold,
                 },
             };
@@ -4304,10 +4523,21 @@ public partial class LiveEditWindow : Window
     /// A drop was recorded somewhere in the plant. Only redraws when it is on the day being
     /// looked at, so a window left open on last Tuesday is not rebuilt by tonight's losses.
     /// </summary>
-    private void OnDropsChanged() => Dispatcher.BeginInvoke(() =>
+    private void OnDropsChanged()
     {
-        if (DropMarks.Shared.On(_day).Count > 0) Draw();
-    }, DispatcherPriority.Background);
+        // One redraw however many arrive before it runs. A plant that is struggling drops frames
+        // by the hundred, and a whole timeline redrawn for each was more work at the worst time.
+        if (Interlocked.Exchange(ref _dropRedrawQueued, 1) != 0) return;
+
+        Dispatcher.BeginInvoke(() =>
+        {
+            Volatile.Write(ref _dropRedrawQueued, 0);
+
+            if (DropMarks.Shared.AnyOn(_day)) Draw();
+        }, DispatcherPriority.Background);
+    }
+
+    private int _dropRedrawQueued;
 
     private void LiveEditWindow_Closing(object? sender, CancelEventArgs e)
     {
@@ -4340,6 +4570,35 @@ public partial class LiveEditWindow : Window
             EndLive("Live Edit went off air - its window was closed.");
         }
 
+        // An export being cut, or waiting for its master, is this window's too: it is called off
+        // when the window closes rather than left running with nobody to see it finish.
+        if (_exportCancel is not null || _waitingExport is not null)
+        {
+            bool keep;
+
+            try
+            {
+                keep = MessageBox.Show(this,
+                        "An export is running. Closing Live Edit calls it off and removes what it has written so far.\n\nClose anyway?",
+                        "Export running", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK;
+            }
+            catch (InvalidOperationException)
+            {
+                keep = false;
+            }
+
+            if (keep)
+            {
+                e.Cancel = true;
+                return;
+            }
+
+            _waitingExport = null;
+            _exportCancel?.Cancel();
+        }
+
+        _closed = true;
+
         UnwireLive();
         LeaveRecordingView();
         _heldPicture.Dispose();
@@ -4349,6 +4608,9 @@ public partial class LiveEditWindow : Window
 
         // A static event holds this window for the life of the process otherwise.
         DropMarks.Shared.Changed -= OnDropsChanged;
+
+        foreach (IDisposable gauge in _gauges) gauge.Dispose();
+        _gauges = Array.Empty<IDisposable>();
 
         // Written on the way out as well as on every change, so a note typed and then forgotten
         // about is not lost by closing the window.
@@ -4542,67 +4804,216 @@ public partial class LiveEditWindow : Window
     /// codecs and produce either a failure or something worse. A range where any segment is
     /// missing its master falls back to proxies throughout, and the log says which it used.
     ///
-    /// A segment still being written is left out entirely. It has no readable duration, so it is
+    /// A proxy still being written is left out entirely. It has no readable duration, so it is
     /// laid out on an assumption, and cutting against an assumption is how you export the wrong
     /// material.
+    ///
+    /// <b>Masters by their own offsets.</b> A master runs five minutes and holds several proxies,
+    /// so the cut is planned on the recording's masters as laid out on the clock - never on the
+    /// proxies' starts with the master's name swapped in, which cut the wrong minutes from it.
+    ///
+    /// <b>A master still being written is waited for.</b> The newest five minutes are always in an
+    /// open master. When the range reaches into it, <paramref name="waitFor"/> is that master's
+    /// start, and the caller waits for it to close rather than cutting from the proxies.
     /// </summary>
     private (IReadOnlyList<RangePart> Parts, string Extension, bool Masters) PlanRange(
-        long inFrame, long outFrame)
+        long inFrame, long outFrame, out DateTime? waitFor)
     {
+        waitFor = null;
+
         List<Placed> touched = _placed
-            .Where(p => !p.Pending && p.EndFrame > inFrame && p.StartFrame < outFrame)
+            .Where(p => p.EndFrame > inFrame && p.StartFrame < outFrame)
             .OrderBy(p => p.StartFrame)
             .ToList();
 
-        bool masters = touched.Count > 0 && touched.All(p => p.Clip.HasMaster);
+        List<Placed> finished = touched.Where(p => !p.Pending).ToList();
 
-        List<(string Path, long StartFrame, long Frames)> segments = touched
-            .Select(p => (Path: masters ? p.Clip.MasterPath! : p.Clip.Path, p.StartFrame, p.Frames))
-            .ToList();
+        // Every part of the range has a master, closed or not. Otherwise proxies throughout.
+        bool masters = touched.Count > 0 && touched.All(p => p.Clip.MasterPath is not null);
 
-        string source = segments.Count > 0 ? segments[0].Path : ".mp4";
+        var parts = new List<RangePart>();
 
-        return (RangePlan.Parts(segments, inFrame, outFrame),
-                System.IO.Path.GetExtension(source).TrimStart('.'),
-                masters);
+        if (masters)
+        {
+            foreach (IGrouping<string?, Placed> recording in touched
+                         .GroupBy(p => p.Folder, StringComparer.OrdinalIgnoreCase)
+                         .OrderBy(g => g.Min(p => p.StartFrame)))
+            {
+                // A flat old recording, paired by name: its master is the proxy's own span.
+                if (recording.Key is null || recording.Any(p => p.Clip.Masters is null))
+                {
+                    parts.AddRange(RangePlan.Parts(
+                        recording.Where(p => !p.Pending).Select(p => (p.Clip.MasterPath!, p.StartFrame, p.Frames)).ToList(),
+                        inFrame, outFrame));
+                    continue;
+                }
+
+                IReadOnlyList<MasterSegment> laid = Store().MastersOf(recording.Key);
+
+                parts.AddRange(RangePlan.FromMasters(
+                    laid.Select(m => (m.Path, FrameOn(m.Starts),
+                                      m.Open ? 0L : (long)Math.Round(m.Runs.TotalSeconds * _rate))).ToList(),
+                    recording.Min(p => p.StartFrame), recording.Max(p => p.EndFrame),
+                    inFrame, outFrame, out bool waits));
+
+                if (waits) waitFor = laid.First(m => m.Open).Starts;
+            }
+
+            // Masters with a gap the proxies do not have - deleted by hand, say - are not cut
+            // across. A frame or two short is the proxies' cuts landing on a keyframe, not a gap.
+            long want = RangePlan.Parts(finished.Select(p => (p.Clip.Path, p.StartFrame, p.Frames)).ToList(),
+                                        inFrame, outFrame).Sum(p => p.Frames);
+
+            if (waitFor is null && parts.Sum(p => p.Frames) + 2 < want)
+            {
+                masters = false;
+                parts.Clear();
+            }
+        }
+
+        if (!masters)
+            parts.AddRange(RangePlan.Parts(
+                finished.Select(p => (p.Clip.Path, p.StartFrame, p.Frames)).ToList(), inFrame, outFrame));
+
+        string source = parts.Count > 0 ? parts[0].Path : ".mp4";
+
+        return (parts, System.IO.Path.GetExtension(source).TrimStart('.'), masters);
     }
+
+    /// <summary>
+    /// An export waiting for the master it needs to close: what to call it, what was marked, and
+    /// when the master began, for the countdown. Null when nothing is waiting.
+    /// </summary>
+    private (string Name, string Metadata, long In, long Out, DateTime MasterStarted)? _waitingExport;
 
     private void Export_Click(object sender, RoutedEventArgs e)
     {
+        // Pressed again while waiting: the wait is called off.
+        if (_waitingExport is { } waiting)
+        {
+            _waitingExport = null;
+            HideExporting();
+            ExportButton.Content = "Export";
+            StoreText.Text = $"Export of {waiting.Name} called off.";
+
+            ActivityLog.Shared.Info(LogSource.App,
+                $"EXPORT  {waiting.Name} called off while waiting for its master.",
+                @event: "liveedit.exportcancelled");
+
+            ShowPosition();
+            return;
+        }
+
         if (_markIn is not { } inFrame || _markOut is not { } outFrame || outFrame <= inFrame)
             return;
 
         (IReadOnlyList<RangePart> parts, string extension, bool masters) =
-            PlanRange(inFrame, outFrame);
+            PlanRange(inFrame, outFrame, out DateTime? waitFor);
 
-        if (parts.Count == 0)
+        if (parts.Count == 0 && waitFor is null)
         {
             StoreText.Text = "The marked range covers no finished media - a segment still being "
                            + "recorded cannot be exported until the recorder closes it.";
             return;
         }
 
-        if (Ffmpeg.Locate(_settings.FfmpegPath) is not { } ffmpeg)
+        if (Ffmpeg.Locate(_settings.FfmpegPath) is null)
         {
             StoreText.Text = "ffmpeg was not found, so a range cannot be cut.";
             return;
         }
 
-        string store = MediaLibrary.FolderFor(_settings);
+        // Waiting for a master, the dialog is shown the range as it will be cut once it closes.
+        if (waitFor is not null) extension = RecordingProfile.HighRes.Extension;
 
         var dialog = new ExportDialog(
             RangePlan.SuggestName(RecordingName(), new Timecode(inFrame, _rate)),
             extension,
             new Timecode(inFrame, _rate), new Timecode(outFrame, _rate),
-            _rate, parts, store)
+            _rate, waitFor is null ? parts : new[] { new RangePart("the master being recorded", 0, outFrame - inFrame) },
+            MediaLibrary.FolderFor(_settings))
         {
             Owner = this,
         };
 
         if (dialog.ShowDialog() != true) return;
 
-        string name = dialog.ExportName;
-        string metadata = dialog.Metadata;
+        if (waitFor is { } started)
+        {
+            _waitingExport = (dialog.ExportName, dialog.Metadata, inFrame, outFrame, started);
+
+            ActivityLog.Shared.Info(LogSource.App,
+                $"EXPORT  {dialog.ExportName} waits for the master being recorded to close, " +
+                $"about {MasterCountdown(started)} from now, and will then be cut from it.",
+                @event: "liveedit.exportwaiting");
+
+            ShowWaitingExport();
+            return;
+        }
+
+        RunExport(dialog.ExportName, dialog.Metadata, inFrame, outFrame);
+    }
+
+    /// <summary>How long until a master that began at <paramref name="started"/> is due to close.</summary>
+    private static string MasterCountdown(DateTime started)
+    {
+        TimeSpan left = started.AddSeconds(RecordingProfile.MasterSegmentSeconds) - DateTime.Now;
+        if (left < TimeSpan.Zero) left = TimeSpan.Zero;
+
+        return $"{(int)left.TotalMinutes}:{left.Seconds:00}";
+    }
+
+    /// <summary>The button and the banner while an export waits for its master: a countdown, and a way out.</summary>
+    private void ShowWaitingExport(bool banner = true)
+    {
+        if (_waitingExport is not { } waiting) return;
+
+        string countdown = MasterCountdown(waiting.MasterStarted);
+
+        ExportButton.Content = $"Waiting for master, {countdown}";
+        ExportButton.ToolTip = "The range reaches into the master still being recorded. It is cut from "
+                             + "the master as soon as the recorder closes it. Press to call it off.";
+        ExportButton.IsEnabled = true;
+
+        if (banner) ShowExporting(waiting.Name, $"waiting for the master to close, {countdown}");
+    }
+
+    /// <summary>
+    /// On the store's two-second watch: an export waiting for its master starts once the master
+    /// has closed and the store has read it.
+    /// </summary>
+    private void TryWaitingExport()
+    {
+        if (_waitingExport is not { } waiting || _listing) return;
+
+        PlanRange(waiting.In, waiting.Out, out DateTime? still);
+
+        if (still is not null)
+        {
+            ShowWaitingExport();
+            return;
+        }
+
+        _waitingExport = null;
+        ExportButton.Content = "Export";
+
+        RunExport(waiting.Name, waiting.Metadata, waiting.In, waiting.Out);
+    }
+
+    /// <summary>Cuts a range that has everything it needs on disk, planned afresh now.</summary>
+    private void RunExport(string name, string metadata, long inFrame, long outFrame)
+    {
+        (IReadOnlyList<RangePart> parts, string extension, bool masters) =
+            PlanRange(inFrame, outFrame, out _);
+
+        if (parts.Count == 0 || Ffmpeg.Locate(_settings.FfmpegPath) is not { } ffmpeg)
+        {
+            HideExporting();
+            StoreText.Text = $"Export of {name} could not start: the range covers no finished media.";
+            return;
+        }
+
+        string store = MediaLibrary.FolderFor(_settings);
         int rate = _rate;
 
         ActivityLog.Shared.Info(LogSource.App,
@@ -4623,19 +5034,37 @@ public partial class LiveEditWindow : Window
 
         if (!_showingIngest) Tab_Changed(IngestTab, new RoutedEventArgs());
 
+        var cancel = new CancellationTokenSource();
+        _exportCancel = cancel;
+
         Task.Run(() => RangeExport.Write(
                      ffmpeg, store, name, metadata, parts, rate, extension,
                      // Off the dispatcher, so it hops back before touching the banner.
-                     progress: stage => Dispatcher.BeginInvoke(
-                         () => ShowExporting($"{name}.{extension}", stage))))
+                     progress: stage => Dispatcher.BeginInvoke(() =>
+                     {
+                         if (!_closed) ShowExporting($"{name}.{extension}", stage);
+                     }),
+                     cancel: cancel.Token))
             .ContinueWith(t =>
             {
-                ExportButton.IsEnabled = true;
-                HideExporting();
+                _exportCancel = null;
+                cancel.Dispose();
 
                 ExportResult result = t.IsFaulted
                     ? new ExportResult(false, "", t.Exception?.GetBaseException().Message ?? "failed")
                     : t.Result;
+
+                // Called off by closing the window: said in the log, and the closed window left alone.
+                if (_closed)
+                {
+                    ActivityLog.Shared.Warn(LogSource.App,
+                        $"EXPORT  {name}.{extension} was called off: Live Edit was closed while it was being cut.",
+                        @event: "liveedit.exportcancelled");
+                    return;
+                }
+
+                ExportButton.IsEnabled = true;
+                HideExporting();
 
                 if (!result.Ok)
                 {
@@ -4666,6 +5095,12 @@ public partial class LiveEditWindow : Window
 
     /// <summary>True while an export is being written, so the panel does not contradict itself.</summary>
     private bool _exporting;
+
+    /// <summary>Calls off the export being cut, if one is. Null when none is running.</summary>
+    private CancellationTokenSource? _exportCancel;
+
+    /// <summary>The window has closed: work finishing in the background leaves it alone.</summary>
+    private bool _closed;
 
     /// <summary>
     /// Puts the Ingest panel into its working state, and says which part is running.
@@ -4816,7 +5251,7 @@ public partial class LiveEditWindow : Window
                 Text = label,
                 Width = 30,
                 Foreground = Brush("Muted"),
-                FontFamily = new FontFamily("Consolas"),
+                FontFamily = Mono,
                 FontSize = 10,
             });
 
@@ -4824,7 +5259,7 @@ public partial class LiveEditWindow : Window
             {
                 Text = value,
                 Foreground = Brush(brush),
-                FontFamily = new FontFamily("Consolas"),
+                FontFamily = Mono,
                 FontSize = 11,
                 FontWeight = FontWeights.Bold,
             });
@@ -4841,7 +5276,7 @@ public partial class LiveEditWindow : Window
         var card = new Border
         {
             Child = lines,
-            Background = new SolidColorBrush(Color.FromArgb(0xE6, 0x10, 0x16, 0x1D)),
+            Background = CardBackground,
             BorderBrush = Brush("Ok"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(4),
@@ -4978,7 +5413,7 @@ public partial class LiveEditWindow : Window
                 Text = mark.Label,
                 Foreground = amber,
                 FontSize = 9.5,
-                FontFamily = new FontFamily("Consolas"),
+                FontFamily = Mono,
                 MaxWidth = cap,
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 ToolTip = tip,
@@ -5016,6 +5451,11 @@ public partial class LiveEditWindow : Window
         IEnumerable<DropMark> drops = Enumerable.Range(0, (int)((_dayFrames - 1) / _oneDay) + 1)
             .SelectMany(d => DropMarks.Shared.On(_day.AddDays(d)));
 
+        // One mark to a pixel. A bad feed can drop thousands of frames in a minute, and at a wide
+        // zoom they all land on the same few pixels: two rectangles each, every redraw, for marks
+        // drawn on top of one another.
+        var marked = new HashSet<int>();
+
         foreach (DropMark drop in drops)
         {
             long frame = FrameOn(drop.At);
@@ -5023,6 +5463,8 @@ public partial class LiveEditWindow : Window
             if (frame < start || frame > start + span) continue;
 
             if (TimelineZoom.XOf(frame, start, span, width) is not { } x) continue;
+
+            if (!marked.Add((int)x)) continue;
 
             string tip = $"{Stamp(frame)}  -  {drop.Label}";
 
@@ -5072,6 +5514,8 @@ public partial class LiveEditWindow : Window
     private void ShowInMonitor(string path, string caption, string? actual = null)
     {
         StopMonitor();
+
+        _activeAt = DateTime.UtcNow;
 
         _monitoring = actual ?? path;
 
@@ -5383,7 +5827,6 @@ public partial class LiveEditWindow : Window
         MonitorPlaceholder.Text = "select a file to preview it";
 
         // The lists and the timeline both held that file.
-        _signature = "";
         if (_showingIngest) LoadIngest(); else LoadClips();
     }
 
@@ -5392,10 +5835,26 @@ public partial class LiveEditWindow : Window
         _placed.Any(p => p.Pending &&
                          string.Equals(p.Clip.Path, path, StringComparison.OrdinalIgnoreCase));
 
-    /// <summary>The master beside a proxy, if this is a proxy and its master is on disk.</summary>
-    private string? MasterOf(string path) =>
-        _placed.FirstOrDefault(p =>
-            string.Equals(p.Clip.Path, path, StringComparison.OrdinalIgnoreCase))?.Clip.MasterPath;
+    /// <summary>
+    /// The master that goes with a proxy when it is deleted: only one holding nothing but this
+    /// proxy's picture, as every master did when both were cut alike. A master is five minutes
+    /// now, so deleting it with one unreadable proxy would take the minutes around it as well;
+    /// it stays, and goes when the storage limit takes it with all the proxies it holds.
+    /// </summary>
+    private string? MasterOf(string path)
+    {
+        if (_placed.FirstOrDefault(p => string.Equals(p.Clip.Path, path, StringComparison.OrdinalIgnoreCase))?.Clip
+            is not { MasterPath: { } master } clip)
+            return null;
+
+        if (clip.Masters is null) return master;
+
+        bool shared = _placed.Any(p =>
+            !string.Equals(p.Clip.Path, path, StringComparison.OrdinalIgnoreCase) &&
+            p.Clip.Masters?.Any(m => string.Equals(m.Path, master, StringComparison.OrdinalIgnoreCase)) == true);
+
+        return clip.Masters.Count == 1 && !shared ? master : null;
+    }
 
     /// <summary>
     /// Every file that belongs to one piece of media: the media itself first, then whatever was

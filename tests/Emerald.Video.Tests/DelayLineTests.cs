@@ -485,4 +485,63 @@ public sealed class DelayLineTests : IDisposable
 
         Assert.False(line.TryAddRef());
     }
+
+    // ------------------------------------------------------------------ trimming
+
+    /// <summary>
+    /// Trimming only says the pages need not stay in memory. What is on air must not be able to
+    /// tell: every frame the ring still holds reads back as written, round the end of the ring too.
+    /// </summary>
+    [Fact]
+    public void Trimmed_frames_read_back_exactly_after_the_ring_has_wrapped()
+    {
+        using DelayLine line = Open(TimeSpan.FromSeconds(20));
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        long total = line.SlotCount + 100;
+        for (long i = 0; i < total; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false);
+        }
+
+        Assert.True(line.TrimmedThrough > total - line.SlotCount, "the range read below must include trimmed frames");
+
+        for (long i = total - line.SlotCount; i < total; i++)
+        {
+            Assert.Equal(DelayReadResult.Ok, line.TryRead(i, buffer));
+            Assert.Equal(Pattern(line.FrameBytes, i), buffer.Video);
+        }
+    }
+
+    /// <summary>
+    /// A transmitter a long way behind keeps the pages it is about to read. A nearer reader beside
+    /// it does not shorten that, and once the far one stops they go.
+    /// </summary>
+    [Fact]
+    public void The_farthest_reader_holds_its_pages_until_it_goes_quiet()
+    {
+        using DelayLine line = Open(TimeSpan.FromSeconds(20));
+        DelayFrameBuffer buffer = line.NewBuffer();
+        byte[] frame = Pattern(line.FrameBytes, 0);
+
+        void Write(int count)
+        {
+            for (int i = 0; i < count; i++) line.Write(frame, frame.Length, null, 0, false);
+        }
+
+        // Ten seconds at 25 is 250 frames kept, with nothing reading.
+        Write(500);
+        Assert.Equal(250, line.TrimmedThrough);
+
+        // 400 behind plus the two-second margin keeps 450, and the mark comes back to meet it.
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(100, buffer));
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(490, buffer));
+        Write(25);
+        Assert.Equal(75, line.TrimmedThrough);
+
+        Thread.Sleep(2100);
+        Write(25);
+        Assert.Equal(300, line.TrimmedThrough);
+    }
 }

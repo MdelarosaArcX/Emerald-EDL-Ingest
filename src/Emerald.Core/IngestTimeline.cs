@@ -267,6 +267,17 @@ public static class IngestTimeline
         return pieces;
     }
 
-    private static IEnumerable<IngestItem> Ordered(IReadOnlyList<IngestItem> items) =>
-        items.OrderBy(i => i.Plan.StartFrame);
+    /// <summary>
+    /// The items in start order. A list already in order - which is how Live Edit hands them over -
+    /// is walked as it is: sorting it again was done several times every frame, once per segment
+    /// on screen at every redraw. The same order either way, because the sort is a stable one.
+    /// </summary>
+    private static IEnumerable<IngestItem> Ordered(IReadOnlyList<IngestItem> items)
+    {
+        for (int i = 1; i < items.Count; i++)
+            if (items[i].Plan.StartFrame < items[i - 1].Plan.StartFrame)
+                return items.OrderBy(item => item.Plan.StartFrame);
+
+        return items;
+    }
 }

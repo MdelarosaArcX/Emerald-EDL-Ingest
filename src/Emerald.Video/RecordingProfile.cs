@@ -43,7 +43,16 @@ public sealed record RecordingOutput(
     /// "DNxHD 145" <i>is</i> the setting, and the encoder refuses anything that is not one of
     /// the values in its table.
     /// </summary>
-    string? VideoBitrate = null)
+    string? VideoBitrate = null,
+
+    /// <summary>
+    /// How many threads this output's encoder gets, or 0 for ffmpeg's own choice. See
+    /// <see cref="RecordingProfile.FilterThreads"/> for why it is never left at that.
+    /// </summary>
+    int Threads = 0,
+
+    /// <summary>The encoder's <c>-thread_type</c>, when it matters. See <see cref="RecordingProfile.HighRes"/>.</summary>
+    string? ThreadType = null)
 {
     public string ContainerLabel => Extension.ToUpperInvariant();
 
@@ -77,11 +86,20 @@ public sealed record RecordingOutput(
 /// the operator sets on the deck is therefore also what the EDL records with, and there is a
 /// single answer to "how was this file made".
 /// </summary>
+/// <param name="GpuProxy">
+/// The proxy goes on the video card if this machine has one that works. The master cannot: there
+/// is no GPU encoder for DNxHD.
+/// </param>
+/// <param name="GpuEncoder">
+/// What <see cref="SdiCapture"/> settled on for this recording, by trying the card. Null is x264.
+/// </param>
 public sealed record RecordingProfile(
     int ProxyBitrateKbps,
     int AudioBitrateKbps,
     int AudioSampleRate,
-    int SegmentSeconds)
+    int SegmentSeconds,
+    bool GpuProxy = false,
+    ProxyEncoder? GpuEncoder = null)
 {
     /// <summary>
     /// The proxy: what the clip strip lists, what Live Edit scrubs, and what every viewer in
@@ -105,7 +123,9 @@ public sealed record RecordingProfile(
         VideoLabel: "H.264",
         PixelFormat: "yuv420p",
         HalfSize: false,
-        FourCc: "avc1");
+        FourCc: "avc1",
+        // Measured with the master at 1080p25 on this plant: over six times real time.
+        Threads: 6);
 
     /// <summary>
     /// The master, kept at full raster: <b>DNxHD 145</b>.
@@ -137,10 +157,45 @@ public sealed record RecordingProfile(
         // No -profile:v. DNxHD is selected by its bitrate; naming a profile would put the
         // encoder into DNxHR instead, which is a different codec with a different fourcc.
         FourCc: "AVdn",
-        VideoBitrate: "145M");
+        VideoBitrate: "145M",
+        // Slices, not frames. Left to itself the encoder runs one frame thread per logical CPU,
+        // each with its own whole copy of the encoder's tables and picture: most of the 3.7 GB
+        // ffmpeg was measured holding while recording here. Slice threads share one, and the
+        // file comes out byte for byte the same - checked by MD5 against frame threads and
+        // against a single thread.
+        Threads: 8,
+        ThreadType: "slice");
+
+    /// <summary>
+    /// How long each master file runs, whatever the proxy's segment length is set to.
+    ///
+    /// Fixed, and apart from the proxy's, because the two are for different things. The proxy is
+    /// cut short so the newest material can be played and scrubbed soon after it is recorded; the
+    /// master is only ever cut from by an export, and an export can wait for it. Cut at the
+    /// proxy's length the master was ten times the files for nothing: a 10 s proxy made 8,640
+    /// masters a day, each one listed, probed and kept track of.
+    ///
+    /// No offered proxy length is longer, so a proxy lies inside one master or across the
+    /// boundary between two, never more.
+    /// </summary>
+    public const int MasterSegmentSeconds = 300;
+
+    /// <summary>The length one output is cut at: the master's own, or the proxy's from the deck.</summary>
+    public int SegmentSecondsFor(RecordingOutput output) =>
+        output == HighRes ? MasterSegmentSeconds : SegmentSeconds;
 
     /// <summary>Both outputs, proxy first, which is the order ffmpeg is given them in.</summary>
     public static IReadOnlyList<RecordingOutput> Outputs { get; } = new[] { LowRes, HighRes };
+
+    /// <summary>
+    /// Threads for ffmpeg's filters, which here is only the pixel format conversion.
+    ///
+    /// <b>Every thread count on the command is stated, because ffmpeg's defaults follow the
+    /// machine.</b> On this plant's forty logical CPUs one recording ran 188 threads and held
+    /// 3.7 GB, for a job that needs about three cores. With these limits the same two encodes
+    /// peak near 410 MB, and run faster for not fighting over the same cores.
+    /// </summary>
+    public const int FilterThreads = 2;
 
     /// <summary>AAC on both files: a MOV carries it perfectly well alongside either codec.</summary>
     public const string AudioCodec = "aac";
@@ -199,14 +254,21 @@ public sealed record RecordingProfile(
         new RecordingOption<int>(60, "1 min"),
         new RecordingOption<int>(120, "2 min"),
         new RecordingOption<int>(300, "5 min"),
-        new RecordingOption<int>(600, "10 min"),
+        // Nothing longer than a master: a proxy is then always inside one or two of them.
+    };
+
+    public static IReadOnlyList<RecordingOption<bool>> ProxyEncoders { get; } = new[]
+    {
+        new RecordingOption<bool>(true, "Auto (GPU if installed)"),
+        new RecordingOption<bool>(false, "CPU only"),
     };
 
     public static RecordingProfile From(AppSettings settings) => new(
         ProxyBitrateKbps: Pick(ProxyBitrates, settings.RecordingVideoBitrateKbps, Default.ProxyBitrateKbps),
         AudioBitrateKbps: Pick(AudioBitrates, settings.RecordingAudioBitrateKbps, Default.AudioBitrateKbps),
         AudioSampleRate: Pick(SampleRates, settings.RecordingAudioSampleRate, Default.AudioSampleRate),
-        SegmentSeconds: Pick(SegmentLengths, settings.RecordingSegmentSeconds, Default.SegmentSeconds));
+        SegmentSeconds: Pick(SegmentLengths, settings.RecordingSegmentSeconds, Default.SegmentSeconds),
+        GpuProxy: settings.RecordingGpuProxy);
 
     public void ApplyTo(AppSettings settings)
     {
@@ -214,6 +276,7 @@ public sealed record RecordingProfile(
         settings.RecordingAudioBitrateKbps = AudioBitrateKbps;
         settings.RecordingAudioSampleRate = AudioSampleRate;
         settings.RecordingSegmentSeconds = SegmentSeconds;
+        settings.RecordingGpuProxy = GpuProxy;
     }
 
     /// <summary>An unknown value in the settings file falls back rather than reaching ffmpeg.</summary>
@@ -289,6 +352,7 @@ public sealed record RecordingProfile(
         var args = new List<string>
         {
             "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-filter_threads", FilterThreads.ToString(),
             "-f", "rawvideo", "-pix_fmt", "uyvy422",
             "-s", $"{format.Width}x{format.Height}", "-r", format.FrameRate.ToString(), "-i", "pipe:0",
             "-f", "s16le", "-ar", inputSampleRate.ToString(), "-ac", pipeChannels.ToString(),
@@ -344,7 +408,27 @@ public sealed record RecordingProfile(
                 args.Add("-filter:v"); args.Add($"scale={width}:{height}");
             }
 
-            args.Add("-c:v"); args.Add(output.VideoCodec);
+            // Keyframes, B-frames and folder are the same whichever encoder makes the proxy.
+            ProxyEncoder? onGpu = output == LowRes ? GpuEncoder : null;
+
+            if (onGpu is not null)
+            {
+                args.AddRange(onGpu.Arguments(format.FrameRate, ProxyBitrateKbps));
+            }
+            else
+            {
+                args.Add("-c:v"); args.Add(output.VideoCodec);
+            }
+
+            if (onGpu is null && output.Threads > 0)
+            {
+                args.Add("-threads"); args.Add(output.Threads.ToString());
+            }
+
+            if (output.ThreadType is { Length: > 0 } threadType)
+            {
+                args.Add("-thread_type"); args.Add(threadType);
+            }
 
             if (output.Profile is { Length: > 0 } videoProfile)
             {
@@ -356,7 +440,7 @@ public sealed record RecordingProfile(
                 args.Add("-b:v"); args.Add(videoBitrate);
             }
 
-            if (output.VideoCodec == "libx264")
+            if (output.VideoCodec == "libx264" && onGpu is null)
             {
                 // veryfast, not ultrafast.
                 //
@@ -409,7 +493,7 @@ public sealed record RecordingProfile(
                 }
             }
 
-            args.Add("-pix_fmt"); args.Add(output.PixelFormat);
+            args.Add("-pix_fmt"); args.Add(onGpu?.PixelFormat ?? output.PixelFormat);
 
             args.Add("-c:a"); args.Add(AudioCodec);
             args.Add("-b:a"); args.Add($"{AudioBitrateKbps}k");
@@ -457,7 +541,7 @@ public sealed record RecordingProfile(
             else
             {
                 args.Add("-f"); args.Add("segment");
-                args.Add("-segment_time"); args.Add(SegmentSeconds.ToString());
+                args.Add("-segment_time"); args.Add(SegmentSecondsFor(output).ToString());
                 args.Add("-segment_format"); args.Add(output.Muxer);
                 args.Add("-reset_timestamps"); args.Add("1");
 

@@ -168,11 +168,12 @@ For the engine threads the third column lists what they call. For the other file
 
 | File | Purpose | Depended on by |
 |---|---|---|
-| `MediaLibrary.cs` | The store's single source of truth: lists clips, pairs proxy with master, works out when each segment starts. | Shell, Live Edit, EDL, Ingest |
+| `MediaLibrary.cs` | `CapturedClip`, the store folder, and a one-shot listing through `StoreIndex`. Pairs old flat files with their master by name. | Shell, Live Edit, EDL, Ingest |
+| `StoreIndex.cs` | The store kept listed: a refresh reads only new or just-closed files. Lays out proxies and masters on their own lengths, gives each proxy the masters it falls in (`MasterSegment`). | Live Edit, `MediaLibrary`, `StorageWarden` |
 | `MediaProbe.cs` | Runs ffprobe, caches the result. | `MediaLibrary`, `RangeExport`, EDL, Live Edit, `IngestMediaRegistrar`, Shell (unreachable clip path) |
-| `MediaCodec.cs` | Managed MOV/MP4 atom walker, roughly 8 ms (comments in `MediaLibrary.cs`, `SegmentWatch.cs`) against 200 ms for ffprobe (comment in `MediaCodec.cs`). No native code. | `MediaLibrary`, `SegmentWatch`, `StorageWarden` |
+| `MediaCodec.cs` | Managed MOV/MP4 atom walker, which also reads the recorder's own segments for listings, roughly 8 ms (comments in `MediaLibrary.cs`, `SegmentWatch.cs`) against 200 ms for ffprobe (comment in `MediaCodec.cs`). No native code. | `MediaLibrary`, `SegmentWatch`, `StorageWarden` |
 | `MediaScanner.cs` | Extension list; turns a dropped path into a selection. | EDL, Live Edit, `MediaLibrary`, `RangeExport`, `StorageWarden` |
-| `RangeExport.cs` | Cuts a marked range from the masters with ffmpeg stream copy (proxies if a master is missing), then writes a JSON sidecar and an encoded H.264 preview, which is the slow part. Output goes to `<store>\ingest`. Also lists that folder and finds previews for Live Edit's Ingest tab. | Live Edit, `ExportDialog` |
+| `RangeExport.cs` | Cuts a marked range from the masters with ffmpeg stream copy (proxies if a master is missing); `RangePlan.FromMasters` plans the cut on the masters' own offsets. Cancellable, then writes a JSON sidecar and an encoded H.264 preview, which is the slow part. Output goes to `<store>\ingest`. Also lists that folder and finds previews for Live Edit's Ingest tab. | Live Edit, `ExportDialog` |
 | `SegmentWatch.cs` | Polls for finished segments. | Shell |
 | `StorageWarden.cs` | Deletes the oldest segments past the size limit. | Shell |
 | `PruneLedger.cs` | Records what was deleted so survivors keep their clock position. | `StorageWarden`, `MediaLibrary` |

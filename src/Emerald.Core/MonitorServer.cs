@@ -366,6 +366,11 @@ public sealed class MonitorServer : IDisposable
                 await Json(stream, MonitorFeed.Transmitted(_log), ct);
                 return;
 
+            // For a developer: what the process, its ffmpegs and each module are holding now.
+            case "/api/memory":
+                await Json(stream, MemoryMonitor.TakeJson(), ct);
+                return;
+
             default:
                 await Write(stream, 404, "text/plain", MonitorFeed.Bytes("no such thing here"), ct);
                 return;

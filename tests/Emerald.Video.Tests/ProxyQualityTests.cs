@@ -25,6 +25,7 @@ public sealed class ProxyQualityTests
             CaptureFrameRate = 25,
             RecordingSegmentSeconds = 30,
             RecordingAudioSampleRate = 48000,
+            RecordingGpuProxy = false,  // The GPU's are pinned in EncoderResourceTests.
         })
         .EncoderArguments(
             new CaptureFormat("1080i50", 1920, 1080, 25),

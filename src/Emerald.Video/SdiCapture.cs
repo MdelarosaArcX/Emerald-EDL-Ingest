@@ -89,11 +89,15 @@ public sealed class SdiCapture : IDisposable
     /// <summary>
     /// Every frame off the receiver, raised on the capture thread.
     ///
-    /// The arrays are freshly allocated per frame and become the handler's own to keep - unlike
-    /// <see cref="PreviewFrame"/>, which hands out a reused buffer. What it shares with
-    /// PreviewFrame is the contract that matters: <b>a handler must not block</b>. This runs
-    /// inside the slot loop, which is the receiver's clock, and the card has four slots of
-    /// headroom. Hand the frame to a queue and return.
+    /// <b>The picture is the handler's only until it returns.</b> Its buffer is used again for a
+    /// later frame, so a handler that queues the frame for another thread takes a claim on it
+    /// first with <see cref="CapturedFrame.Retain"/> and gives it up with
+    /// <see cref="CapturedFrame.Release"/> once that thread has read it - as
+    /// <see cref="DelayLine.Offer"/> does. The audio array is the handler's own to keep.
+    ///
+    /// And the contract it shares with <see cref="PreviewFrame"/>: <b>a handler must not
+    /// block</b>. This runs inside the slot loop, which is the receiver's clock, and the card has
+    /// four slots of headroom. Hand the frame to a queue and return.
     /// </summary>
     public event Action<CapturedFrame>? Frame;
 
@@ -157,6 +161,10 @@ public sealed class SdiCapture : IDisposable
         Interlocked.Exchange(ref _framesRecorded, 0);
         Volatile.Write(ref _pairsRecording, 0);
 
+        // Or the last recording's complaints are reported again at the end of this one, and once
+        // the list is full this one's are never kept at all.
+        lock (_encoderErrors) _encoderErrors.Clear();
+
         _cts = new CancellationTokenSource();
         CancellationToken ct = _cts.Token;
 
@@ -164,6 +172,10 @@ public sealed class SdiCapture : IDisposable
         {
             IsBackground = true,
             Name = "SDI capture",
+
+            // Parked on the card nearly all the time, and when a slot arrives it has four slots
+            // of headroom to take it in. Encoders and windows can wait a moment; the receiver cannot.
+            Priority = ThreadPriority.AboveNormal,
         };
 
         _worker.Start();
@@ -303,10 +315,13 @@ public sealed class SdiCapture : IDisposable
             VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_CORE_SP_BUFFERQUEUE_DEPTH, 4);
             VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_CORE_SP_IO_TIMEOUT, IoTimeoutMs);
 
+            // Before the stream starts, while nothing is waiting to be taken off the receiver.
+            request = ChooseProxyEncoder(request, format);
+
             (int proxyWidth, int proxyHeight) = RecordingProfile.HalfRaster(format);
 
-            Report($"Capture: RX{rxChannel} locked to {format.Name}, recording {request.Profile.SegmentSeconds}s " +
-                   $"segments to {folder} - {proxyWidth}x{proxyHeight} {RecordingProfile.LowRes.VideoLabel} proxy " +
+            Report($"Capture: RX{rxChannel} locked to {format.Name}, recording {request.Profile.SegmentSeconds}s proxy " +
+                   $"and {RecordingProfile.MasterSegmentSeconds / 60} min master segments to {folder} - {proxyWidth}x{proxyHeight} {request.Profile.GpuEncoder?.Label ?? RecordingProfile.LowRes.VideoLabel} proxy " +
                    $"and {RecordingProfile.HighRes.VideoLabel} master");
 
             rc = VideoMasterHD.VHD_StartStream(stream);
@@ -348,7 +363,13 @@ public sealed class SdiCapture : IDisposable
 
             int recordChannels = pairs * 2;
 
-            var frame = new byte[format.FrameBytes];
+            // One recording's worth of frame buffers, used round and round. See FramePool.
+            var pool = new FramePool(format.FrameBytes);
+
+            using IDisposable poolIdle = MemoryGauges.Register("Capture", "frame buffers idle in the pool", () => pool.WaitingBytes);
+            using IDisposable poolMade = MemoryGauges.Register("Capture", "frame buffers allocated this recording", () => pool.Made, "count");
+            using IDisposable poolFault = MemoryGauges.Register("Capture", "frame buffers released twice (must be 0)", () => pool.OverReleased, "count");
+
             int silenceBytes = SampleRate / format.FrameRate * recordChannels * 2;
             var interleaved = new byte[silenceBytes * 4];
 
@@ -383,6 +404,7 @@ public sealed class SdiCapture : IDisposable
             int lockFailures = 0;
             bool warnedNoSlots = false;
             var started = Stopwatch.StartNew();
+            var encoderWatch = new EncoderWatch(format.FrameRate);
 
             Report($"Capture: stream started on RX{rxChannel}, waiting for slots...");
 
@@ -454,6 +476,8 @@ public sealed class SdiCapture : IDisposable
                     continue;
                 }
 
+                FrameLease? picture = null;
+
                 try
                 {
                     IntPtr buffer = IntPtr.Zero;
@@ -468,8 +492,12 @@ public sealed class SdiCapture : IDisposable
                     if (VideoMasterHD.VHD_GetSlotBuffer(slot, VideoMasterHD.VHD_SDI_BT_VIDEO, ref buffer, ref size) == 0
                         && buffer != IntPtr.Zero)
                     {
-                        int take = Math.Min(frame.Length, (int)size);
-                        var copy = new byte[take];
+                        int take = Math.Min(format.FrameBytes, (int)size);
+
+                        // This loop's own claim on the buffer, given up when the slot is.
+                        picture = pool.Rent(take);
+
+                        byte[] copy = picture.Buffer;
                         Marshal.Copy(buffer, copy, 0, take);
 
                         // The same array goes to both consumers. Neither writes to it, so the
@@ -484,7 +512,10 @@ public sealed class SdiCapture : IDisposable
                         // this frame was - see the audio block below - because the two pipes
                         // carry no timestamps and their alignment is nothing more than how many
                         // of each were written.
-                        if (!encoder.OfferVideo(copy)) dropped++;
+                        bool taken = encoder.OfferVideo(picture);
+                        if (!taken) dropped++;
+
+                        ReportEncoderState(encoderWatch.Note(taken), frames, format.FrameRate);
 
                         if (PreviewFrame is not null && size >= (uint)format.FrameBytes &&
                             frames % previewEvery == 0)
@@ -566,7 +597,7 @@ public sealed class SdiCapture : IDisposable
                         {
                             tap.Invoke(new CapturedFrame(tapVideo, tapVideoBytes,
                                                          tapAudio, tapAudioBytes, audioReal,
-                                                         frames - 1));
+                                                         frames - 1, picture));
                         }
                         catch
                         {
@@ -577,6 +608,9 @@ public sealed class SdiCapture : IDisposable
                 finally
                 {
                     VideoMasterHD.VHD_UnlockSlotHandle(slot);
+
+                    // Whoever queued the frame holds it now. With nobody left, it is the next frame's.
+                    picture?.Release();
                 }
 
                 // Once a second, the counts go where the monitoring page reads them: what came
@@ -639,8 +673,15 @@ public sealed class SdiCapture : IDisposable
                 // The frame count is the recorder's own, so this is exact: the frames actually
                 // taken off the receiver, not an elapsed time. Dropped ones are said separately.
                 if (frames > 0 && frames % (format.FrameRate * 30) == 0)
+                {
                     Report($"REC   {request.NamePrefix} - {new Timecode(frames, format.FrameRate)} " +
                            $"({frames} frames{(dropped > 0 ? $", {dropped} dropped" : "")})");
+
+                    // Off this thread: asking a drive a question is not something to do on the
+                    // receiver's clock.
+                    string store = request.Folder;
+                    _ = Task.Run(() => CheckDisk(store, encoderWatch));
+                }
             }
 
             framesTaken = frames;
@@ -689,6 +730,20 @@ public sealed class SdiCapture : IDisposable
                 {
                     unused.Finish();
                     unused.RemoveIfEmpty(request.Folder);
+                }
+                else if (!upcoming.IsCompleted)
+                {
+                    // Still opening after five seconds. Closed whenever it does open, or its
+                    // ffmpeg would sit waiting on its input until the application went.
+                    string store = request.Folder;
+
+                    _ = upcoming.ContinueWith(t =>
+                    {
+                        if (!t.IsCompletedSuccessfully || t.Result is not { } late) return;
+
+                        late.Finish();
+                        late.RemoveIfEmpty(store);
+                    }, TaskScheduler.Default);
                 }
             }
 
@@ -741,6 +796,69 @@ public sealed class SdiCapture : IDisposable
     private readonly List<string> _encoderErrors = new();
 
     /// <summary>
+    /// Says that the encoder has stopped taking frames, and that it has started again.
+    ///
+    /// Not a <see cref="Fail"/>, and the recording is not stopped. The loop this runs in also
+    /// feeds the delay line, so stopping here would take whatever is on air off it a delay later,
+    /// because of a fault in the files. The operator is told, and decides.
+    /// </summary>
+    private void ReportEncoderState(EncoderState state, long frame, int frameRate)
+    {
+        if (state == EncoderState.Running) return;
+
+        Timecode at = new(frame, frameRate);
+
+        if (state == EncoderState.Recovered)
+        {
+            ActivityLog.Shared.Warn(LogSource.Capture,
+                $"Capture: the encoder is taking frames again at {at}. Nothing between the stall and here was recorded.",
+                @event: "capture.encoderrecovered", correlation: SessionId);
+            Message?.Invoke($"Capture: the encoder is taking frames again at {at}.", true);
+            return;
+        }
+
+        string? reason;
+        lock (_encoderErrors) reason = _encoderErrors.LastOrDefault();
+
+        string text = $"Capture: NOT RECORDING - the encoder has taken no frames for " +
+                      $"{EncoderWatch.StallSeconds} s, at {at}. " +
+                      (reason is null ? "It gave no reason. " : $"It said: {reason} ") +
+                      "Anything on air carries on. Check the disk, then stop and record again.";
+
+        ActivityLog.Shared.Error(LogSource.Capture, text, @event: "capture.encoderstalled", correlation: SessionId);
+        Message?.Invoke(text, true);
+    }
+
+    /// <summary>
+    /// Warns while there is still time to act. A full disk is the one thing that has ended a
+    /// recording on this plant: ffmpeg stays alive with its output dead, and takes no more frames.
+    /// </summary>
+    private void CheckDisk(string folder, EncoderWatch watch)
+    {
+        long free;
+
+        try
+        {
+            string? root = Path.GetPathRoot(Path.GetFullPath(folder));
+            if (string.IsNullOrEmpty(root)) return;
+
+            free = new DriveInfo(root).AvailableFreeSpace;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return;
+        }
+
+        if (!watch.NoteDiskSpace(free)) return;
+
+        string text = $"Capture: only {free / (1L << 30)} GB is free where this recording is going ({folder}). " +
+                      "It will stop writing when the disk is full.";
+
+        ActivityLog.Shared.Warn(LogSource.Capture, text, @event: "capture.lowdisk", correlation: SessionId);
+        Message?.Invoke(text, true);
+    }
+
+    /// <summary>
     /// The encoder for the next day's folder, started ahead of midnight. Null when it could not
     /// be: the recording then carries on in the old day's folder rather than stopping, and says so.
     /// </summary>
@@ -781,7 +899,7 @@ public sealed class SdiCapture : IDisposable
     {
         private readonly SdiCapture _owner;
         private readonly Task _connect;
-        private readonly BlockingCollection<byte[]> _video = new(VideoQueueDepth);
+        private readonly BlockingCollection<FrameLease> _video = new(VideoQueueDepth);
         private readonly BlockingCollection<byte[]> _audio = new(AudioQueueDepth);
         private readonly Thread _videoWriter;
         private readonly Thread _audioWriter;
@@ -814,7 +932,16 @@ public sealed class SdiCapture : IDisposable
 
             _videoWriter = new Thread(() =>
             {
-                try { foreach (byte[] b in _video.GetConsumingEnumerable()) videoOut.Write(b, 0, b.Length); }
+                try
+                {
+                    foreach (FrameLease frame in _video.GetConsumingEnumerable())
+                    {
+                        // Released whether or not the write went through: a pipe that has gone
+                        // must not keep the frame.
+                        try { videoOut.Write(frame.Buffer, 0, frame.Buffer.Length); }
+                        finally { frame.Release(); }
+                    }
+                }
                 catch { /* torn down */ }
                 finally { try { videoOut.Close(); } catch { } }
             })
@@ -869,9 +996,22 @@ public sealed class SdiCapture : IDisposable
         /// One frame of picture, if there is room for it. Never blocks: a stalled encoder must
         /// cost frames, not back up into the receiver and cause overruns.
         /// </summary>
-        public bool OfferVideo(byte[] frame)
+        public bool OfferVideo(FrameLease frame)
         {
-            if (!_video.TryAdd(frame)) return false;
+            // The queue's claim, taken before the writer can see the frame and given straight
+            // back if there was no room for it.
+            frame.Retain();
+
+            bool taken;
+
+            try { taken = _video.TryAdd(frame); }
+            catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { taken = false; }
+
+            if (!taken)
+            {
+                frame.Release();
+                return false;
+            }
 
             VideoIn++;
             return true;
@@ -950,6 +1090,28 @@ public sealed class SdiCapture : IDisposable
         }
     }
 
+    /// <summary>
+    /// Settles what encodes the proxy, once a recording, so a card that cannot do it costs the
+    /// proxy its GPU rather than costing the recording its files.
+    /// </summary>
+    private CaptureRequest ChooseProxyEncoder(CaptureRequest request, CaptureFormat format)
+    {
+        if (!request.Profile.GpuProxy)
+        {
+            Report("Capture: proxy on the CPU, as chosen.");
+            return request;
+        }
+
+        ProxyEncoder? encoder = GpuEncoder.Choose(request.FfmpegPath, format, request.Profile.ProxyBitrateKbps,
+                                                  out string account);
+
+        Report(encoder is null
+            ? $"Capture: proxy on the CPU - {account}"
+            : $"Capture: proxy on the video card, {encoder.Label} - {account}");
+
+        return request with { Profile = request.Profile with { GpuEncoder = encoder } };
+    }
+
     private Process StartEncoder(CaptureRequest request, string pipeName, CaptureFormat format, int audioPairs)
     {
         var info = new ProcessStartInfo(request.FfmpegPath)
@@ -969,6 +1131,8 @@ public sealed class SdiCapture : IDisposable
             info.ArgumentList.Add(a);
 
         Process ff = Process.Start(info) ?? throw new InvalidOperationException("Could not start ffmpeg for capture.");
+
+        MemoryGauges.NameChild(ff.Id, "capture encoder");
 
         // Kept, not discarded: a silent encoder failure is otherwise indistinguishable from
         // a working recording that happens to produce an empty file.
@@ -1074,7 +1238,18 @@ public sealed record CaptureResult(
 public readonly record struct CapturedFrame(
     byte[] Video, int VideoBytes,
     byte[]? Audio, int AudioBytes, bool AudioReal,
-    long Sequence);
+    long Sequence,
+    FrameLease? Lease = null)
+{
+    /// <summary>
+    /// Takes a claim on the picture, so it stays this frame's after the handler returns. Matched
+    /// by one <see cref="Release"/>. Nothing to do for a frame that owns its array outright.
+    /// </summary>
+    public void Retain() => Lease?.Retain();
+
+    /// <summary>Gives up a claim taken with <see cref="Retain"/>.</summary>
+    public void Release() => Lease?.Release();
+}
 
 /// <summary>
 /// Raster and rate of whatever the RX is locked to, plus the SDI standard it came from.

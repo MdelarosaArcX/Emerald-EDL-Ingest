@@ -125,6 +125,17 @@ public static class LiveCues
     public const long InsertGrace = 5;
 
     /// <summary>
+    /// Whether a cue could still take over at or after <paramref name="recordingFrame"/>. Not
+    /// once it is done; not an insert the transmitter is more than its grace past; not anything
+    /// else whose range has gone by. Decoders opened for a cue that cannot are closed.
+    /// </summary>
+    public static bool CanStillFire(LiveCue cue, long recordingFrame, IReadOnlySet<string> done) =>
+        !done.Contains(cue.Id) &&
+        (cue.Mode == IngestMode.Insert
+            ? recordingFrame - cue.RecordingFrame <= InsertGrace
+            : recordingFrame < cue.EndFrame);
+
+    /// <summary>
     /// Cues whose media should be opened now, so the decoder is running before they fire:
     /// anything with media, not done, starting within <paramref name="lookahead"/> frames.
     /// </summary>

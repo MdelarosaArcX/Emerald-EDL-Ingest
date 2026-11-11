@@ -535,6 +535,10 @@ public sealed class LiveAirTransmitter : IDisposable
         {
             if (prepared.ContainsKey(cue.Id)) continue;
 
+            // An insert the transmitter has passed without playing is still inside its own
+            // length, so it is still listed - and would be opened again on every frame.
+            if (!LiveCues.CanStillFire(cue, recording, done)) continue;
+
             prepared[cue.Id] = Task.Run(() => Open(cue, 0));
 
             Cue(cue, LogLevel.Info, "prepared",
@@ -542,11 +546,16 @@ public sealed class LiveAirTransmitter : IDisposable
                 $"{new Timecode(Math.Max(0, cue.RecordingFrame - recording), _format.FrameRate)}.");
         }
 
-        // A cue removed from the timeline after its media was opened: close the decoders now
-        // rather than leave two ffmpegs running for something that will never play.
-        foreach (string id in prepared.Keys.Where(id => !done.Contains(id) && cues.All(c => c.Id != id)).ToList())
+        // Media opened for a cue that will not now play it: taken off the timeline, passed
+        // without firing, or reached so late there was nothing of it left. Closed now rather than
+        // left as two ffmpegs and a second of decoded frames until the transmission ends. A cue
+        // that did take its media is not here: taking it removes it.
+        foreach (string id in prepared.Keys
+                     .Where(id => !cues.Any(c => c.Id == id && LiveCues.CanStillFire(c, recording, done)))
+                     .ToList())
         {
-            _ = prepared[id].ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result?.Dispose(); });
+            _ = prepared[id].ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result?.Dispose(); },
+                                          TaskScheduler.Default);
             prepared.Remove(id);
         }
     }
@@ -565,6 +574,12 @@ public sealed class LiveAirTransmitter : IDisposable
                 // last frame on air rather than cutting in without the media.
                 try { if (task.Wait(TimeSpan.FromSeconds(3)) && task.Result is { } ready) return PreRolled(ready); }
                 catch { /* fall through and try again directly */ }
+
+                // Not ready in time, so it is opened again below. The one still opening is closed
+                // when it finishes: nothing else knows about it any more, and left alone it kept
+                // two ffmpegs and a second of decoded frames until the application went.
+                _ = task.ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result?.Dispose(); },
+                                      TaskScheduler.Default);
             }
             else
             {
@@ -710,7 +725,7 @@ public sealed class LiveAirTransmitter : IDisposable
     {
         if (job.Audio is { } sound)
         {
-            sound.ReadFrame(left, right, job.Taken, 0);
+            sound.ReadVideoFrame(left, right, job.Taken);
 
             if (job.Cue.GainDb != 0) Scale(left, right, left.Length, AudioEdits.Linear(job.Cue.GainDb));
             return;

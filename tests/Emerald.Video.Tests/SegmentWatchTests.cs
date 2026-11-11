@@ -54,7 +54,7 @@ public sealed class SegmentWatchTests : IDisposable
     }
 
     [Fact]
-    public void A_finished_segment_is_announced_with_its_length_and_both_sizes()
+    public void A_finished_proxy_and_master_are_each_announced_with_their_length_and_size()
     {
         if (Ffmpeg is null) return;
 
@@ -66,12 +66,19 @@ public sealed class SegmentWatchTests : IDisposable
         var watch = new SegmentWatch(_root, "clip", DateTime.UtcNow.AddMinutes(-1));
         IReadOnlyList<CompletedSegment> done = watch.Poll();
 
-        CompletedSegment segment = Assert.Single(done);
+        Assert.Equal(2, done.Count);
+
+        CompletedSegment segment = done.Single(d => !d.IsMaster);
         Assert.Equal(1, segment.Number);
-        Assert.Equal(master, segment.MasterPath);
+        Assert.Equal(proxy, segment.Path);
         Assert.InRange(segment.Duration!.Value.TotalSeconds, 1.9, 2.1);
-        Assert.Equal(new FileInfo(proxy).Length, segment.ProxyBytes);
-        Assert.Equal(new FileInfo(master).Length, segment.MasterBytes);
+        Assert.Equal(new FileInfo(proxy).Length, segment.Bytes);
+
+        CompletedSegment closed = done.Single(d => d.IsMaster);
+        Assert.Equal(1, closed.Number);
+        Assert.Equal(master, closed.Path);
+        Assert.InRange(closed.Duration!.Value.TotalSeconds, 1.9, 2.1);
+        Assert.Equal(new FileInfo(master).Length, closed.Bytes);
     }
 
     [Fact]
@@ -94,9 +101,12 @@ public sealed class SegmentWatchTests : IDisposable
         Assert.Empty(watch.Poll());   // and never twice
     }
 
-    /// <summary>The master closes a moment after the proxy. Announcing then would halve the size.</summary>
+    /// <summary>
+    /// The master runs five minutes and the proxy less, so a proxy has no master to wait for:
+    /// holding it back kept the newest proxies unannounced for minutes.
+    /// </summary>
     [Fact]
-    public void A_segment_waits_for_its_master_to_close()
+    public void A_proxy_is_announced_without_waiting_for_the_master_which_is_announced_when_it_closes()
     {
         if (Ffmpeg is null) return;
 
@@ -109,11 +119,17 @@ public sealed class SegmentWatchTests : IDisposable
 
         var watch = new SegmentWatch(_root, "clip", DateTime.UtcNow.AddMinutes(-1));
 
-        Assert.Empty(watch.Poll());
+        CompletedSegment first = Assert.Single(watch.Poll());
+        Assert.False(first.IsMaster);
+        Assert.Equal(proxy, first.Path);
 
         File.WriteAllBytes(master, whole);
 
-        Assert.Equal(whole.Length, Assert.Single(watch.Poll()).MasterBytes);
+        CompletedSegment then = Assert.Single(watch.Poll());
+        Assert.True(then.IsMaster);
+        Assert.Equal(whole.Length, then.Bytes);
+
+        Assert.Empty(watch.Poll());   // and neither twice
     }
 
     [Fact]

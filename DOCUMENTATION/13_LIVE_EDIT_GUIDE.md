@@ -116,7 +116,8 @@ Pressing a mark again on the same frame removes it. A Mark In after the out poin
 Keep in mind:
 
 - The cut comes from the masters when every segment in the range has one, otherwise from the proxies. A proxy cut starts at the first keyframe at or after Mark In, so it may start late.
-- A segment still being recorded is left out.
+- Masters are 5 minutes long, so the newest few minutes are always in a master still being recorded. If the range reaches into it, Export **waits** for that master to close and then cuts from it. The button shows **Waiting for master, m:ss**; press it again to call the export off.
+- A proxy still being recorded is left out when the cut is from proxies.
 - The export is the recording as captured. Deleted scenes, placed items and sound levels are not applied.
 - A name already in the folder is refused rather than overwritten.
 
@@ -203,7 +204,9 @@ stateDiagram-v2
 
 ### Work past midnight
 
-A recording that runs past midnight continues on the same ruler, after 23:59. The window moves to the next day when the on-air mark does, or at midnight if you stayed on today and nothing holds it back. Read the [known issue](#known-issues) on typing times past midnight before using one there.
+A recording that runs past midnight continues on the same ruler, after 23:59. The window moves to the next day when the on-air mark does, or at midnight if you stayed on today and nothing holds it back. A time you type past midnight means the one nearest the playhead, or the drop point in the Place dialog, so `00:10:00:00` typed at 00:05 the next morning stays on that morning. To name the later day outright, type `24:10:00:00`. While the ruler runs past a day, the Place dialog shows the date beside PLACE AT.
+
+The ruler only reaches the next day once the recording has. Until then, a time after midnight means the start of the ruler. While something is on air that is refused as being in the no edit zone; with nothing on air it is placed there, so check the time shown before pressing Place. If the window changes day while the Place dialog is open, nothing is placed and you are asked to drop the file again.
 
 ## Buttons and controls
 
@@ -236,15 +239,15 @@ The Go Live button's label shows the state:
 | Seek bar | Scrubs within the file | When its length is known |
 | **▶** / **II** | Plays or pauses the preview | When a file has opened |
 | **■** | Stops and returns to the file's start | When a file has opened |
-| **Delete** | Permanently deletes an unreadable file and its companions (master, preview copy, metadata), after showing the list and size. **Cannot be undone.** It refuses a segment still being recorded. | Only when a file fails to open |
+| **Delete** | Permanently deletes an unreadable file and its companions (preview copy, metadata, and its master only if that master holds nothing else), after showing the list and size. **Cannot be undone.** It refuses a segment still being recorded. | Only when a file fails to open |
 
-The volume slider and MUTE do not control this monitor.
+The volume slider and MUTE do not control this monitor. After 5 minutes with nothing playing it closes its file, so the storage limit can delete it; pick the file again to preview it.
 
 ### Lists (area C)
 
 | Control | What it does |
 |---|---|
-| **CAPTURE MEDIA** | Lists the current recording's segments, newest first, with the one being recorded on top |
+| **CAPTURE MEDIA** | Lists the current recording's segments, newest first, with the one being recorded on top. The master column reads **master in-progress** while the 5-minute master holding that segment is still being recorded. |
 | **INGEST MEDIA** | Lists exported ranges and any other media in the ingest folder |
 | **Folder** | Opens the folder for the tab showing in Explorer |
 | **Refresh** | Reads the capture store again. It does not refresh the ingest list: to do that, click **CAPTURE MEDIA** and then **INGEST MEDIA**. |
@@ -349,11 +352,12 @@ The window opens at 1 hour.
 
 ### Typing a position
 
-These work in the go-to box. The Place and Bookmarks boxes use the same rules, but read a relative form differently: Place counts from the drop point, and Bookmarks from the start of the ruler.
+These work in the go-to box. The Place and Bookmarks boxes use the same rules, but read a relative form differently: Place counts from the drop point, and Bookmarks from the playhead, or from the selected bookmark when you press Update.
 
 | Type | Means |
 |---|---|
 | `10:23:45:12` | That timecode |
+| `24:10:00:00` | Past midnight: that place on the ruler, the next day. Refused if the ruler does not reach it. |
 | `10:23:45` | That time, frame 0 |
 | `23:45` | Minutes and seconds in the playhead's current hour |
 | `35000` | Frame number, counted from the midnight the ruler starts on |
@@ -470,13 +474,13 @@ The lower list is Live Edit's part of the application log. **Clear** empties thi
 
 ## Known issues
 
-These are faults in the current code, not setup mistakes. IDs refer to the [technical assessment](11_TECHNICAL_ASSESSMENT.md). Entries marked "new" were found while writing this guide and are not in the assessment. None of these has been fixed.
+These are faults in the current code, not setup mistakes. IDs refer to the [technical assessment](11_TECHNICAL_ASSESSMENT.md). Entries marked "new" were found while writing this guide and are not in the assessment. None of these has been fixed unless its row says so.
 
 ### Can affect air
 
 | ID | Problem | What to do |
 |---|---|---|
-| A3 | Sound of placed items airs wrongly: it never gets past about the first second of the file. What this sounds like at the card was not measured. | Test on a card before relying on placed sound. |
+| A3 | **Fixed in code.** The sound of a placed item was read at the wrong position and stayed in the first moments of the file. The fix is tested through the decoder but has not been heard at the card. | Listen to one placed item on a test output before relying on placed sound. |
 | A2 | Stopping the recording while live freezes the output on a silent frame within about a second, instead of playing out the delay. If the recording stopped before the delay filled, it holds black. | Press **END LIVE** when ready to leave air. |
 | B24 | Losing the source on a delayed feed holds a frozen, silent frame and does not fail. | Watch the output, and press **END LIVE** if needed. |
 | A4 | A source with more than one audio pair corrupts the sound on air. The recording is correct. | Use one pair until this is fixed. |
@@ -489,8 +493,6 @@ These are faults in the current code, not setup mistakes. IDs refer to the [tech
 |---|---|---|
 | | Placed items, deleted scenes and sound edits are not saved. | Keep the window open for the whole job. |
 | B2 | With an insert before the marks, Export takes the wrong material, off by the insert's length. | Export before placing inserts, or check the result. |
-| New | **After midnight, typed times land a day early.** The ruler runs past 23:59 but its times read `00:10:00:00`, and a typed time always means the first day. The PLACE AT box is filled in this form, so a drop past midnight is either refused as being in the no edit zone or, when nothing is on air, placed about 24 hours early. **Drop point** does not help. (`src/Emerald.LiveEdit/IngestDropDialog.xaml.cs:99`, `:148`; the go-to box at `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:3239`) | In PLACE AT type `+0` for the drop point itself, or `+50` to go on from it. In the go-to box use `+` and `-`, or a frame number. |
-| New | **Bookmarks can't be added past midnight as filled in.** The box shows `24:10:00:00`, which is refused with "Hours must be 00-23". (`src/Emerald.LiveEdit/BookmarkDialog.xaml.cs:47`, `:93`) | Type the frame number instead. See also C18: bookmarks past midnight disappear after a rollover. |
 | B17 | Go Live and other windows can overwrite each other's saved settings. | Check your settings after using Go Live. |
 
 ### Minor

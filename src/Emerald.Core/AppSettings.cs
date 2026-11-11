@@ -79,6 +79,10 @@ public sealed class AppSettings
     [JsonPropertyName("recordingVideoBitrateKbps")] public int RecordingVideoBitrateKbps { get; set; }
     [JsonPropertyName("recordingAudioBitrateKbps")] public int RecordingAudioBitrateKbps { get; set; } = 192;
     [JsonPropertyName("recordingAudioSampleRate")] public int RecordingAudioSampleRate { get; set; } = 48000;
+
+    /// <summary>Encode the proxy on the video card when it can, and on the CPU when it cannot.</summary>
+    [JsonPropertyName("recordingGpuProxy")] public bool RecordingGpuProxy { get; set; } = true;
+
     /// <summary>
     /// How long each recorded segment runs.
     ///
@@ -240,6 +244,12 @@ public sealed class AppSettings
     /// and leaves the pruning to whoever wants it done.
     /// </summary>
     [JsonPropertyName("logRetentionDays")] public int LogRetentionDays { get; set; } = 14;
+
+    /// <summary>
+    /// For a developer: writes what the application is using to <c>memory-yyyyMMdd.jsonl</c> in
+    /// the log folder every ten seconds. Off unless asked for here or with EMERALD_MEMORY_LOG=1.
+    /// </summary>
+    [JsonPropertyName("memoryDiagnostics")] public bool MemoryDiagnostics { get; set; }
 
     /// <summary>The default home for the record, alongside everything else Emerald remembers.</summary>
     public static string DefaultLogFolder { get; } = Path.Combine(

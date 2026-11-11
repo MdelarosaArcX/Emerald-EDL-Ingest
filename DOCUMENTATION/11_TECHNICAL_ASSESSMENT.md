@@ -21,7 +21,7 @@ Effects at the card, such as what goes down the wire on an underrun, are Not ver
 | Playback deck | Arm, count down, on air, multiple TX | End of drain (A2). Close prompt (B5). Clip audition was removed; only stale comments remain. |
 | EDL | Compose, validate, queue, cue, play, loop, gain, solo, offset | SOM with embedded audio (A5). Multi-port path has no caller. |
 | Ingest | Validate, schedule, roll, register, recover | Runs only with its window open (B7). Verification is shallow (B10). |
-| Live Edit | Timeline, player, marks, placement, delete scene, undo, levels, bookmarks, export, Go Live, EDL handshake | Cue audio (A3). Placements not saved. Export ignores edits and has an offset fault (B2). |
+| Live Edit | Timeline, player, marks, placement, delete scene, undo, levels, bookmarks, export, Go Live, EDL handshake | Placements not saved. Export ignores edits and has an offset fault (B2). |
 | Monitor | Log, filters, strip, transmitted view, remote page | Ingest stage never written. Live Edit absent from strip (C5). |
 | Installer | Install, update, uninstall, EDL product | Version is written twice |
 
@@ -56,11 +56,13 @@ The monitored-versus-recorded mismatch is the one that matters most on air. `Sta
 
 The test `Stopping_the_recording_still_plays_out_everything_recorded` (`tests/Emerald.Video.Tests/DelayPacerTests.cs:127`) checks only the first and last positions, so it passes.
 
-### A3. Live Edit cue audio is read at the wrong position
+### A3. Live Edit cue audio was read at the wrong position (fixed)
 
-`src/Emerald.Video/LiveAirTransmitter.cs:713` passes `job.Taken`, a frame count, as `framePosition`, which `AudioSource.ReadFrame` treats as **samples** (`src/Emerald.Video/AudioSource.cs:266`). `PlayoutService` passes samples correctly.
+**Fixed.** The transmitter now calls `AudioSource.ReadVideoFrame`, which takes a frame number and converts it to samples. `CueSoundTests` plays a file whose every sample carries its own position through the real decoder, a frame at a time, and checks each frame; it fails on the old code. Not yet heard at the card. What follows describes the fault as it was.
 
-Each frame re-reads almost the same 1920 samples at 25 fps, moving one sample a frame. The cue never gets past about its first second of audio, however long it runs. With sound at the head of the media this should be a frame-rate buzz. With a silent head it airs silence. What it sounds like at the card was not measured. Direction of fix: multiply by the samples per frame.
+`LiveAirTransmitter.CueSound` passed `job.Taken`, a frame count, to `AudioSource.ReadFrame`, which counts **samples** (its parameter was then named `framePosition`; it is now `samplePosition`). `PlayoutService` passed samples correctly and is unchanged.
+
+Each frame re-read almost the same 1920 samples at 25 fps, moving one sample a frame, so the cue stayed within the first moments of its audio however long it ran. With sound at the head of the media this should have been a frame-rate buzz; with a silent head, silence. What it sounded like at the card was not measured.
 
 ### A4. Multi-pair audio corrupts the delayed output
 
@@ -110,7 +112,7 @@ Consequences:
 | B12 | **EDL: a missing clock airs immediately,** and so does a start over 12 hours ahead. One failed poll clears the clock. | `src/Emerald.EDL/PlayoutService.cs:967`, `:989` |
 | B13 | **EDL queue strands after an output failure.** Entries stay QUEUED with no worker. The next SEND starts a new one, which takes the stranded entries first: any whose start has passed air immediately, and the rest wait for their start. | `src/Emerald.EDL/PlayoutService.cs:402` |
 | B14 | **EDL: live audio settings belong to the form.** Editing rows while on air changes the on-air message. Queued messages use whatever the form holds at air time. | `src/Emerald.EDL/EdlWindow.xaml.cs:1223` |
-| B15 | **Wrong master can pair with a proxy** when a master is missing, because every file in a folder has the same stamp. This can export wrong picture or offer an unrelated file for deletion. | `src/Emerald.Media/MediaLibrary.cs:387` |
+| B15 | **Fixed.** A wrong master could pair with a proxy when a master was missing, because every file in a folder had the same stamp. Masters are now placed on the clock by their own lengths (`StoreIndex`), not paired by number or stamp. | `src/Emerald.Media/MediaLibrary.cs:387` |
 | B16 | **Segments slide on a gap.** A missing or unreadable middle segment moves all later ones earlier by its length. | `src/Emerald.Media/MediaLibrary.cs:293` |
 | B17 | **Go Live overwrites settings with a stale copy.** `LiveEditWindow` holds its own `AppSettings`, so saves in each direction undo the other. | `src/Emerald.LiveEdit/GoLiveDialog.xaml.cs:197`, `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:66` |
 | B18 | **The last segment stays "still being recorded"** after a stop, since the fingerprint excludes the newest file. It also blocks day rollover until a relist. | `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:655` |
@@ -131,7 +133,7 @@ Consequences:
 |---|---|---|
 | C1 | Tidal lock can sit in CountingDown with no transmitter if the TX ports are switched off after arming and before the recording rolls. A warning is logged, but the lock is not failed. | `src/Emerald.App/PlaybackWindow.xaml.cs:666` |
 | C2 | Record during "Stopping..." re-enters a stop, with unlocked `_cts` and `_worker` | `src/Emerald.App/ShellWindow.xaml.cs:987`, `src/Emerald.Video/SdiCapture.cs:172` |
-| C3 | Cue decoders can leak on timeout, or when a cue is passed but stays listed: 2 ffmpeg processes and about 112 MB each | `src/Emerald.Video/LiveAirTransmitter.cs:560` |
+| C3 | **Fixed.** Cue decoders could leak on timeout, or when a cue is passed but stays listed: 2 ffmpeg processes and about 112 MB each | `src/Emerald.Video/LiveAirTransmitter.cs:560` |
 | C4 | TX thread blocks on media preparation (up to 3 s + 3 s) and on inline disposal | `src/Emerald.Video/LiveAirTransmitter.cs:293`, `:560` |
 | C5 | `PipelineState.Ingest` has no writer, and Live Edit's transmission is not in the strip or `/api/state` | `src/Emerald.Core/PipelineState.cs`, `src/Emerald.Core/MonitorFeed.cs:28` |
 | C6 | Remote page skips log lines on catch-up: `since` jumps to `lastSeq`, the newest in the ring, not the last received | `src/Emerald.Core/MonitorPage.cs:257` |
@@ -145,7 +147,7 @@ Consequences:
 | C14 | On-air mark is wrong during Fit to fill, moving at half speed at 2x and then jumping | `src/Emerald.LiveEdit/LiveEditWindow.Live.cs:549` |
 | C15 | Deleted scene isn't black on held frames in preview. Air is unaffected. | `src/Emerald.LiveEdit/LiveEditWindow.Held.cs:142` |
 | C16 | Export button re-enables during an export | `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:3829` |
-| C17 | A held ring claim outlives its use, so a stopped recording's ring can stay on disk | `src/Emerald.LiveEdit/LiveEditWindow.Held.cs:60` |
+| C17 | **Fixed.** A held ring claim outlived its use, so a stopped recording's ring could stay mapped and on disk until Live Edit closed. The claim is now dropped once the line is sealed and not being shown. | `src/Emerald.LiveEdit/LiveEditWindow.Held.cs:60` |
 | C18 | Bookmarks past midnight disappear after rollover | `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:903` |
 | C19 | Each encoder start repeats audio while paying back the frames sent before ffmpeg opened its audio pipe: the first file of a recording and the first file after midnight, not every segment | `src/Emerald.Video/SdiCapture.cs:893` |
 | C20 | `Finished` can fire while the old day's encoder is still closing | `src/Emerald.Video/SdiCapture.cs:428` |
@@ -177,7 +179,7 @@ Consequences:
 | C46 | SDK return values unchecked: embed audio, RX stream properties | `src/Emerald.Deltacast/SdiOutput.cs:190`, `src/Emerald.Video/SdiCapture.cs:298` |
 | C47 | A late-starting signal permanently marks a good recording failed | `src/Emerald.Video/SdiCapture.cs:451` |
 | C48 | Playout reuses an open output when only the rate changed | `src/Emerald.EDL/PlayoutService.cs:366` |
-| C49 | Preview placeholder text reads "about every 0 min": integer division with a 30 s default | `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:1157` |
+| C49 | **Fixed.** Preview placeholder text read "about every 0 min": integer division with a 30 s default. It now uses the offered label ("30 s"), as does the EDL deck's folder hint. | `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:1157` |
 | C50 | The installers use the elevated account's `%APPDATA%`, so when the administrator is not the operator, the store setting goes to the wrong profile | `installer/install.bat:24` |
 | C51 | `update.bat -q` with no folder takes `-q` as the source path | `installer/update.bat:25` |
 | C52 | Uninstall's prompt says "settings and logs" but deleting removes all of `%APPDATA%\Emerald`, including `ingest.db` and bookmarks | `installer/uninstall.bat:78` |
@@ -193,11 +195,11 @@ Not demonstrated. They depend on runtime behaviour or SDK semantics.
 | Ring creation on the UI thread | Extending a 41 GiB file and `Flush(true)` may stall all windows. Not measured. |
 | Ring on the system drive by default | Constant heavy writes to `%LOCALAPPDATA%`. |
 | Mapped-view I/O errors | May raise a structured exception rather than `IOException`. Whether `Write`'s catch sees it: Not verified. |
-| Per-frame large allocations | `new byte[4 MB]` per frame, about 104 MB/s, with default GC settings. Gen2 pauses against 160 ms of card headroom. `FrameReadahead` shows the pooled alternative. |
+| Per-frame large allocations | **Fixed for capture.** The capture loop reuses its frame buffers (`FramePool`). `PlayoutService` and `FrameReadahead` still allocate per message and per cue, not per frame. |
 | `Stop` returning while the worker lives | 2 + 6 s join versus up to about 15 s in `Finish`. A new `Start` could collide on the handle. |
 | Short RX buffer | A short slot would misalign every later raw frame. Whether the SDK ever returns one: Not verified. |
 | Kill after 5 s | `Kill(true)` leaves a file without its index if closing is slow. |
-| Proxy and master boundaries differ | With `-g 12` at 25 fps and a 30 s segment, the proxy can cut only on keyframes while DNxHD cuts exactly. Inferred, not measured. |
+| Proxy and master boundaries differ | By design now: the master is cut at 5 minutes and the proxy shorter. Each is laid out on its own measured lengths, and exports plan on the masters' offsets (`RangePlan.FromMasters`), so the proxies' keyframe-late cuts do not move a master cut. |
 | Audio request ratchet | `SdiAudioReader` steps its channel count down permanently on any failed read. |
 | `RxPreview` field races | `_worker`, `_cts` and `_lease` are written from several threads without a lock. |
 | Thread-safety of `SegmentWatch.Poll` | Overlapping tasks could duplicate lines. |
@@ -257,10 +259,21 @@ Unmeasured, from reading the code.
 
 ## Memory and resource management
 
-- **Verified leaks:** cue decoders (C3), a held ring claim (C17), `MediaCodec.Cache` with no cap (low growth).
+- **Leaks found and fixed:** cue decoders (C3, both paths), the held ring claim (C17), and `MediaCodec.Cache`, which had no cap and kept an entry for every look at a file still being written. It is now capped at 20,000 and keeps answers only.
 - **Bounded caches:** `MediaProbe` clears at 20,000, `Waveform` at 5,000.
 - **SDK handles:** no leaks were found. All open paths close in `finally` or `Dispose`, stream before board. There is no finalizer.
-- **Rings** rely on reference counts, and on the startup sweep after a crash.
+- **Encoder threads:** ffmpeg's thread counts are stated on every recording, because its defaults follow the CPU count and held 3.7 GB on this machine. See [the flags](05_MEDIA_PROCESSING.md).
+- **Rings** rely on reference counts, and on the startup sweep after a crash. A ring is memory-mapped, and it used to show as working set up to its full size: 41 GB for the default ready line at 1080p25 (120 s delay, 300 s headroom). `DelayLine.TrimBehind` now gives back pages once a second with `VirtualUnlock`, keeping the newest 10 s, or the farthest reader's distance plus 2 s if that is more (about 13 GB at a 120 s delay). The cost is that trimmed pages get written to the ring file, up to about 100 MB/s, on the system drive unless `tidalLockRingFolder` says otherwise; before trimming, a recording measured no writes to C:. Trimmed pages normally wait in the standby list, where a read or an overwrite takes a soft fault (about 2 ms a frame, measured on a test mapping). Under memory pressure they can be evicted, and then either one reads from disk. Lower headroom makes the ring smaller.
+- **Ring size and release:** the ready ring holds about 100 MB/s of 1080p25 until it is full, then stops growing: about 29 GB at its 300 s minimum, 41 GB by default. **Delay ready** on the Capture deck turns it off. A ring is deleted without flushing it first. Flushing took 37 s and wrote about 5.9 GB to C: for a 4 GB ring; without it, the same release took about 1 s and wrote nothing.
+- **Frame buffers are reused.** The capture loop used to allocate a 4 MB array for every frame, about 99 MB/s on the large object heap. `FramePool` now hands the same buffers round, with a count of holders on each (`FrameLease`): the loop, the encoder's queue and each ring's queue take a claim and give it up once they have copied the frame. A buffer goes back to the pool only when the count reaches nothing. One pool per recording; at most 16 idle buffers (66 MB) are kept.
+- **Measured, recorder path without the card** (real ffmpeg command, real ring, 8-frame queues, 25 fps, 5 minutes each, quiet machine): per-frame allocation ran 294 full collections and 182 ms of GC pause, with the frame copy averaging 1.08 ms and 361 copies over 5 ms. Reused buffers ran 0 full collections, the copy averaged 0.69 ms and 0 copies were over 5 ms. No frames were dropped either way. A 30-minute run of the reused path: 0 full collections, 0 drops, managed heap 54 to 59 MB, ffmpeg 356 to 369 MB, one buffer reused for all 45,000 frames.
+- **Measured on the running application** (recording, Live Edit open, 6 minutes, before these changes): private memory 506 to 516 MB and flat, ffmpeg 362 to 364 MB, handles and threads flat. Working set rose to 42.2 GB as the ready ring filled and then held.
+- **Live Edit over a long run.** Live Edit read the whole store again every time a segment closed: a recursive file walk every 2 s, then a listing and probe of every file of every day, then a layout over all of them on the UI thread. Over a day that was O(n²) in the number of files, and past 20,000 files the probe caches emptied themselves partway through every listing. `StoreIndex` keeps what it has read: a refresh walks only folders that can have changed and reads only new or just-closed files, with a full walk every 60 s for deletions.
+- **Live Edit per frame.** The timeline's edit list was sorted again on every lookup, several times a frame. It is now handed over in order and walked as it is. Finding the segment under the playhead is a binary search; drawing finds the visible run of segments by halving and draws sub-pixel segments and drop marks as one block per run or pixel. The scrollbar is set only when a value changes.
+- **Live Edit over days.** Placed items, deleted scenes and sound edits that ended before yesterday are let go of at each day change (they used to be shifted back a day for ever). The player held ready behind the big screen and the small monitor close after 5 minutes idle. Waveforms are kept for an hour either side of the view. An export is called off when the window closes, and background work finishing after close leaves the window alone.
+- **Other limits added:** `SegmentWatch` forgets segments the storage limit has deleted; `EdlLogger` allows 2,000 appends to wait on the disk and counts the rest; Live Edit keeps waveforms only for files on the timeline; ffprobe is killed after 15 s; playout copies its last frame into one buffer instead of cloning it per file.
+- **Not tested on the card.** The pool, the ring release and the cue fixes are unit tested and were run in the harness, not through `SdiCapture` with a receiver.
+- **Still open:** `TransmissionTally` grows while the Monitor window stays open; the `MediaProbe` and `Waveform` caches clear all at once at their caps (Live Edit no longer re-reads through them, but other callers do); the big screen's player keeps its file open while idle, because it shows the frame left on; `LOAD` is logged for every segment played through.
 - **Window event subscriptions** to shared objects are removed on close. `_capture` and `_preview` subscriptions share the window's lifetime.
 
 ## Security
@@ -344,7 +357,7 @@ Do not copy these without checking.
 If fixing in order of on-air risk:
 
 1. **A2, B24:** every drain and every source loss at a delay over half a second.
-2. **A3:** every placed item with sound.
+2. **A3:** every placed item with sound. Fixed; listen to one at the card.
 3. **A7:** deleted picture reaching air.
 4. **A1:** monitoring one port while recording another.
 5. **A4:** any multi-language feed on the air path.
@@ -352,7 +365,7 @@ If fixing in order of on-air risk:
 7. **B1:** the session-long block.
 8. **A5, A6, A8.**
 
-Each should get a failing test first where possible. A2 can be tested now, because `DelayPacer.Decide` is pure. A3, A4 and A7 can be tested without a card only after their logic is moved out of the transmitters or an `ISdiOutput` is injected.
+Each should get a failing test first where possible. A2 can be tested now, because `DelayPacer.Decide` is pure. A3 is tested through the decoder (`CueSoundTests`). A4 and A7 can be tested without a card only after their logic is moved out of the transmitters or an `ISdiOutput` is injected.
 
 ## What could not be fully analysed
 

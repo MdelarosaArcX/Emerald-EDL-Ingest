@@ -17,10 +17,15 @@ public static class FramePick
     /// <summary>
     /// Reads a frame of the day out of what was typed.
     ///
-    /// <paramref name="current"/> is where the playhead is, which only matters for the relative
-    /// forms. The result is clamped to the day, so a nudge off either end lands on the end rather
-    /// than being refused — an operator holding a key down at midnight means the start of the day,
-    /// not a mistake.
+    /// <paramref name="current"/> is where the playhead is, which matters for the relative forms
+    /// and for which day a time means. The result is clamped to the day, so a nudge off either end
+    /// lands on the end rather than being refused — an operator holding a key down at midnight
+    /// means the start of the day, not a mistake.
+    ///
+    /// <b>A recording that runs past midnight makes the ruler longer than a day</b>, and a time
+    /// then names more than one frame, because the ruler reads 00:10:00:00 at both ends. It means
+    /// the one nearest <paramref name="current"/>, so what is read off the ruler lands where it
+    /// was read. <c>24:10:00:00</c> names the later one outright, where the ruler reaches that far.
     /// </summary>
     public static bool TryParse(string? text, int rate, long dayFrames, long current,
                                out long frame, out string? error)
@@ -85,10 +90,22 @@ public static class FramePick
             return true;
         }
 
+        // Hours past 23: a place on a ruler that has run into the next day, stated outright.
+        if (TryPastMidnight(input, rate, dayFrames, out frame, out string? beyond))
+        {
+            if (beyond is null) return true;
+
+            frame = current;
+            error = beyond;
+            return false;
+        }
+
+        frame = current;
+
         // A full timecode, which is what the plant speaks.
         if (Timecode.TryParse(input, rate, out Timecode at, out string? why))
         {
-            frame = Clamp(at.TotalFrames, dayFrames);
+            frame = Nearest(at.TotalFrames, rate, dayFrames, current);
             return true;
         }
 
@@ -119,16 +136,73 @@ public static class FramePick
         for (int i = 0; i < parts.Length; i++)
             if (!int.TryParse(parts[i], out n[i]) || n[i] < 0) return false;
 
-        var here = new Timecode(current, rate);
-
-        int hours = parts.Length == 3 ? n[0] : here.Hours;
         int minutes = parts.Length == 3 ? n[1] : n[0];
         int seconds = parts.Length == 3 ? n[2] : n[1];
 
-        if (hours > 23 || minutes > 59 || seconds > 59) return false;
+        if (minutes > 59 || seconds > 59) return false;
 
-        frame = Clamp(((hours * 60L + minutes) * 60L + seconds) * rate, dayFrames);
+        // Minutes and seconds alone stay in the hour the playhead is in, past midnight as well.
+        if (parts.Length == 2)
+        {
+            long hour = new Timecode(current, rate).Hours;
+
+            frame = Clamp(((hour * 60L + minutes) * 60L + seconds) * rate, dayFrames);
+            return true;
+        }
+
+        if (n[0] > 23) return false;
+
+        frame = Nearest(((n[0] * 60L + minutes) * 60L + seconds) * rate, rate, dayFrames, current);
         return true;
+    }
+
+    /// <summary>
+    /// A timecode whose hours run past 23, on a ruler that goes that far. False when it is not that
+    /// form, and true with <paramref name="error"/> set when it is but the ruler stops short.
+    /// </summary>
+    private static bool TryPastMidnight(string input, int rate, long dayFrames, out long frame, out string? error)
+    {
+        frame = 0;
+        error = null;
+
+        string[] parts = input.Split(new[] { ':', ';', '.' }, StringSplitOptions.None);
+
+        if (parts.Length is < 3 or > 4) return false;
+
+        var n = new int[4];
+        for (int i = 0; i < parts.Length; i++)
+            if (!int.TryParse(parts[i], out n[i]) || n[i] < 0) return false;
+
+        // Past 99 is a slip of the finger rather than a place on a ruler four days long.
+        if (n[0] is < 24 or > 99 || n[1] > 59 || n[2] > 59 || n[3] >= rate) return false;
+
+        long at = ((n[0] * 60L + n[1]) * 60L + n[2]) * rate + n[3];
+
+        if (at >= dayFrames)
+        {
+            error = $"The timeline ends at {new Timecode(dayFrames - 1, rate)}.";
+            return true;
+        }
+
+        frame = at;
+        return true;
+    }
+
+    /// <summary>
+    /// Which of the times a ruler longer than a day reads the same is closest to
+    /// <paramref name="current"/>. A ruler of one day has only the one. Exactly twelve hours
+    /// either way goes forward, where edits are still to come.
+    /// </summary>
+    private static long Nearest(long timeOfDay, int rate, long dayFrames, long current)
+    {
+        long oneDay = 86_400L * rate;
+        long best = Clamp(timeOfDay, dayFrames);
+
+        for (long at = timeOfDay; at < dayFrames; at += oneDay)
+            if (Math.Abs(at - current) <= Math.Abs(best - current))
+                best = at;
+
+        return best;
     }
 
     private static long Clamp(long frame, long dayFrames) =>

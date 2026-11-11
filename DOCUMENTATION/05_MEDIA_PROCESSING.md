@@ -135,11 +135,20 @@ Each output, proxy first:
 -map 0:v:0
 -map 1:a:0  or  -map [p{p}o{out}]
 -map {i+2}:a:0  or  -map [b{i}o{out}]
--c:v {libx264|dnxhd}
+-c:v {libx264|hevc_nvenc|h264_nvenc|hevc_qsv|h264_qsv|dnxhd}
+-preset p4 -no-scenecut 1 -forced-idr 1 -rc vbr     (NVIDIA)
+-preset medium                              (Intel)
+-profile:v {main|high} -bf 0 -g {max(1,rate/2)}     (GPU: main for HEVC, high for H.264)
+-tag:v hvc1                                 (GPU, HEVC)
+-cq {30 HEVC|28 H.264} -b:v 0               (NVIDIA, automatic bitrate)
+-global_quality {28 HEVC|25 H.264}          (Intel, automatic bitrate)
+-b:v {k}k -maxrate {k}k -bufsize {k*2}k     (GPU, only if a bitrate is chosen)
+-threads 6                                  (libx264)
+-threads 8 -thread_type slice               (master)
 -b:v 145M                                   (master)
 -preset veryfast -profile:v high -bf 0 -g {max(1,rate/2)} -sc_threshold 0     (libx264)
 -b:v {k}k -maxrate {k}k -bufsize {k*2}k     (libx264, only if a bitrate is chosen)
--pix_fmt {yuv420p|yuv422p}
+-pix_fmt {yuv420p|nv12|yuv422p}             (nv12 for Intel)
 -c:a aac -b:a {AudioBitrateKbps}k
 -ar {AudioSampleRate}                       (only if not 48000)
 -metadata:s:a:{p} title=...   -disposition:a:{p} {default|0}          (each pair, only if pairs > 1 or beds exist)
@@ -151,7 +160,7 @@ Each output, proxy first:
 Then one of three destinations:
 
 ```
--f segment -segment_time {s} -segment_format {mp4|mov} -reset_timestamps 1
+-f segment -segment_time {proxy s | 300} -segment_format {mp4|mov} -reset_timestamps 1
     -segment_start_number {start} {root}\{low|high}\{folder}\{prefix}_{MMddyyHHmm}_%d.{ext}
 
 -f {mp4|mov} {root}\{low|high}\{prefix}.{ext}       (single file, no -y, refuses to overwrite)
@@ -163,15 +172,15 @@ Then one of three destinations:
 Worked example: 1080p25, one audio pair, default settings.
 
 ```
-ffmpeg -hide_banner -loglevel error -nostdin
+ffmpeg -hide_banner -loglevel error -nostdin -filter_threads 2
  -f rawvideo -pix_fmt uyvy422 -s 1920x1080 -r 25 -i pipe:0
  -f s16le -ar 48000 -ac 2 -i \\.\pipe\edlcap_<pid>_<guid>
- -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -profile:v high -bf 0 -g 12 -sc_threshold 0
+ -map 0:v:0 -map 1:a:0 -c:v libx264 -threads 6 -preset veryfast -profile:v high -bf 0 -g 12 -sc_threshold 0
    -pix_fmt yuv420p -c:a aac -b:a 192k
    -f segment -segment_time 30 -segment_format mp4 -reset_timestamps 1 -segment_start_number 1
    <root>\low\<folder>\media_MMddyyHHmm_%d.mp4
- -map 0:v:0 -map 1:a:0 -c:v dnxhd -b:v 145M -pix_fmt yuv422p -c:a aac -b:a 192k
-   -f segment -segment_time 30 -segment_format mov -reset_timestamps 1 -segment_start_number 1
+ -map 0:v:0 -map 1:a:0 -c:v dnxhd -threads 8 -thread_type slice -b:v 145M -pix_fmt yuv422p -c:a aac -b:a 192k
+   -f segment -segment_time 300 -segment_format mov -reset_timestamps 1 -segment_start_number 1
    <root>\high\<folder>\media_MMddyyHHmm_%d.mov
 ```
 
@@ -179,6 +188,7 @@ Why these flags:
 
 | Flag | Reason in the code |
 |---|---|
+| `-threads`, `-thread_type slice`, `-filter_threads` | ffmpeg's defaults follow the CPU count. On 40 logical CPUs, the command without these limits peaked at 3,775 MB with 191 threads and dropped frames from frame 22. With them it peaked at 360 MB with 40 threads and dropped none (two 20-second runs of each, synthetic picture, no card). DNxHD output was identical by MD5. |
 | `-r` on raw input | Raw video has no timestamps |
 | `-g rate/2`, `-sc_threshold 0` | A keyframe every half second so the proxy seeks. The comment records an 11-second gap before this. |
 | `-bf 0` | No frame reordering, for backward stepping |
@@ -186,6 +196,7 @@ Why these flags:
 | `pan`, not `channelsplit` | The channel layout of raw PCM is a guess |
 | `asplit` | A filter output can be mapped only once |
 | `-reset_timestamps 1` | Each segment starts at zero |
+| `-segment_time` per output | The proxy takes the deck's segment length; the master is always `RecordingProfile.MasterSegmentSeconds` (300 s). Changing the deck setting never changes the master. |
 | No `-strftime` on segments | Under it `%d` means day of month, so every segment overwrites one file (`src/Emerald.Core/RecordingSequence.cs:27`) |
 
 ### Decoding for air
@@ -195,7 +206,7 @@ Why these flags:
 ```
 -hide_banner -loglevel error -nostdin
 [-accurate_seek -ss {seconds:F3}]
--i {mediaPath} -an
+-threads 4 -i {mediaPath} -an
 -vf [setpts=PTS/{speed},]scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,fps={rate}
 -pix_fmt uyvy422 -f rawvideo pipe:1
 ```
@@ -223,7 +234,9 @@ This letterboxes, conforms the rate and drops audio. There is no deinterlacer in
 | Export | `src/Emerald.Media/RangeExport.cs:165` | `ffmpeg -hide_banner -loglevel error -nostdin -y -f concat -safe 0 -i {list} -ss {from} -t {length} -c copy -avoid_negative_ts make_zero {output}` |
 | Export preview | `src/Emerald.Media/RangeExport.cs:299` | `ffmpeg -hide_banner -loglevel error -nostdin -y -i {export} -c:v libx264 -preset veryfast -profile:v high -crf 20 -pix_fmt yuv420p -bf 0 -g {max(1,rate/2)} -sc_threshold 0 -c:a aac -b:a 192k {name}.preview.mp4` |
 | Waveform | `src/Emerald.Media/Waveform.cs:123` | `ffmpeg -v error -nostdin -i {path} -vn -ac 1 -ar 8000 -f s16le -acodec pcm_s16le -` |
-| Thumbnail | `src/Emerald.App/ClipThumbnails.cs:73` | `ffmpeg -hide_banner -loglevel error -nostdin -y -ss 1 -i {clip} -frames:v 1 -vf scale=294:-1 {cache}.png` |
+| Thumbnail | `src/Emerald.App/ClipThumbnails.cs:73` | `ffmpeg -hide_banner -loglevel error -nostdin -y -threads 2 -ss 1 -i {clip} -frames:v 1 -vf scale=294:-1 {cache}.png` |
+
+**Listing the store.** `MediaLibrary.List` does not start ffprobe for the recorder's own segments. `MediaCodec.ReadSegment` reads the same facts from the container when the file has one H.264 or HEVC video track and at most one AAC track. Anything else, including a recording with several audio tracks, a timecode track, a file outside a recording folder or the segment still being written, goes to ffprobe. Measured on a store of 686 proxies during a recording: a fresh process listed it in about 0.3 s, against 10.9 s before, and the 685 closed segments gave the same fields and lengths as ffprobe. The disk cache was already warm for the after figures. A file deleted during a listing is now skipped. Before, it ended the listing, and on a store at its size limit the first listing could come back empty.
 
 ## Recording profile
 
@@ -232,17 +245,35 @@ This letterboxes, conforms the rate and drops audio. There is no deinterlacer in
 | | `LowRes`, proxy | `HighRes`, master |
 |---|---|---|
 | Folder and container | `low`, MP4 | `high`, MOV |
-| Video | libx264, yuv420p, **full raster** | dnxhd, 145 Mb/s, yuv422p |
+| Video | H.264 High or HEVC Main, 4:2:0, **full raster**, on the video card or the CPU | dnxhd, 145 Mb/s, yuv422p, always on the CPU |
 | Audio | AAC | AAC |
 
-Defaults: automatic proxy bitrate, 192 kb/s audio, 48 kHz, 30-second segments (`:160`). Choices are limited to lists (`:166`), so an unlisted value in settings falls back to the default and never reaches ffmpeg:
+**Proxy encoder.** The Capture deck's **Proxy encoder** setting (`recordingGpuProxy`) offers *Auto (GPU if installed)*, the default on every installation, and *CPU only*. `GpuEncoder.Choose` settles the encoder once per recording, before the receiver stream starts, and the encoder started for the next day's folder uses the same choice. It takes these steps:
+
+1. Read the display adapters from the registry and pick out NVIDIA and Intel. On a machine with both, NVIDIA is tried first.
+2. Ask Media Foundation for an HEVC decoder. Without one, HEVC isn't tried, because every viewer in the application plays the proxy through `MediaElement`.
+3. Try each candidate in order with two black frames and the recording's own options: HEVC then H.264. The first that works is used.
+4. If none works, or no card is found, use `libx264`.
+
+The log line that starts `Capture: proxy on` gives the encoder and the reason.
+
+- **This plant today: `libx264`.** The RTX 3060 is found, but the installed ffmpeg (2026-07-23 build) needs NVIDIA driver 610 or newer and the driver is 560.94. After a driver update it would choose H.264 on the card.
+- **HEVC can't be played here.** Media Foundation reports 0 HEVC decoders, and `MediaElement` fails on an HEVC proxy with "Cannot find the media file". An installed decoder is what would make HEVC eligible. Store-packaged decoders are not counted, so one may be missed. That leaves the proxy on H.264, which plays. Playback of an HEVC proxy with a decoder installed has not been tested.
+- **Intel has not been run.** This plant has no Intel graphics. The Quick Sync options, quality values and keyframe spacing are untested, and only the failure path has been seen ("Error creating a MFX session"), which falls through as intended.
+- **AMD** cards are not used. The proxy goes on the CPU.
+- **ffmpeg 6.1.1 can't record here.** With the 8-frame queue it stops taking frames after about 10, with any encoder, because it waits for more audio than the recorder sends. It was used only to measure NVENC, with `-probesize 32 -analyzeduration 0` added on the audio input.
+- **Measured.** Recorder's arguments under ffmpeg 6.1.1, synthetic picture, 20 s runs at 1080p25, 0 frames dropped in all of them: `libx264` about 5.3 cores and 361 MB; `h264_nvenc` about 2.4 cores and 435 MB; `hevc_nvenc` about 2.4 cores and 418 MB.
+- **Size and quality.** On real 10-second segments, against `libx264` at 3,601 kb/s on the same 4 segments (SSIM 0.9892 on average): `h264_nvenc` at level 28 was 3,427 kb/s (0.9899), and `hevc_nvenc` at level 30 was 2,672 kb/s (0.9884). HEVC saves less than usual here because the proxy has no B-frames and a keyframe every half second.
+- **Risk.** Both files come from one ffmpeg, so a GPU fault that ends that process stops both, the same as any other encoder exit. This has not been tested. *CPU only* removes that dependency.
+
+Defaults: automatic proxy bitrate, 192 kb/s audio, 48 kHz, 30-second proxy segments, 5-minute master segments. Choices are limited to lists (`:166`), so an unlisted value in settings falls back to the default and never reaches ffmpeg:
 
 | Setting | Offered values |
 |---|---|
 | Proxy bitrate | Auto (0), 1500, 3000, 5000, 8000 kb/s |
 | Audio bitrate | 128, 192, 256, 320 kb/s |
 | Sample rate | 48000, 44100, 32000 Hz |
-| Segment length | 10, 15, 30, 60, 120, 300, 600 s |
+| Proxy segment length | 10, 15, 30, 60, 120, 300 s. 600 was removed so a proxy is never longer than a master; a saved 600 falls back to 30. The master is fixed at 300 s. |
 
 A title of `capture` silently becomes `media` (`RecordingSequence.cs:65`). `SanitisePrefix` replaces invalid characters and `%`, and caps the prefix at 60 characters.
 
@@ -250,7 +281,10 @@ A title of `capture` silently becomes `media` (`RecordingSequence.cs:65`). `Sani
 
 - Each recording has a folder stamped `yyyy-MM-dd_HH-mm-ss` when Record was pressed.
 - Files are `<prefix>_<MMddyyHHmm>_<N>`, where N starts at 1 per folder and is not padded.
-- A segment's position on the timeline is the folder's start plus the length of the segments before it, worked out by `MediaLibrary.Accumulate` (`src/Emerald.Media/MediaLibrary.cs:268`).
+- A segment's position on the timeline is the folder's start plus the length of the segments before it, worked out by `StoreIndex.LayEndToEnd` (`src/Emerald.Media/StoreIndex.cs`). Proxies and masters are each laid out on their own lengths.
+- **Master and proxy are cut at different lengths.** The master runs 5 minutes and the proxy 10 s to 5 min, so one master holds several proxies, and a proxy can straddle two masters. A proxy is given the masters its span of the clock falls in (`CapturedClip.Masters`). Recordings made when both were cut alike still pair one to one, because that is the same rule.
+- **Why the split.** The proxy is cut short so the newest material can be played soon after it is recorded. The master is only read by an export, which can wait. Cut at the proxy's length, a 10 s proxy also meant 8,640 masters a day, each listed and tracked.
+- The newest master is open for up to 5 minutes. While it is, `HasMaster` is false for the proxies inside it and the Capture Media list says "master in-progress".
 
 An open segment has no index until it closes, so the player cannot read it. `HeldPicture` covers that gap from the ring.
 
@@ -373,14 +407,14 @@ See [the EDL workflow](04_SYSTEM_WORKFLOW.md#edl-generator-composing-and-playing
 ```mermaid
 flowchart LR
     Rec["Recorder writes segments"] --> Watch["SegmentWatch polls: mvhd present means closed"]
-    Watch --> LogSeg["capture.segment log line"]
-    Rec --> Warden["StorageWarden: oldest first past the limit"]
+    Watch --> LogSeg["capture.segment and capture.master log lines"]
+    Rec --> Warden["StorageWarden: a master with the proxies it holds, oldest first"]
     Warden --> Ledger["PruneLedger records what went"]
-    Rec --> List["MediaLibrary.List"]
+    Rec --> List["StoreIndex.Refresh: reads only new or just-closed files"]
     Ledger --> List
-    List --> Probe["MediaProbe with ffprobe, 6 at a time, cached"]
-    List --> Pair["MasterIndex pairs proxy and master"]
-    Probe --> Starts["Accumulate works out segment starts"]
+    List --> Probe["Container read of own segments, ffprobe otherwise, 6 at a time"]
+    List --> Pair["Masters laid out on their own lengths"]
+    Probe --> Starts["LayEndToEnd works out segment starts"]
     Pair --> Starts
     Starts --> Place["Live Edit Place: timeline"]
     Place --> Wave["Waveform: ffmpeg at 8 kHz mono, cached in memory"]
@@ -391,6 +425,10 @@ flowchart LR
 ```
 
 Export uses masters only if every segment in the range has one, otherwise proxies. DNxHD is all-intra, so a master export is frame-exact. A proxy export starts at a keyframe.
+
+- **Masters are cut at their own offsets.** `RangePlan.FromMasters` plans the cut on the recording's masters as laid out on the clock, narrowed to the span its proxies cover.
+- **An open master is waited for.** If the range reaches into the master still being written, Live Edit waits for it to close (at most 5 minutes) and then cuts from it. See [the Live Edit guide](13_LIVE_EDIT_GUIDE.md#export-a-range).
+- **The capture deck announces proxies and masters apart.** `SegmentWatch` reports a proxy as soon as it closes (`capture.segment`) and a master when it closes (`capture.master`). A proxy no longer waits for a master.
 
 ## Timecode handling
 
@@ -433,6 +471,8 @@ At 1080p25:
 | RX open | Lease, handle, no signal, raster | `Fail` and return |
 | Slot lock | Timeout | Retry until stopped. Before the first frame and after 3 s, one `Fail`, which marks the result failed. After the first frame, silent. |
 | Encoder slow | Queue full | Frame and its audio dropped, logged, recording continues |
+| Encoder stalled | No frame taken for 10 s, process still alive (for example a full disk) | `EncoderWatch` raises one error with ffmpeg's last message. The recording is not stopped, so the delay line and anything on air carry on. Said again when frames are taken. |
+| Disk low | Under 10 GB free, checked every 30 s | One warning, repeated only if the space returns and goes again |
 | Encoder dead | Process exit | Detected within about a second of frames, recording stops, no restart |
 | Midnight encoder | Open fails | Stays in old folder, tries again next midnight |
 | Ring create | No space or IO | `DelayLineException`, lock fails, recording continues |

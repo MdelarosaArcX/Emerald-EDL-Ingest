@@ -13,9 +13,9 @@ namespace Emerald.Media;
 /// four-character code and closes it again: a handful of seeks and a few kilobytes, with no
 /// process to start.
 ///
-/// It answers one question only. Anything that needs duration, raster or stream layout still
-/// goes through <see cref="MediaProbe"/>, which is worth its cost for one file and not for a
-/// thousand.
+/// Anything beyond the plain layout the recorder writes, which <see cref="ReadSegment"/> reads,
+/// still goes through <see cref="MediaProbe"/>, which is worth its cost for one file and not for
+/// a thousand.
 /// </summary>
 public static class MediaCodec
 {
@@ -43,6 +43,12 @@ public static class MediaCodec
     /// </summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string?> Cache = new();
 
+    /// <summary>Beyond this the cache is started again: files pruned from the store leave entries behind.</summary>
+    private const int CacheMost = 20_000;
+
+    /// <summary>How many files' codecs are remembered, for the memory monitor.</summary>
+    public static int Remembered => Cache.Count;
+
     /// <summary>The raw four-character code, for anything that wants to compare rather than show.</summary>
     public static string? ReadFourCc(string path)
     {
@@ -53,7 +59,16 @@ public static class MediaCodec
 
             string key = $"{path}|{file.Length}|{file.LastWriteTimeUtc.Ticks}";
 
-            return Cache.GetOrAdd(key, _ => ReadUncached(path));
+            if (Cache.TryGetValue(key, out string? known)) return known;
+
+            // Only an answer is kept. A file still being written has none, and its length changes
+            // with every look, so remembering "nothing yet" added an entry per listing for ever.
+            if (ReadUncached(path) is not { } read) return null;
+
+            if (Cache.Count >= CacheMost) Cache.Clear();
+
+            Cache[key] = read;
+            return read;
         }
         catch (IOException) { return null; }
         catch (UnauthorizedAccessException) { return null; }
@@ -320,6 +335,8 @@ public static class MediaCodec
     /// <summary>A track's handler type and its media header's duration, from its mdia.</summary>
     private static (string Handler, TimeSpan? Duration)? TrackMedia(Stream file, long start, long end)
     {
+        Span<byte> kind = stackalloc byte[4];
+
         foreach ((string type, long body, long next) in Atoms(file, start, end))
         {
             if (type != "mdia") continue;
@@ -338,7 +355,6 @@ public static class MediaCodec
                 {
                     file.Position = innerBody + 8;
 
-                    Span<byte> kind = stackalloc byte[4];
                     if (Fill(file, kind)) handler = Encoding.ASCII.GetString(kind);
                 }
             }
@@ -347,6 +363,178 @@ public static class MediaCodec
         }
 
         return null;
+    }
+
+    // ------------------------------------------------------------------ a recorder's segment
+
+    /// <summary>What a segment's container says about it, in the terms ffprobe would use.</summary>
+    public sealed record SegmentLayout(
+        TimeSpan Duration,
+        TimeSpan Picture,
+        string VideoCodec,
+        int Width,
+        int Height,
+        int AudioChannels,
+        string? AudioLanguage,
+        bool HasAudio);
+
+    /// <summary>
+    /// Everything a listing needs from one of the recorder's own segments, without a process per
+    /// file. Null for anything that is not the plain layout - one H.264 or HEVC picture and at most
+    /// one AAC track - so that a recording with several language tracks, a timecode track or a
+    /// segment still open is left to ffprobe, which has an answer for all of them.
+    /// </summary>
+    public static SegmentLayout? ReadSegment(string path)
+    {
+        try
+        {
+            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
+            foreach ((string type, long body, long next) in Atoms(file, 0, file.Length))
+                if (type == "moov") return ReadMovie(file, body, next);
+
+            return null;
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+        catch (NotSupportedException) { return null; }
+    }
+
+    private static SegmentLayout? ReadMovie(Stream file, long start, long end)
+    {
+        TimeSpan? duration = null;
+        SegmentLayout? video = null;
+        bool hasAudio = false;
+        int channels = 0;
+        string? language = null;
+
+        foreach ((string type, long body, long next) in Atoms(file, start, end))
+        {
+            if (type == "mvhd") duration = MovieDuration(file, body);
+
+            if (type != "trak") continue;
+
+            if (ReadTrack(file, body, next) is not { } track) return null;
+
+            if (track.Handler == "vide")
+            {
+                string? codec = track.FourCc switch
+                {
+                    "avc1" => "h264",
+                    "hvc1" or "hev1" => "hevc",
+                    _ => null,
+                };
+
+                if (video is not null || codec is null) return null;
+
+                video = new SegmentLayout(TimeSpan.Zero, track.Duration, codec, track.First, track.Second, 0, null, false);
+            }
+            else if (track.Handler == "soun")
+            {
+                if (hasAudio || track.FourCc != "mp4a") return null;
+
+                hasAudio = true;
+                channels = track.Second;
+                language = track.Language;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        return video is null || duration is not { } whole
+            ? null
+            : video with { Duration = whole, HasAudio = hasAudio, AudioChannels = channels, AudioLanguage = language };
+    }
+
+    /// <summary>
+    /// One track's handler, length, language and sample description. <c>First</c> and <c>Second</c>
+    /// are the picture's width and height, or for sound the second is its channel count.
+    /// </summary>
+    private static (string Handler, TimeSpan Duration, string? Language, string FourCc, int First, int Second)? ReadTrack(
+        Stream file, long start, long end)
+    {
+        Span<byte> kind = stackalloc byte[4];
+        Span<byte> entry = stackalloc byte[48];
+
+        foreach ((string type, long body, long next) in Atoms(file, start, end))
+        {
+            if (type != "mdia") continue;
+
+            string? handler = null, language = null, fourCc = null;
+            TimeSpan? duration = null;
+            int first = 0, second = 0;
+
+            foreach ((string inner, long innerBody, long innerNext) in Atoms(file, body, next))
+            {
+                if (inner == "mdhd")
+                {
+                    duration = MovieDuration(file, innerBody);
+                    language = MediaLanguage(file, innerBody);
+                }
+                else if (inner == "hdlr")
+                {
+                    file.Position = innerBody + 8;
+
+                    if (Fill(file, kind)) handler = Encoding.ASCII.GetString(kind);
+                }
+                else if (inner == "minf")
+                {
+                    foreach ((string info, long infoBody, long infoNext) in Atoms(file, innerBody, innerNext))
+                    {
+                        if (info != "stbl") continue;
+
+                        foreach ((string table, long tableBody, _) in Atoms(file, infoBody, infoNext))
+                        {
+                            if (table != "stsd") continue;
+
+                            // Version/flags, entry count, then the entry: its size and code, six
+                            // reserved bytes and a reference index. Then the two kinds part.
+                            file.Position = tableBody;
+
+                            if (!Fill(file, entry)) return null;
+
+                            if (BinaryPrimitives.ReadUInt32BigEndian(entry[4..8]) != 1) return null;
+
+                            fourCc = Encoding.ASCII.GetString(entry[12..16]);
+
+                            // Picture: sixteen bytes of nothing, then width and height.
+                            // Sound: version, revision and vendor, then the channels.
+                            first = BinaryPrimitives.ReadUInt16BigEndian(entry[40..42]);
+                            second = handler == "soun" || fourCc == "mp4a"
+                                ? BinaryPrimitives.ReadUInt16BigEndian(entry[32..34])
+                                : BinaryPrimitives.ReadUInt16BigEndian(entry[42..44]);
+                        }
+                    }
+                }
+            }
+
+            return handler is null || duration is not { } length || fourCc is null
+                ? null
+                : (handler, length, language, fourCc, first, second);
+        }
+
+        return null;
+    }
+
+    /// <summary>The media header's language: three letters of five bits each, offset from 0x60.</summary>
+    private static string? MediaLanguage(Stream file, long body)
+    {
+        file.Position = body;
+
+        Span<byte> head = stackalloc byte[34];
+        if (!Fill(file, head)) return null;
+
+        // Past the version's two sizes of times, the timescale and the duration.
+        int packed = BinaryPrimitives.ReadUInt16BigEndian(head[0] == 1 ? head[32..34] : head[20..22]);
+
+        return new string(new[]
+        {
+            (char)(((packed >> 10) & 0x1F) + 0x60),
+            (char)(((packed >> 5) & 0x1F) + 0x60),
+            (char)((packed & 0x1F) + 0x60),
+        });
     }
 
     /// <summary>The atoms laid side by side between two offsets: type, where its body starts, where the next begins.</summary>

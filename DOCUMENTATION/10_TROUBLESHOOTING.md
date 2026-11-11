@@ -129,7 +129,7 @@ Select-String -Path "$env:APPDATA\Emerald\logs\emerald-*.jsonl" -Pattern '"Level
 | All edits refused after one | Known issue: a TooLate change blocks later versions | Undo that change. If undo also refuses, it stays until off air. |
 | Last segment stays "still being recorded" | Known issue: fingerprint excludes the newest file | Press Refresh or Sync. |
 | Timeline does not change day | The above, or something is playing by hand, or you chose a different day | See [the rules](05_MEDIA_PROCESSING.md#midnight-rollover) |
-| Cue audio buzzes | Known issue: frame count passed where samples are expected | Use video-only placements until fixed |
+| Cue audio buzzes | Fixed (A3): the sound of a placed item was read at the wrong position. A build from before the fix still does it. | Update to a build with the fix. If it still buzzes, check the file's own audio. |
 | Deleted picture briefly on air | Known issue: Repeat during a deleted scene | Check `delay.trouble` |
 | Export is off by the length of an insert | Known issue: ruler and captured frames mixed | Export before placing inserts |
 | Placements gone after closing | Not saved, by design | Finish before closing |

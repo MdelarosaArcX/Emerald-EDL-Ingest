@@ -120,6 +120,16 @@ public static class MediaProbe
     /// <summary>Beyond this the cache is started again: files pruned from the store leave entries behind.</summary>
     private const int ProbedMost = 20_000;
 
+    /// <summary>How many files' probes are remembered, for the memory monitor.</summary>
+    public static int Remembered => Probed.Count;
+
+    /// <summary>
+    /// As long as ffprobe is given. It answers in a tenth of a second; a file it cannot get through
+    /// - a share that has gone away - would otherwise hold its caller for good, and one caller is
+    /// the EDL's window.
+    /// </summary>
+    private const int ProbeMilliseconds = 15_000;
+
     /// <summary>
     /// Reads duration, start timecode and stream layout. Returns null when ffprobe is
     /// missing or the file cannot be read; callers fall back to treating SOM as elapsed.
@@ -153,6 +163,54 @@ public static class MediaProbe
         return info;
     }
 
+    /// <summary>
+    /// <see cref="Probe"/> for one of the recorder's own segments in a listing: read from the
+    /// container where it is the plain layout, about a millisecond against ffprobe's hundred and
+    /// twenty, and from ffprobe where it is not. The two share a cache, because they give the same
+    /// answer; a test holds them to it.
+    /// </summary>
+    public static MediaInfo? ProbeSegment(string? ffprobePath, string mediaPath, int frameRate)
+    {
+        if (ffprobePath is null) return null;
+
+        try
+        {
+            var file = new FileInfo(mediaPath);
+            if (!file.Exists) return null;
+
+            string key = $"{mediaPath}|{file.Length}|{file.LastWriteTimeUtc.Ticks}|{frameRate}";
+
+            if (Probed.TryGetValue(key, out MediaInfo? known)) return known;
+
+            if (MediaCodec.ReadSegment(mediaPath) is { Duration.Ticks: > 0 } layout)
+            {
+                MediaInfo info = FromLayout(mediaPath, layout, frameRate);
+
+                if (Probed.Count >= ProbedMost) Probed.Clear();
+                Probed[key] = info;
+                return info;
+            }
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+
+        return Probe(ffprobePath, mediaPath, frameRate);
+    }
+
+    private static MediaInfo FromLayout(string mediaPath, MediaCodec.SegmentLayout layout, int frameRate) => new(
+        Path: mediaPath,
+        Duration: layout.Duration,
+        StartTimecode: Timecode.Zero(frameRate),
+        HasEmbeddedTimecode: false,
+        HasAudio: layout.HasAudio,
+        VideoCodec: layout.VideoCodec,
+        Width: layout.Width,
+        Height: layout.Height,
+        AudioStreams: layout.HasAudio
+            ? new[] { new MediaAudioStream(0, "aac", layout.AudioChannels, layout.AudioLanguage, null) }
+            : Array.Empty<MediaAudioStream>(),
+        PictureDuration: layout.Picture > TimeSpan.Zero ? layout.Picture : null);
+
     private static MediaInfo? ProbeUncached(string? ffprobePath, string mediaPath, int frameRate)
     {
         if (ffprobePath is null || !File.Exists(mediaPath)) return null;
@@ -176,11 +234,20 @@ public static class MediaProbe
             using Process? probe = Process.Start(info);
             if (probe is null) return null;
 
-            string json = probe.StandardOutput.ReadToEnd();
-            probe.StandardError.ReadToEnd();
-            probe.WaitForExit(15000);
+            // Both pipes read as they fill. One after the other, a full stderr stops ffprobe
+            // writing stdout, and neither read ever returns.
+            Task<string> output = probe.StandardOutput.ReadToEndAsync();
+            Task<string> errors = probe.StandardError.ReadToEndAsync();
 
-            return Parse(json, mediaPath, frameRate);
+            if (!probe.WaitForExit(ProbeMilliseconds))
+            {
+                try { probe.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+                return null;
+            }
+
+            if (!Task.WaitAll(new Task[] { output, errors }, 2000)) return null;
+
+            return Parse(output.Result, mediaPath, frameRate);
         }
         catch
         {

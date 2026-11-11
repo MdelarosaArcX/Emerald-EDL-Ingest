@@ -799,7 +799,15 @@ public sealed class PlayoutService : IDisposable
                 }
 
                 // Keep the final frame in case post-play is a freeze.
-                if (framesFromThisFile > 0) lastFrame = (byte[])frame.Clone();
+                //
+                // Into the buffer already kept, not a new one each time: a message looping a ten
+                // second clip made a four megabyte copy of itself eight thousand times a day.
+                if (framesFromThisFile > 0)
+                {
+                    if (lastFrame is null || lastFrame.Length != frame.Length) lastFrame = new byte[frame.Length];
+
+                    Buffer.BlockCopy(frame, 0, lastFrame, 0, frame.Length);
+                }
 
                 // Every file gets its END line, with exactly how many frames it put to air and
                 // where in the message that left things — not only the ones that came up

@@ -70,6 +70,9 @@ public static class Waveform
     /// <summary>Beyond this the cache is started again: files pruned from the store leave entries behind.</summary>
     private const int ReadMost = 5_000;
 
+    /// <summary>How many files' waveforms are remembered, for the memory monitor.</summary>
+    public static int Remembered => Read.Count;
+
     /// <summary>The waveform if it has been read already, without reading it.</summary>
     public static WavePeaks? Known(string path) =>
         Key(path) is { } key && Read.TryGetValue(key, out WavePeaks? peaks) ? peaks : null;
