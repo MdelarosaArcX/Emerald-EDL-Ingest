@@ -192,7 +192,8 @@ public partial class IngestControllerWindow : Window
         var log = new IngestLog();
         log.Entry += entry => Dispatcher.BeginInvoke(() => Append(entry));
 
-        _controller = new IngestControllerService(_settings, clock, hardware, log: log);
+        _controller = new IngestControllerService(_settings, clock, hardware, log: log,
+                                                  pipeline: Emerald.Core.PipelineState.Shared);
         _controller.Scheduler.QueueChanged += () => Dispatcher.BeginInvoke(RenderQueue);
         _controller.Scheduler.JobChanged += _ => Dispatcher.BeginInvoke(RenderQueue);
 

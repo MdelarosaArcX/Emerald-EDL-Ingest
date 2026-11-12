@@ -48,7 +48,7 @@ public sealed class StoreIndex
     /// <summary>Overlap shorter than this is a rounding of lengths, not a master holding part of a proxy.</summary>
     private static readonly TimeSpan Slack = TimeSpan.FromMilliseconds(20);
 
-    private readonly string _root;
+    private readonly StorePaths _paths;
     private readonly string? _ffprobe;
     private readonly int _rate;
 
@@ -64,13 +64,20 @@ public sealed class StoreIndex
     private DateTime _lastFull = DateTime.MinValue;
 
     public StoreIndex(string root, string? ffprobePath, int frameRate = 25)
+        : this(StorePaths.Under(root), ffprobePath, frameRate)
     {
-        _root = root;
+    }
+
+    /// <param name="paths">The masters' folder and the proxies' folder, which may be on different drives.</param>
+    public StoreIndex(StorePaths paths, string? ffprobePath, int frameRate = 25)
+    {
+        _paths = paths;
         _ffprobe = ffprobePath;
         _rate = frameRate;
     }
 
-    public string Root => _root;
+    /// <summary>The folders this index lists.</summary>
+    public StorePaths Paths => _paths;
 
     /// <summary>Everything in the store, newest first, as of the last refresh.</summary>
     public IReadOnlyList<CapturedClip> Clips => _clips;
@@ -96,8 +103,8 @@ public sealed class StoreIndex
         DateTime clock = now ?? DateTime.UtcNow;
         full |= clock - _lastFull >= FullEvery;
 
-        string low = RecordingProfile.FolderFor(RecordingProfile.LowRes, _root);
-        string high = RecordingProfile.FolderFor(RecordingProfile.HighRes, _root);
+        string low = _paths.Low;
+        string high = _paths.High;
 
         bool changed = false;
 
@@ -149,14 +156,15 @@ public sealed class StoreIndex
         if (full)
         {
             looseChanged |= GatherLoose(low, Kind.LooseProxy, toRead);
-            looseChanged |= GatherLoose(_root, Kind.Other, toRead);
+            if (_paths.Root is { } root) looseChanged |= GatherLoose(root, Kind.Other, toRead);
         }
 
-        // Several at once, because each opens a file on a disk the recorder is writing to. Only the
+        // Two at once: each opens a file on a disk the recorder is writing to, and on a spinning disk
+        // more readers are more seeking, not more speed. Only the
         // first refresh has many; after that it is the one or two files that have just closed.
         var read = new Known?[toRead.Count];
 
-        Parallel.For(0, toRead.Count, new ParallelOptions { MaxDegreeOfParallelism = 6 },
+        Parallel.For(0, toRead.Count, new ParallelOptions { MaxDegreeOfParallelism = 2 },
                      i => read[i] = Read(toRead[i].File, toRead[i].Kind));
 
         FilesRead += toRead.Count;
@@ -306,7 +314,7 @@ public sealed class StoreIndex
                 {
                     // The picture's own length, not the movie's: the sound runs a few milliseconds
                     // past the last frame, and laid end to end that is a timeline sliding behind.
-                    TimeSpan? runs = MediaCodec.ReadPictureDuration(file.FullName) ?? MediaCodec.ReadDuration(file.FullName);
+                    TimeSpan? runs = MediaLengths.Picture(file);
                     bool closed = runs is { Ticks: > 0 };
 
                     return new Known(file.Length, file.LastWriteTimeUtc.Ticks, file.LastWriteTime,
@@ -338,7 +346,7 @@ public sealed class StoreIndex
     {
         var masters = new MediaLibrary.MasterIndex(high, SearchOption.TopDirectoryOnly);
         var clips = new List<CapturedClip>();
-        string low = Path.GetFullPath(RecordingProfile.FolderFor(RecordingProfile.LowRes, _root));
+        string low = Path.GetFullPath(_paths.Low);
 
         foreach ((string path, Known known) in _loose)
         {

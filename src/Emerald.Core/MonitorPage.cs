@@ -56,6 +56,8 @@ public static class MonitorPage
         .pill{font-size:9.5px;font-weight:700;letter-spacing:.5px}
         .grp td{background:#141922;color:var(--tc);font-weight:700}
         .empty{padding:20px;color:var(--muted);text-align:center}
+        .res{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+        .res canvas{display:block;width:100%;height:26px;margin-top:5px}
         @media(max-width:1100px){.strip{grid-template-columns:repeat(2,1fr)}}
         </style>
 
@@ -72,9 +74,19 @@ public static class MonitorPage
 
           <div class="strip" id="strip"></div>
 
+          <!-- The machine: processor, memory, graphics and each drive, with the last ten minutes. -->
+          <div class="strip res" id="res"></div>
+
           <div id="logView">
             <div class="bar">
-              <select id="src"><option value="">All sources</option></select>
+              <select id="area" title="The database table a line is kept in">
+                <option value="">All areas</option><option value="Errors">Errors</option>
+                <option value="Capture">Capture</option><option value="Playback">Playback</option>
+                <option value="LiveEdit">Live Edit</option><option value="Edl">EDL</option>
+                <option value="OnAir">On air</option><option value="Ingest">Ingest</option>
+                <option value="App">App</option>
+              </select>
+              <select id="day" title="Today is live; an earlier day is read back from the database"></select>
               <select id="lvl">
                 <option value="0">Info and up</option><option value="1">Ok and up</option>
                 <option value="2">Warn and up</option><option value="3">Errors only</option>
@@ -114,7 +126,7 @@ public static class MonitorPage
         <script>
         const LEVELS = ["Info","Ok","Warn","Error"];
         const CLS = {Info:"", Ok:"ok", Warn:"warn", Error:"bad"};
-        let since = 0, lines = [], follow = true, tab = "log", sources = new Set(), misses = 0;
+        let since = 0, lines = [], live = [], follow = true, tab = "log", misses = 0, day = "";
 
         const $ = id => document.getElementById(id);
         const esc = s => (s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
@@ -132,9 +144,34 @@ public static class MonitorPage
         $("tabLog").onclick = () => show("log");
         $("tabTx").onclick = () => show("tx");
 
-        ["src","lvl","q","idq"].forEach(id => $(id).oninput = $(id).onchange = draw);
+        // Today and the days before it, as far back as the database is likely to keep.
+        for (let i = 0; i <= 14; i++){
+          const d = new Date(); d.setDate(d.getDate() - i);
+          const o = document.createElement("option");
+          o.value = i === 0 ? "" : d.toISOString().slice(0, 10);
+          o.textContent = i === 0 ? "Today (live)" : i === 1 ? "Yesterday" : d.toDateString().slice(0, 10);
+          $("day").appendChild(o);
+        }
+
+        async function loadDay(){
+          day = $("day").value;
+          if (!day){ lines = live; draw(); return; }
+          $("count").textContent = "reading " + day + " ...";
+          try{
+            const area = $("area").value;
+            const h = await (await fetch("api/history?day=" + day + "&limit=5000" + (area ? "&area=" + area : ""))).json();
+            if (day !== $("day").value) return;
+            lines = h.lines;
+            draw();
+            if (h.total > h.count) $("count").textContent += ` - the newest ${h.count} of ${h.total}`;
+          } catch(e){ $("count").textContent = "could not read " + day; }
+        }
+
+        ["lvl","q","idq"].forEach(id => $(id).oninput = $(id).onchange = draw);
+        $("area").onchange = () => day ? loadDay() : draw();
+        $("day").onchange = loadDay;
         $("clear").onclick = () => {
-          $("src").value = ""; $("lvl").value = "0"; $("q").value = ""; $("idq").value = ""; draw();
+          $("area").value = ""; $("day").value = ""; $("lvl").value = "0"; $("q").value = ""; $("idq").value = ""; loadDay();
         };
         $("follow").onclick = () => {
           follow = !follow; $("follow").className = follow ? "sel" : ""; if (follow) tail();
@@ -147,7 +184,9 @@ public static class MonitorPage
 
         function matches(l){
           if (LEVELS.indexOf(l.level) < +$("lvl").value) return false;
-          if ($("src").value && l.source !== $("src").value) return false;
+          const area = $("area").value;
+          if (area === "Errors" && l.level !== "Warn" && l.level !== "Error") return false;
+          if (area && area !== "Errors" && l.area !== area) return false;
           const id = $("idq").value.trim().toLowerCase();
           if (id && !(l.id ?? "").toLowerCase().includes(id)) return false;
           const q = $("q").value.trim().toLowerCase();
@@ -190,7 +229,8 @@ public static class MonitorPage
           }
 
           let airFrames = "";
-          if (f.aired > 0){
+          const sending = d.phase === "CountingDown" || d.phase === "OnAir" || d.phase === "Draining";
+          if (sending && f.aired > 0){
             const behind = Math.max(0, f.recorded - f.aired - d.targetFrames);
             const bad = f.skipped > 0 || behind > 0;
             airFrames = `<div class="frames ${bad ? "bad" : f.repeated > 0 ? "warn" : ""}">`
@@ -201,11 +241,8 @@ public static class MonitorPage
               + (!bad && f.repeated === 0 ? " &middot; no drops" : "") + `</div>`;
           }
 
-          const phase = d.phase === "Off"
-            ? {headline:"idle", detail:"", idle:true, level:"Info"}
-            : {headline: d.phase === "CountingDown" ? `FILLING ${Math.round(d.fill*100)}%` : d.phase.toUpperCase(),
-               detail: d.detail, idle:false,
-               level: d.phase === "OnAir" ? "Ok" : d.phase === "Failed" ? "Error" : "Warn"};
+          // The playback deck's tidal lock or Live Edit's transmission, already worded.
+          const phase = d.stage;
 
           $("strip").innerHTML =
             stage("CAPTURE", s.capture, capFrames) +
@@ -245,18 +282,10 @@ public static class MonitorPage
 
             const l = await (await fetch("api/log?since=" + since + "&limit=1000")).json();
             if (l.lines.length){
-              for (const line of l.lines){
-                lines.push(line);
-                if (!sources.has(line.source)){
-                  sources.add(line.source);
-                  const o = document.createElement("option");
-                  o.value = o.textContent = line.source;
-                  $("src").appendChild(o);
-                }
-              }
+              for (const line of l.lines) live.push(line);
               since = l.lastSeq;
-              if (lines.length > 5000) lines = lines.slice(-5000);
-              if (tab === "log") draw();
+              if (live.length > 5000) live = live.slice(-5000);
+              if (!day){ lines = live; if (tab === "log") draw(); }
             }
 
             misses = 0;
@@ -271,8 +300,61 @@ public static class MonitorPage
           }
         }
 
+        // ------------------------------------------------------------ the machine
+        const GB = b => (b / 1073741824).toFixed(1);
+        const MB = b => (b / 1048576).toFixed(1);
+
+        function tile(name, value, detail, series, level){
+          const cls = level >= 90 ? "bad" : level >= 70 ? "warn" : "";
+          return `<div class="card"><div class="lbl">${esc(name.toUpperCase())}</div>
+            <div class="head ${cls}">${esc(value)}</div>
+            <div class="det" title="${esc(detail)}">${esc(detail)}</div>
+            <canvas data-series="${series.join(",")}"></canvas></div>`;
+        }
+
+        function spark(c){
+          const values = (c.dataset.series || "").split(",").filter(v => v !== "").map(Number);
+          const w = c.width = c.clientWidth * devicePixelRatio, h = c.height = 26 * devicePixelRatio;
+          const g = c.getContext("2d");
+          g.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--tc");
+          g.lineWidth = devicePixelRatio;
+          g.beginPath();
+          values.forEach((v, i) => {
+            const x = w * (i + 600 - values.length) / 599, y = h - h * Math.min(1, Math.max(0, v / 100));
+            i ? g.lineTo(x, y) : g.moveTo(x, y);
+          });
+          g.stroke();
+        }
+
+        async function resources(){
+          try{
+            const r = await (await fetch("api/resources")).json();
+            const n = r.now;
+            if (!n){ $("res").innerHTML = ""; return; }
+            const hist = r.history;
+            const ram = n.RamTotalBytes ? 100 * n.RamUsedBytes / n.RamTotalBytes : 0;
+            let html = tile("CPU", n.CpuPercent.toFixed(0) + "%", "", hist.map(s => s.cpu), n.CpuPercent)
+              + tile("RAM", ram.toFixed(0) + "%", `${GB(n.RamUsedBytes)} of ${GB(n.RamTotalBytes)} GB in use`, hist.map(s => s.ram), ram)
+              + tile("Emerald", GB(n.EmeraldPrivateBytes + n.FfmpegPrivateBytes) + " GB",
+                     `app ${GB(n.EmeraldPrivateBytes)} GB · ffmpeg ${GB(n.FfmpegPrivateBytes)} GB`,
+                     hist.map(s => 0), 0);
+            if (n.GpuPercent != null)
+              html += tile("GPU", n.GpuPercent.toFixed(0) + "%",
+                           `encode ${(n.GpuEncodePercent ?? 0).toFixed(0)}%` + (n.GpuMemoryBytes != null ? ` · ${GB(n.GpuMemoryBytes)} GB memory` : ""),
+                           hist.map(s => s.gpu ?? 0), n.GpuPercent);
+            for (const d of n.Disks)
+              html += tile(d.Name, d.ActivePercent.toFixed(0) + "% active",
+                           `R ${MB(d.ReadBytesPerSecond)} · W ${MB(d.WriteBytesPerSecond)} MB/s` + (d.TotalBytes ? ` · ${GB(d.FreeBytes)} GB free` : ""),
+                           hist.map(s => (s.disks.find(x => x.name === d.Name) || {active: 0}).active), d.ActivePercent);
+            $("res").innerHTML = html;
+            document.querySelectorAll("#res canvas").forEach(spark);
+          } catch(e){ /* the poll reports the connection */ }
+        }
+
         poll();
+        resources();
         setInterval(poll, 500);
+        setInterval(resources, 1000);
         setInterval(() => { if (tab === "tx") loadTransmitted(); }, 3000);
         </script>
         """;

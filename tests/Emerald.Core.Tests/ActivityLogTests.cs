@@ -1,5 +1,4 @@
 using System.IO;
-using System.Text.Json;
 using Emerald.Core;
 using Xunit;
 
@@ -143,39 +142,39 @@ public sealed class ActivityLogTests : IDisposable
                     $"a write took {clock.ElapsedMilliseconds} ms");
     }
 
-    // ------------------------------------------------------------------ the file
+    // ------------------------------------------------------------------ the database
 
     [Fact]
-    public void The_record_is_written_as_one_json_object_per_line()
+    public void The_record_is_written_to_the_database_with_every_field()
     {
+        using LogDatabase db = Database();
+
         using (ActivityLog log = New())
         {
-            log.StartWriting(_folder, retentionDays: 14);
+            log.StartWriting(db, retentionDays: 14);
             log.Ok(LogSource.Edl, "queued", @event: "edl.queued", correlation: "abc12345",
                    file: @"C:\media\promo.mov");
 
             Drain(log);
         }
 
-        string[] lines = File.ReadAllLines(TodaysFile());
+        LogLine read = Assert.Single(db.ReadDay(DateTime.Today));
 
-        Assert.Single(lines);
-
-        LogLine? read = JsonSerializer.Deserialize<LogLine>(lines[0], Options);
-
-        Assert.NotNull(read);
-        Assert.Equal("queued", read!.Message);
+        Assert.Equal("queued", read.Message);
         Assert.Equal("edl.queued", read.Event);
         Assert.Equal("abc12345", read.Correlation);
         Assert.Equal(@"C:\media\promo.mov", read.File);
+        Assert.Equal(1, db.Count("log_edl"));
     }
 
     [Fact]
-    public void A_transient_line_reaches_the_screen_and_never_the_file()
+    public void A_transient_line_reaches_the_screen_and_never_the_database()
     {
+        using LogDatabase db = Database();
+
         using (ActivityLog log = New())
         {
-            log.StartWriting(_folder, retentionDays: 14);
+            log.StartWriting(db, retentionDays: 14);
 
             log.Info(LogSource.Playout, "kept");
             log.Info(LogSource.Playout, "the once-a-second heartbeat", transient: true);
@@ -185,10 +184,7 @@ public sealed class ActivityLogTests : IDisposable
 
         // The engine reports every second while a message runs. Those belong on the page and
         // not in the record, or the events are buried under them.
-        string[] lines = File.ReadAllLines(TodaysFile());
-
-        Assert.Single(lines);
-        Assert.Contains("kept", lines[0]);
+        Assert.Equal("kept", Assert.Single(db.ReadDay(DateTime.Today)).Message);
     }
 
     [Fact]
@@ -205,42 +201,24 @@ public sealed class ActivityLogTests : IDisposable
         Assert.Equal(new[] { false, true }, seen);
     }
 
-    [Fact]
-    public void The_file_can_still_be_read_while_Emerald_is_holding_it()
-    {
-        using ActivityLog log = New();
-
-        log.StartWriting(_folder, retentionDays: 14);
-        log.Info(LogSource.App, "tail me");
-        Drain(log);
-
-        // An operator watching a problem wants to tail the file now, not after the application
-        // exits. A share mode that made that impossible would be a lock for nobody's benefit.
-        using var stream = new FileStream(TodaysFile(), FileMode.Open, FileAccess.Read,
-                                          FileShare.ReadWrite);
-        using var reader = new StreamReader(stream);
-
-        Assert.Contains("tail me", reader.ReadToEnd());
-    }
-
-
     /// <summary>
-    /// The transmitted view loads the whole day back off the disk, so what was written has to
-    /// come back as what it was — the tags and the correlation especially, since the tally
-    /// keys on them and a null id would scatter a message's files across separate headings.
+    /// The transmitted view loads the whole day back, so what was written has to come back as
+    /// what it was — the tags and the correlation especially, since the tally keys on them and a
+    /// null id would scatter a message's files across separate headings.
     /// </summary>
     [Fact]
-    public void A_day_written_comes_back_off_the_disk_as_it_went_on()
+    public void A_day_written_comes_back_as_it_went_on()
     {
+        using LogDatabase db = Database();
         using ActivityLog log = New();
 
-        log.StartWriting(_folder, retentionDays: 14);
+        log.StartWriting(db, retentionDays: 14);
         log.Info(LogSource.Edl, "queued", @event: "edl.queued", correlation: "a1b2c3d4");
         log.Ok(LogSource.Playout, "playing", @event: "playout.video",
                correlation: "a1b2c3d4", file: @"C:\m\promo.mov", detail: "track 1\nlabel English");
         Drain(log);
 
-        LogLine[] back = ActivityLog.ReadDay(_folder, DateTime.Today);
+        LogLine[] back = log.ReadDay(DateTime.Today);
 
         Assert.Equal(2, back.Length);
         Assert.Equal("edl.queued", back[0].Event);
@@ -254,47 +232,62 @@ public sealed class ActivityLogTests : IDisposable
     [Fact]
     public void A_day_with_no_record_reads_back_as_nothing_rather_than_throwing()
     {
-        Assert.Empty(ActivityLog.ReadDay(_folder, DateTime.Today.AddDays(-9)));
+        using LogDatabase db = Database();
+        using ActivityLog log = New();
+        log.StartWriting(db, retentionDays: 14);
+
+        Assert.Empty(log.ReadDay(DateTime.Today.AddDays(-9)));
     }
 
-    /// <summary>A crash leaves a half-written last line. The rest of the day is still good.</summary>
+    /// <summary>The screen keeps the head of a long line; the database keeps all of it.</summary>
     [Fact]
-    public void A_torn_line_is_skipped_and_the_rest_of_the_day_survives()
+    public void A_long_detail_is_trimmed_on_screen_and_kept_whole_in_the_database()
     {
+        using LogDatabase db = Database();
         using ActivityLog log = New();
+        log.StartWriting(db, retentionDays: 14);
 
-        log.StartWriting(_folder, retentionDays: 14);
-        log.Info(LogSource.App, "whole");
+        string detail = new('x', ActivityLog.MaxDetailChars * 3);
+        log.Info(LogSource.LiveEdit, "long", @event: "edl.editCreated", detail: detail);
         Drain(log);
-        log.Dispose();
 
-        File.AppendAllText(TodaysFile(), "{\"Seq\":99,\"Message\":\"tor" + Environment.NewLine);
-
-        LogLine[] back = ActivityLog.ReadDay(_folder, DateTime.Today);
-
-        Assert.Single(back);
-        Assert.Equal("whole", back[0].Message);
+        Assert.True(log.Snapshot().Single().Detail!.Length < detail.Length);
+        Assert.Equal(detail, db.ReadDay(DateTime.Today, LogArea.Edl).Single().Detail);
     }
 
-    // ------------------------------------------------------------------ retention sweep
+    [Fact]
+    public void Closing_the_log_writes_what_is_still_queued()
+    {
+        using LogDatabase db = Database();
+
+        using (ActivityLog log = New())
+        {
+            log.StartWriting(db, retentionDays: 14);
+            for (int i = 0; i < 2000; i++) log.Info(LogSource.App, $"line {i}");
+        }
+
+        Assert.Equal(2000, db.Count("log_app"));
+    }
+
+    // ------------------------------------------------------------------ old files
 
     [Fact]
-    public void Records_older_than_the_window_are_swept_and_newer_ones_kept()
+    public void Old_log_files_older_than_the_window_are_swept_and_newer_ones_kept()
     {
-        using ActivityLog log = New();
-
         string old = Write($"emerald-{DateTime.Today.AddDays(-30):yyyyMMdd}.jsonl");
+        string oldEdl = Write($"edl-{DateTime.Today.AddDays(-30):yyyyMMdd}.jsonl");
+        string oldMemory = Write($"memory-{DateTime.Today.AddDays(-30):yyyyMMdd}.jsonl");
         string edge = Write($"emerald-{DateTime.Today.AddDays(-14):yyyyMMdd}.jsonl");
-        string recent = Write($"emerald-{DateTime.Today.AddDays(-2):yyyyMMdd}.jsonl");
-        string today = Write($"emerald-{DateTime.Today:yyyyMMdd}.jsonl");
+        string recent = Write($"edl-{DateTime.Today.AddDays(-2):yyyyMMdd}.jsonl");
 
-        int swept = log.Sweep(_folder, retentionDays: 14);
+        int swept = ActivityLog.SweepOldFiles(_folder, retentionDays: 14);
 
-        Assert.Equal(1, swept);
+        Assert.Equal(3, swept);
         Assert.False(File.Exists(old));
+        Assert.False(File.Exists(oldEdl));
+        Assert.False(File.Exists(oldMemory));
         Assert.True(File.Exists(edge), "the edge of the window is kept, not swept");
         Assert.True(File.Exists(recent));
-        Assert.True(File.Exists(today));
     }
 
     [Fact]
@@ -305,9 +298,7 @@ public sealed class ActivityLogTests : IDisposable
         string path = Write($"emerald-{DateTime.Today.AddDays(-30):yyyyMMdd}.jsonl");
         File.SetLastWriteTime(path, DateTime.Now);
 
-        using ActivityLog log = New();
-
-        Assert.Equal(1, log.Sweep(_folder, retentionDays: 14));
+        Assert.Equal(1, ActivityLog.SweepOldFiles(_folder, retentionDays: 14));
         Assert.False(File.Exists(path));
     }
 
@@ -320,6 +311,9 @@ public sealed class ActivityLogTests : IDisposable
         Assert.Equal(new DateTime(2026, 9, 9),
                      ActivityLog.DateFromName(@"C:\logs\emerald-20260909-003.jsonl"));
 
+        Assert.Equal(new DateTime(2026, 9, 9),
+                     ActivityLog.DateFromName(@"C:\logs\edl-20260909.jsonl"));
+
         Assert.Null(ActivityLog.DateFromName(@"C:\logs\something-else.txt"));
     }
 
@@ -328,19 +322,12 @@ public sealed class ActivityLogTests : IDisposable
     {
         Write($"emerald-{DateTime.Today.AddDays(-900):yyyyMMdd}.jsonl");
 
-        using ActivityLog log = New();
-
-        Assert.Equal(0, log.Sweep(_folder, retentionDays: -1));
+        Assert.Equal(0, ActivityLog.SweepOldFiles(_folder, retentionDays: -1));
     }
 
     // ------------------------------------------------------------------ helpers
 
-    private static readonly JsonSerializerOptions Options = new()
-    {
-        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() },
-    };
-
-    private string TodaysFile() => Path.Combine(_folder, $"emerald-{DateTime.Today:yyyyMMdd}.jsonl");
+    private LogDatabase Database() => new(LogDatabase.PathIn(_folder));
 
     private string Write(string name)
     {

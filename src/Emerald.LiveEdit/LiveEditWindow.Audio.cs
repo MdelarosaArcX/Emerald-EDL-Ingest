@@ -71,8 +71,12 @@ public partial class LiveEditWindow
         _waveFailed.RemoveWhere(path => !shown.Contains(path));
     }
 
-    /// <summary>Two ffmpegs at a time: enough to fill a screen quickly, not enough to starve the recorder.</summary>
-    private static readonly SemaphoreSlim WaveSlots = new(2);
+    /// <summary>
+    /// One ffmpeg at a time. Each reads a whole file from the disk the recorder is writing to;
+    /// two at once on a spinning disk was two more heads' worth of seeking. Waveforms are kept on
+    /// disk once read (<see cref="Waveform.CacheFolder"/>), so this is a cost paid once a segment.
+    /// </summary>
+    private static readonly SemaphoreSlim WaveSlots = new(1);
 
     private bool _waveRedrawQueued;
 
@@ -568,7 +572,9 @@ public partial class LiveEditWindow
             }
             else if (to - from >= 3)
             {
-                ReadWaveform(overlay.Path);
+                // A master-quality export is gigabytes of DNxHD; its preview copy has the same
+                // sound in a few megabytes.
+                ReadWaveform(overlay.Path, RangeExport.PreviewFor(overlay.Path));
             }
 
             if (to - from > 60)
@@ -784,8 +790,10 @@ public partial class LiveEditWindow
     /// Reads a segment's waveform in the background, and draws the lane again once it is in.
     /// Asked for again on every redraw until it is in, so only what is on screen is ever read.
     /// </summary>
-    private void ReadWaveform(string path)
+    /// <param name="source">The file to read the sound from, when it is not <paramref name="path"/> itself.</param>
+    private void ReadWaveform(string path, string? source = null)
     {
+        string from = source ?? path;
         if (_waveReading.Contains(path) || _waveFailed.Contains(path)) return;
         if (Ffmpeg.Locate(_settings.FfmpegPath) is not { } ffmpeg) return;
 
@@ -796,7 +804,7 @@ public partial class LiveEditWindow
             await WaveSlots.WaitAsync();
 
             WavePeaks? peaks;
-            try { peaks = Waveform.Peaks(ffmpeg, path); }
+            try { peaks = Waveform.Peaks(ffmpeg, from); }
             finally { WaveSlots.Release(); }
 
             _ = Dispatcher.BeginInvoke(() =>

@@ -145,15 +145,35 @@ public static class MediaLibrary
         string.IsNullOrWhiteSpace(settings.CaptureFolder) ? DefaultFolder : settings.CaptureFolder;
 
     /// <summary>
+    /// Where the masters and the proxies go: the high-res and low-res folders the operator chose,
+    /// each one not chosen being its high\ or low\ folder in the store as it always was.
+    /// </summary>
+    public static StorePaths PathsFor(AppSettings settings) =>
+        PathsFor(settings.CaptureFolder, settings.HighResFolder, settings.LowResFolder);
+
+    /// <summary>The same, from the three folders as they are saved.</summary>
+    public static StorePaths PathsFor(string capture, string high, string low)
+    {
+        StorePaths under = StorePaths.Under(string.IsNullOrWhiteSpace(capture) ? DefaultFolder : capture.Trim());
+
+        return new StorePaths(
+            string.IsNullOrWhiteSpace(high) ? under.High : high.Trim(),
+            string.IsNullOrWhiteSpace(low) ? under.Low : low.Trim());
+    }
+
+    /// <summary>
     /// Everything in the store, newest first. <paramref name="ffprobePath"/> may be null, in
     /// which case clips are listed without format detail rather than not listed at all — the
     /// operator should still see their recordings when ffmpeg is missing.
     /// </summary>
-    public static IReadOnlyList<CapturedClip> List(string folder, string? ffprobePath, int frameRate = 25)
+    public static IReadOnlyList<CapturedClip> List(string folder, string? ffprobePath, int frameRate = 25) =>
+        List(StorePaths.Under(folder), ffprobePath, frameRate);
+
+    public static IReadOnlyList<CapturedClip> List(StorePaths paths, string? ffprobePath, int frameRate = 25)
     {
         // A listing is an index read once. Live Edit keeps its own and refreshes it instead,
         // which opens only what has changed.
-        var index = new StoreIndex(folder, ffprobePath, frameRate);
+        var index = new StoreIndex(paths, ffprobePath, frameRate);
         index.Refresh(full: true);
         return index.Clips;
     }
@@ -375,7 +395,7 @@ public static class MediaLibrary
 
     /// <summary>Convenience overload for callers that already hold settings.</summary>
     public static IReadOnlyList<CapturedClip> List(AppSettings settings, int frameRate = 25) =>
-        List(FolderFor(settings), MediaProbe.LocateFfprobe(Ffmpeg.Locate(settings.FfmpegPath)), frameRate);
+        List(PathsFor(settings), MediaProbe.LocateFfprobe(Ffmpeg.Locate(settings.FfmpegPath)), frameRate);
 
     private static string ResolveDefaultFolder()
     {

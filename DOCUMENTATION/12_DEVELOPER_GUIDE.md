@@ -25,7 +25,7 @@ Comments are unusually thorough, and often explain a measured failure. Treat the
 
 The code graph helps with navigation. `graphify update .` refreshes it, `graphify-out/GRAPH_REPORT.md` lists the most connected classes, and `graphify query "..."` searches it. `graphify-out` is git-ignored and `graphify` is installed separately, so a fresh clone has neither. Install it and generate the graph first.
 
-**Before you start:** install the .NET 8 SDK and ffmpeg, and get the `assets\` folder, which is not in git but which the projects include as resources. Always build the solution, since a direct project build lands in a different output folder. The default timecode URL (`http://10.0.0.31:8888/api/timecode`) won't answer off-site: real-mode ingest then refuses to schedule, and the EDL plays immediately. Settings, logs and the ingest database are described in [data and storage](08_DATA_AND_STORAGE.md). `CLAUDE.md` lists `npm` commands that don't apply here.
+**Before you start:** install the .NET 8 SDK and ffmpeg, and get the `assets\` folder, which is not in git but which the projects include as resources. Always build the solution, since a direct project build lands in a different output folder. The default timecode URL (`http://10.0.0.31:8888/api/timecode`) won't answer off-site: real-mode ingest then refuses to schedule, and the EDL plays immediately. Settings, the log database (`emerald.db`) and the ingest database are described in [data and storage](08_DATA_AND_STORAGE.md). `CLAUDE.md` lists `npm` commands that don't apply here.
 
 ## Rules of the codebase
 
@@ -38,14 +38,16 @@ The code graph helps with navigation. `graphify update .` refreshes it, `graphif
 7. **Marshal to the UI** with `Dispatcher.BeginInvoke` in any handler raised on an engine thread.
 8. **Operator errors are sentences.** Return a reason rather than throwing. Log with an `@event` tag.
 9. **Put pure rules in Core** with time passed in, and test them.
-10. **Don't change an event tag casually.** `TransmissionTally` reads them.
+10. **Don't change an event tag casually.** `TransmissionTally` reads them, and the tag's prefix decides which database table the line is stored in.
+11. **Two folders, not one root.** Recordings go to `StorePaths(High, Low)` (`src/Emerald.Video/StorePaths.cs`), from `MediaLibrary.PathsFor(settings)`. Don't build paths as `Path.Combine(root, "high")`. `StorePaths.Under(root)` exists for callers that still have one folder, such as the EDL window and ingest; exports go to `StorePaths.Exports`, snapshots to `Root ?? High`.
+12. **Helper processes go behind the recorder.** Any ffmpeg or ffprobe that only reads media for display or export should call `BackgroundPriority.Apply(process)` right after `Process.Start`. Never call it on anything that feeds the air or the recorder.
 
 ## Add a new feature
 
 1. Decide the layer. Rules with no hardware go in Core. Real-time loops and recording or air decoding go in Video. Store logic, including its ffmpeg and ffprobe work such as export, waveforms and probing, goes in Media.
 2. Write the rule as a pure function with a test.
 3. Wire it into the window last.
-4. Add activity log lines with an `@event` tag.
+4. Add activity log lines with an `@event` tag. They reach the database by themselves: `ActivityLog.Write` queues, and the writer thread stores them in the table `LogDatabase.AreaOf` picks.
 5. If it's settings-backed, add a property to `AppSettings` with a default. Old files load, since a missing key takes the default.
 6. Run `graphify update .` and confirm the report's Import Cycles section still says none.
 7. Update the relevant document here.
@@ -73,6 +75,26 @@ The server is read-only by design, and any route added should stay that way unle
 3. Add tests to `tests/Emerald.Core.Tests/MonitorServerTests.cs`.
 4. If the page should show it, edit `src/Emerald.Core/MonitorPage.cs`, which is one string constant. Escape values with `esc`, noting it doesn't cover attribute context.
 5. Document it in [API and communication](07_API_AND_COMMUNICATION.md).
+
+## Logging and the database
+
+Everything goes through `ActivityLog.Shared` (`src/Emerald.Core/ActivityLog.cs`). Don't write log files of your own. `Write` never touches the disk: it stamps the line, puts it in the 5000-line ring, queues it and returns. The `activity log` writer thread stores batches in `emerald.db` (`src/Emerald.Core/LogDatabase.cs`). Lines marked `transient` stay on screen only.
+
+**Which table.** `LogDatabase.AreaOf` maps a line to an area by its event prefix first, then its source. Warnings and errors are also copied to `log_error`. To route a new kind of line, give it a tag with an existing prefix, or add a rule to `AreaOf`.
+
+**Adding an area (a new table):**
+
+1. Add a value to `LogArea`, and to `LogDatabase.Areas` in the order the Monitor should list it.
+2. Name its table in `LogDatabase.TableFor`. The constructor creates it with `create table if not exists`, and `Sweep` and `Read` pick it up from `Areas`.
+3. Route lines to it in `AreaOf`.
+4. Give it a display name in `MonitorWindow.AreaName` if `ToString()` is not right, and add an `<option>` to the area select in `MonitorPage.cs`.
+5. Add a test to `tests/Emerald.Core.Tests/LogDatabaseTests.cs`.
+
+There are no migrations. A new column on an existing table would need an `alter table` guarded against an existing column, as `IngestStore` does with `AddColumnIfMissing`.
+
+**Reading back.** `ActivityLog.ReadDay(day, area)` flushes the queue (up to 2 s) and reads the database, or the ring when there is no database. Never call it from a real-time thread, and keep it off the UI thread for a whole day.
+
+**Resource samples.** `ResourceSampler.Shared` samples once a second only while something holds a `Watch()` or a recording runs. Take a `Watch()` while you need figures and dispose it after.
 
 ## Add a new frontend component
 
@@ -105,9 +127,11 @@ Run it from the repository root, in Git Bash or another shell with gawk. It is s
 
 **Segment lengths.** The proxy is cut at `RecordingProfile.SegmentSeconds` (the deck's setting) and the master at `RecordingProfile.MasterSegmentSeconds` (300). `SegmentSecondsFor(output)` picks between them. Never assume a proxy and a master with the same number hold the same picture: use `CapturedClip.Masters`, or `StoreIndex.MastersOf(folder)` for a cut.
 
-**Listing the store.** Keep a `StoreIndex` and call `Refresh()` rather than calling `MediaLibrary.List` repeatedly: a refresh reads only new or just-closed files, and returns whether anything changed. `MediaLibrary.List` is a one-shot index, fine for an occasional listing.
+**Listing the store.** Keep a `StoreIndex` and call `Refresh()` rather than calling `MediaLibrary.List` repeatedly: a refresh reads only new or just-closed files, and returns whether anything changed. `MediaLibrary.List` is a one-shot index, fine for an occasional listing. Both take a `StorePaths`; the string-root overloads remain and go through `StorePaths.Under`. For a segment's length use `MediaLengths.Picture(file)`, which reads each finished file once for the whole app.
 
-**Adding an output.** Add a `RecordingOutput` to `RecordingProfile.Outputs`. `MediaLibrary`, `StoreIndex`, `StorageWarden` and `IngestRecorder` assume low and high, and `IngestRecorder` maps `[0]` to proxy and `[1]` to master, so check each.
+**Store folders.** `RecordingProfile.EncoderArguments`, `CaptureRequest` (its `Store`, read through `Paths`), `RecordingSetup.TryBuild`, `SegmentWatch`, `StoreIndex`, `RangeExport` and `StorageWarden.Enforce` all take a `StorePaths`. A new caller should too. `StorePaths.Root` is the one folder both sit in when they are laid out the old way, otherwise null, so handle null.
+
+**Adding an output.** Add a `RecordingOutput` to `RecordingProfile.Outputs`. `StorePaths` has exactly two folders (`For(output)` picks by the high-res key), and `MediaLibrary`, `StoreIndex`, `StorageWarden` and `IngestRecorder` assume low and high, and `IngestRecorder` maps `[0]` to proxy and `[1]` to master, so check each.
 
 **Decoding for air.** `FrameSource` and `AudioSource`. `ReadFrame`'s position is in **samples**.
 
@@ -117,6 +141,7 @@ Run it from the repository root, in Git Bash or another shell with gawk. It is s
 - `%d` means day of month under `-strftime`.
 - DNxHD 145 accepts only certain rasters. `RecordingOutput.Supports` enforces this.
 - Media Foundation can't decode DNxHD, so anything played on screen needs a proxy.
+- The recording drive is often one spinning disk. Every extra reader there is seeking that takes the head from the recorder. Read once and cache (as `Waveform` and `MediaLengths` do), keep reads few at a time, and lower the priority of helper processes with `BackgroundPriority`.
 
 **Ring format.** Changing the slot layout needs a change to `DelayLine` only, and its magic number should change too.
 
@@ -135,7 +160,7 @@ See [troubleshooting](10_TROUBLESHOOTING.md#hardware-checks), and add:
 
 | Situation | Approach |
 |---|---|
-| Handler doesn't run | Check for a `_loading` style guard. See [A1](11_TECHNICAL_ASSESSMENT.md#a1-_loading-is-never-cleared-so-five-shell-handlers-never-run). |
+| Handler doesn't run | Check for a `_loading` style guard, and that something clears it. See [A1](11_TECHNICAL_ASSESSMENT.md#a1-_loading-was-never-cleared-so-five-shell-handlers-never-ran). |
 | Exception on a background thread | Nothing logs it. Run under a debugger with first-chance exceptions on. |
 | Window throws on load, build was clean | Run `tools/check-xaml-styles.sh`. |
 | Off-by-a-few frames on the timeline | Check the coordinate. Then check inserts in `IngestTimeline`. |
@@ -144,7 +169,7 @@ See [troubleshooting](10_TROUBLESHOOTING.md#hardware-checks), and add:
 | Tests fail, ffmpeg not found | Put it on `PATH`. |
 | UI freezes | Look for a synchronous `Stop`, `Join` or ffprobe on the UI thread. |
 | Memory looks high or keeps growing | Turn on the memory record (below) and compare `PrivateBytes` over time. Working set alone mostly shows the delay ring. |
-| Log line missing | `ActivityLog` isn't flushed at exit. Also check `Transient`. |
+| Log line missing | Check `Transient`, and `log.dropped`. A normal exit flushes the log, but a crash can lose the last batch. Check the line went to the area you expected (`LogDatabase.AreaOf`). If `app.databasefailed` was logged, the record is memory only. |
 
 **Attaching a debugger:** Debug build with `run.bat Debug`, then attach, or set `Emerald.App` as the startup project with arguments `--edl`. Remember a running instance captures later launches.
 
@@ -153,7 +178,8 @@ See [troubleshooting](10_TROUBLESHOOTING.md#hardware-checks), and add:
 `MemoryMonitor` (`src/Emerald.Core/MemoryMonitor.cs`) reports what the process, its ffmpeg children and each module hold.
 
 - **On request:** open the Monitor window's remote page server and fetch `/api/memory`. See [the API](07_API_AND_COMMUNICATION.md).
-- **As a record:** set `"memoryDiagnostics": true` in `settings.json`, or start Emerald with `EMERALD_MEMORY_LOG=1`. A snapshot goes to `memory-yyyyMMdd.jsonl` in the log folder every 10 s. It is off by default.
+- **As a record:** set `"memoryDiagnostics": true` in `settings.json`, or start Emerald with `EMERALD_MEMORY_LOG=1`. A snapshot goes to the `resource_process` table of `emerald.db` every 10 s, as one JSON row. It is off by default, and does not start if the database could not be opened.
+- **Machine figures:** the Monitor's resource tiles, `/api/resources`, and, while recording, `resource_sample` and `resource_disk` in the database, keyed to the recording in `recording_session`.
 - **Adding a figure:** `MemoryGauges.Register("Module", "name", () => value)` returns an `IDisposable`; dispose it when the thing goes away. The function is called from the monitor's thread, so it must be cheap and must not touch UI objects.
 - **Naming a child process:** call `MemoryGauges.NameChild(process.Id, "role")` after `Process.Start`.
 

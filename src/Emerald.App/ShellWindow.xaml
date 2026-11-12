@@ -851,11 +851,47 @@
                                                 ToolTip="Rescan the boards"/>
                                     </Grid>
 
-                                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Output path"
-                                               Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
-                                    <TextBox x:Name="OutputPathBox" Grid.Row="2" Grid.Column="1"
-                                             Style="{StaticResource IpMiniTextBox}" Margin="0,3,0,0"
-                                             LostFocus="OutputPath_LostFocus"/>
+                                    <!-- Where the two outputs go, each anywhere: the masters and
+                                         the proxies on different drives keep the proxies' reads
+                                         off the disk the masters are written to. Locked while
+                                         recording - the encoder is told once. -->
+                                    <Grid Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,3,0,0">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="84"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="4"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <TextBlock Grid.Row="0" Grid.Column="0" Text="High-res path"
+                                                   Style="{StaticResource IpLabel}" Margin="0,0,8,0"/>
+                                        <TextBox x:Name="HighResBox" Grid.Row="0" Grid.Column="1"
+                                                 Style="{StaticResource IpMiniTextBox}"
+                                                 LostFocus="StorePath_LostFocus"
+                                                 ToolTip="Folder for the DNxHD masters (5-minute files)"/>
+                                        <Button x:Name="HighResBrowse" Grid.Row="0" Grid.Column="3"
+                                                Style="{StaticResource IpIconButton}" Width="24" Height="18"
+                                                Tag="{StaticResource IconFolder}"
+                                                Foreground="{StaticResource IpMuted}" Click="BrowseStorePath_Click"
+                                                ToolTip="Choose the high-res folder"/>
+
+                                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Low-res path"
+                                                   Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
+                                        <TextBox x:Name="LowResBox" Grid.Row="1" Grid.Column="1"
+                                                 Style="{StaticResource IpMiniTextBox}" Margin="0,3,0,0"
+                                                 LostFocus="StorePath_LostFocus"
+                                                 ToolTip="Folder for the H.264 proxies Live Edit plays"/>
+                                        <Button x:Name="LowResBrowse" Grid.Row="1" Grid.Column="3"
+                                                Style="{StaticResource IpIconButton}" Width="24" Height="18"
+                                                Margin="0,3,0,0"
+                                                Tag="{StaticResource IconFolder}"
+                                                Foreground="{StaticResource IpMuted}" Click="BrowseStorePath_Click"
+                                                ToolTip="Choose the low-res folder"/>
+                                    </Grid>
 
                                     <TextBlock Grid.Row="3" Grid.Column="0" Text="Title"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
@@ -979,11 +1015,22 @@
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"
                                                VerticalAlignment="Top"/>
                                     <StackPanel Grid.Row="13" Grid.Column="1" Margin="0,3,0,0">
-                                        <ComboBox x:Name="StorageLimitCombo"
-                                                  Style="{StaticResource IpMiniCombo}"
-                                                  Width="126" HorizontalAlignment="Left"
-                                                  SelectionChanged="StorageLimit_Changed"
-                                                  ToolTip="Past this, the oldest recordings are deleted to make room for the newest"/>
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="high" Foreground="{StaticResource IpDim}" FontSize="9"
+                                                       Width="24" VerticalAlignment="Center"/>
+                                            <ComboBox x:Name="HighLimitCombo"
+                                                      Style="{StaticResource IpMiniCombo}" Width="102"
+                                                      SelectionChanged="StorageLimit_Changed"
+                                                      ToolTip="Past this, the oldest master is deleted with the proxies it holds"/>
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal" Margin="0,3,0,0">
+                                            <TextBlock Text="low" Foreground="{StaticResource IpDim}" FontSize="9"
+                                                       Width="24" VerticalAlignment="Center"/>
+                                            <ComboBox x:Name="LowLimitCombo"
+                                                      Style="{StaticResource IpMiniCombo}" Width="102"
+                                                      SelectionChanged="StorageLimit_Changed"
+                                                      ToolTip="Past this, the oldest proxies are deleted; their masters stay until the high-res limit takes them"/>
+                                        </StackPanel>
                                         <TextBlock x:Name="StorageNote" Foreground="{StaticResource IpDim}"
                                                    FontSize="9" Margin="0,3,0,0" TextWrapping="Wrap"/>
                                     </StackPanel>

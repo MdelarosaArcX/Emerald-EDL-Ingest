@@ -10,7 +10,7 @@ Each workflow is in chronological order. Line references are to commit `dd8e4a7`
 2. `App_Startup` takes the first argument starting with `--`, lower-cased (`:63`). It allows nothing, `--edl`, `--ingest` or `--monitor`. Anything else shows a message and exits with code 1.
 3. It takes the named mutex `Emerald.App.SingleInstance` (`:80`). If another process owns it, `Handoff` connects to the pipe `Emerald.App.Activate` with a 2 second timeout and writes the mode as one line. On success this process exits. On failure it carries on as a second instance (`:90`).
 4. `DelayLine.SweepOrphans` deletes `tidal-<pid>-*.ring` files whose process is gone (`:95`).
-5. `StartActivityLog` (`:126`) sweeps old logs, starts the writer, hooks `DispatcherUnhandledException` and logs `app.started`.
+5. `StartActivityLog` (`:126`) opens `emerald.db` in the data folder (falling back to `%APPDATA%\Emerald`, then to memory only), sweeps old `.jsonl` log files, starts the writer, attaches the resource sampler, points the waveform cache at `<data folder>\peaks`, hooks `DispatcherUnhandledException` and logs `app.started`.
 6. Software rendering applies if `softwareRendering` is set or `EMERALD_SOFTWARE_RENDER=1` (`:101`).
 7. `StartListening` starts the pipe server (`:223`).
 8. `OpenModule` shows the window (`:159`). If a shell exists it delegates to `shell.OpenModule`.
@@ -32,7 +32,7 @@ Modules open through `ShowModule<T>` (`:2550`), which creates the window or acti
 5. Saves deck settings.
 6. Closes `_edl`, `_liveEdit`, `_ingest`, `_playback` and `_monitor`.
 
-`App.OnExit` (`src/Emerald.App/App.xaml.cs:259`) shuts down the timecode link, cancels the listener and releases the mutex. WPF's default `OnLastWindowClose` applies, so a window that refuses to close keeps the process alive.
+`App.OnExit` (`src/Emerald.App/App.xaml.cs:259`) shuts down the timecode link, stops the memory monitor and the resource sampler, flushes the activity log to the database (up to 3 s) and closes it, cancels the listener and releases the mutex. WPF's default `OnLastWindowClose` applies, so a window that refuses to close keeps the process alive.
 
 Each module has its own close behaviour:
 
@@ -44,7 +44,7 @@ Each module has its own close behaviour:
 | Live Edit | Prompts if armed, filling, on air or draining, then ends the transmission. If the prompt cannot be shown, which the code expects when the shell is closing it, the transmission ends with no prompt. |
 | Monitor | Stops timers and the remote server |
 
-Gaps here are [verified issues](11_TECHNICAL_ASSESSMENT.md): rings are left on disk when the shell closes during a recording, and the activity log is never flushed.
+Gaps here are [verified issues](11_TECHNICAL_ASSESSMENT.md): rings are left on disk when the shell closes during a recording.
 
 The shell stops its capture before asking modules to close, and never cancels its own close. If a module then refuses to close, the recording has already stopped, the shell still closes, and the process stays alive for that window.
 
@@ -53,13 +53,13 @@ The shell stops its capture before asking modules to close, and never cancels it
 `StartRecording` (`src/Emerald.App/ShellWindow.xaml.cs:995`):
 
 1. Requires a board and port.
-2. Resolves `StoreFolder` and creates it.
-3. Writes the profile, rate, folder and limit into settings, then `AppSettings.SaveCaptureFolder` so Live Edit can follow.
+2. Resolves the high-res and low-res folders (`StorePaths`) and creates both.
+3. Writes the profile, rate, both folders and both limits into settings, then `AppSettings.SaveStoreFolders` so Live Edit can follow.
 4. Collects added audio beds with `CurrentCaptureAudio`.
 5. `RecordingSequence.Next(DateTime.Now, title)` produces the folder name and file stem.
 6. `RecordingSetup.TryBuild` validates and builds the `CaptureRequest`. Failure shows a sentence and, if tidal lock is Armed, calls `TidalLock.Fail`. An armed Go Live is left waiting.
 7. `_capture.Start(request with { Names = naming })` starts the `SDI capture` thread.
-8. A `SegmentWatch` starts following the new folder.
+8. A `SegmentWatch` starts following the new folder in both outputs' folders.
 9. `PipelineState` is updated and the UI shows RECORDING.
 
 **On the capture thread**, `SdiCapture.Run` takes the receiver, displacing the preview, and locks to the signal. It then raises `FormatDetected`.
@@ -329,14 +329,19 @@ Overlays stay on the timeline after going off air.
 
 ## Monitor and remote monitoring
 
-1. The strip redraws at 200 ms and on change, from `PipelineState` and `TidalLock`.
-2. The Activity tab queues `ActivityLog.Line` events and drains them every 25 ms, with filters by source, level, search text and correlation ID.
-3. The Transmitted tab folds today's log file plus new lines through `TransmissionTally`.
-4. The remote toggle (`MonitorWindow.xaml.cs:433`) starts a `MonitorServer`. If `monitorApi` is true the server starts when this window loads, not when the app starts, and stops when it closes.
+1. The strip redraws at 200 ms and on change (`PipelineState`, `TidalLock`, `LiveAir`), from `PlantStatus.Read`, which the remote page's `/api/state` uses too:
+   - TIDAL LOCK: the playback deck's tidal lock, or Live Edit's transmission when the deck's is off. The detail starts with which one.
+   - EDL QUEUE: the EDL window's queue, or, while Live Edit is live, its EDL: the version held, how many edits are still to come, the next one and its timecode, and "on air: vN" while the transmitter has not picked up the newest version.
+   - ON AIR: the EDL window's entry; else what Live Edit is putting out (a cue's file, or the recording) or the playback deck's delayed recording, with the time of day it was taken.
+   - INGEST: written by `IngestControllerService` on every queue or job change (`IngestStage.Of`): recording, booked with the next start, or the last failure. Cleared when the Ingest window closes.
+2. The resource strip redraws once a second from `ResourceSampler`, which samples while the window is open.
+3. The Activity tab reads the chosen day from the database off the UI thread, then, for today, queues `ActivityLog.Line` events and drains them every 25 ms. Filters: area, day, level, search text and correlation ID. Up to 20,000 rows.
+4. The Transmitted tab folds today's lines from the database plus new lines through `TransmissionTally`. Each EDL window message is a group, and so is each Live Edit go-live (`liveair.armed`), whose cue files are queued at `liveair.cue.prepared` and aired at `liveair.cue.playing`.
+5. The remote toggle (`MonitorWindow.xaml.cs:433`) starts a `MonitorServer`. If `monitorApi` is true the server starts when this window loads, not when the app starts, and stops when it closes.
 
 ## Files and media
 
-The recorder writes files directly. Nothing is copied or transcoded afterwards. Files are discovered by listing folders rather than through a database, except ingest jobs. See [data and storage](08_DATA_AND_STORAGE.md).
+The recorder writes files directly. Nothing is copied or transcoded afterwards. Files are discovered by listing folders rather than through a database, except ingest jobs. The masters and the proxies can be in folders of their own, on different drives. See [data and storage](08_DATA_AND_STORAGE.md).
 
 ## Error handling
 

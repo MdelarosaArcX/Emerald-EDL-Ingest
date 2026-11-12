@@ -46,6 +46,14 @@ sequenceDiagram
         B->>S: GET api/log?since=N&limit=1000
         S-->>B: JSON lines
     end
+    loop Every 1 s
+        B->>S: GET api/resources
+        S-->>B: JSON now and last 10 minutes
+    end
+    opt An earlier day chosen
+        B->>S: GET api/history?day=yyyy-MM-dd&limit=5000
+        S-->>B: JSON lines from emerald.db
+    end
     loop Every 3 s, while the Transmitted tab is open
         B->>S: GET api/transmitted
         S-->>B: JSON edls
@@ -61,13 +69,13 @@ sequenceDiagram
 
 **Transport.** A raw `TcpListener` on `IPAddress.Any` (`src/Emerald.Core/MonitorServer.cs:115`), so all IPv4 interfaces. `HttpListener` was avoided because it needs elevation or a URL reservation for non-localhost.
 
-**Switching it on.** The `RemoteToggle` in the Monitor window. If `monitorApi` is true it restarts when that window next opens. Closing the window stops it. It is off by default.
+**Switching it on.** The `RemoteToggle` in the Monitor window. If `monitorApi` is true it restarts when that window next opens. Closing the window stops it. It is off by default. While it runs it holds a `ResourceSampler` watch, so the machine is sampled once a second for `/api/resources`.
 
 **Port.** `monitorApiPort`, default 8787. No UI edits it, so changing it means editing `settings.json` with Emerald closed. `installer/install.bat` opens TCP 8787 in Windows Firewall, and `installer/edl/install.bat` adds no rule. A different port needs its own rule, and the Monitor window shows the `netsh` command to run.
 
 **Protocol.** One request per connection. Every response has `Content-Length`, `Cache-Control: no-store`, `Access-Control-Allow-Origin: *` and `Connection: close`. Paths are matched exactly and are case-sensitive, so `/API/state` and `/api/state/` return 404.
 
-**Limits.** 8 KiB request head, 64 KiB body drain, 5-second read timeout, `limit` clamped to 1 to 2000. A head over the limit or a read timeout closes the connection with no HTTP status. There is no limit on connections and no write timeout.
+**Limits.** 8 KiB request head, 64 KiB body drain, 5-second read timeout, `limit` clamped to 1 to 2000 on `/api/log` and 1 to 5000 on `/api/history`. A head over the limit or a read timeout closes the connection with no HTTP status. There is no limit on connections and no write timeout.
 
 ### Routes
 
@@ -76,7 +84,9 @@ sequenceDiagram
 | GET | `/`, `/index.html` | 200, `text/html`, the page |
 | GET | `/api/health` | 200, JSON |
 | GET | `/api/state` | 200, JSON |
-| GET | `/api/log?since=&limit=` | 200, JSON. Defaults: since 0, limit 500. |
+| GET | `/api/log?since=&limit=&area=` | 200, JSON. Defaults: since 0, limit 500, every area. |
+| GET | `/api/history?day=&area=&limit=` | 200, JSON. A day from the database. Defaults: today, every area, limit 2000. |
+| GET | `/api/resources` | 200, JSON. The machine now and over the last 10 minutes. |
 | GET | `/api/transmitted` | 200, JSON |
 | GET | `/api/memory` | 200, JSON. For developers: one memory snapshot. |
 | GET | anything else | 404, `no such thing here` |
@@ -106,12 +116,16 @@ HEAD is routed like GET, and it wrongly returns a body too.
   "edl": {"headline": "idle", "detail": "", "level": "Info", "idle": true},
   "onAir": {"headline": "idle", "detail": "", "level": "Info", "idle": true},
   "ingest": {"headline": "idle", "detail": "", "level": "Info", "idle": true},
-  "delay": {"phase": "OnAir", "detail": "On air, 2 min behind the receiver.", "behind": "2 min",
-            "fill": 1, "framesToAir": 0, "targetFrames": 3000},
+  "delay": {"phase": "OnAir", "owner": "Playback deck", "detail": "On air, 2 min behind the receiver.",
+            "behind": "2 min", "fill": 1, "framesToAir": 0, "targetFrames": 3000,
+            "stage": {"headline": "ON AIR", "detail": "Playback deck: On air, 2 min behind the receiver.",
+                      "level": "Ok", "idle": false}},
   "frames": {"recorded": 90000, "notEncoded": 0, "notDelayed": 0, "aired": 87000,
              "repeated": 0, "skipped": 0, "resyncs": 0}
 }
 ```
+
+`delay` is whichever transmitter holds the delay: `owner` is `Playback deck`, `Live Edit`, or empty when neither does, and `stage` is the card as drawn. `edl`, `onAir` and `ingest` come from `PlantStatus.Read`, so they show Live Edit's EDL and transmission and the ingest queue as well as the EDL window.
 
 `timecode` is omitted when the clock is unavailable. That includes a process started with `--monitor` alone, because the Monitor window does not call `TimecodeLink.Connect`. `level` is `Info`, `Ok`, `Warn` or `Error`. `delay.phase` is the `TidalLockState` name.
 
@@ -124,6 +138,7 @@ HEAD is routed like GET, and it wrongly returns a body too.
   "lastSeq": 1842,
   "count": 1,
   "lines": [{
+    "area": "Capture",
     "seq": 1841,
     "at": "2026-11-05T20:57:26.1+08:00",
     "time": "20:57:26.100",
@@ -140,7 +155,45 @@ HEAD is routed like GET, and it wrongly returns a body too.
 }
 ```
 
-`timecode`, `event`, `id`, `path` and `detail` are omitted when null. `id` is the correlation ID. `file` is always present and is `""` when the line names no file. `lastSeq` is the newest line in the log, not the newest line returned. `Seq` restarts from 1 each time the process starts. Transient lines are included, though they are not in the log file.
+`timecode`, `event`, `id`, `path` and `detail` are omitted when null. `id` is the correlation ID. `file` is always present and is `""` when the line names no file. `lastSeq` is the newest line in the log, not the newest line returned. `Seq` restarts from 1 each time the process starts. Transient lines are included, though they are not in the database.
+
+`area` is the database table the line belongs in: `Capture`, `Playback`, `LiveEdit`, `Edl`, `OnAir`, `Ingest` or `App` (`LogDatabase.AreaOf`). `?area=` narrows the reply to one area, in any case. `Errors` returns the warnings and errors of every area. An unknown area is ignored and every line is returned. The filter is applied after `since` and `limit`, so a narrowed reply can hold fewer than `limit` lines while more remain.
+
+### GET /api/history?day=2026-11-05&area=capture&limit=2000
+
+A whole local day read back from `emerald.db`, for a day the ring no longer holds. `day` is `yyyy-MM-dd`; anything else means today. `area` works as on `/api/log`, except that with no area the errors table is not read (its lines are already in their areas). The reply holds the newest `limit` lines of the day, oldest first.
+
+```json
+{
+  "day": "2026-11-05",
+  "total": 18420,
+  "count": 2000,
+  "lines": [{"area": "Capture", "at": "...", "time": "20:57:26.100", "timecode": "20:57:26:02",
+             "source": "CAPTURE", "level": "Ok", "message": "...", "event": "capture.segment",
+             "id": "9f31c07a", "file": "media_1105262057_3.mov", "path": "..."}]
+}
+```
+
+`total` is the day's lines; `count` is how many came back. History lines carry no `seq` and no `detail`.
+
+### GET /api/resources
+
+What `ResourceSampler` holds: the newest sample and the last 10 minutes at one a second.
+
+```json
+{
+  "recording": "9f31c07a",
+  "now": {"At": "...", "CpuPercent": 31.5, "RamUsedBytes": 0, "RamTotalBytes": 0,
+          "EmeraldPrivateBytes": 0, "FfmpegPrivateBytes": 0, "GpuPercent": 12.0,
+          "GpuEncodePercent": 9.0, "GpuMemoryBytes": 0,
+          "Disks": [{"Name": "Disk 1 (E:)", "ActivePercent": 14.2, "ReadBytesPerSecond": 0,
+                     "WriteBytesPerSecond": 16252928, "QueueLength": 0, "FreeBytes": 0, "TotalBytes": 0}]},
+  "history": [{"at": "...", "cpu": 31.5, "ram": 42.0, "gpu": 12.0,
+               "disks": [{"name": "Disk 1 (E:)", "active": 14.2}]}]
+}
+```
+
+`recording` is the running recording's correlation ID, omitted when none. `now` is omitted before the first sample, and its fields are PascalCase. GPU fields are omitted on a machine without graphics counters. `ram` in `history` is a percentage. The values above show the shape, not a measurement.
 
 ### GET /api/memory
 
@@ -197,7 +250,7 @@ Good:
 
 Weak:
 
-- Anyone who can reach the port can read the log, including full media paths, file names, operator text and exception messages.
+- Anyone who can reach the port can read the log, including full media paths, file names, operator text and exception messages. Through `/api/history` that is every retained day, not only what is in memory, and `/api/resources` shows the machine's load and disk names.
 - `Access-Control-Allow-Origin: *` lets any web page in a browser on that network read it. Browser private-network rules: Not verified.
 - Plain HTTP.
 
@@ -341,17 +394,17 @@ A `Stale` verdict is reissued once, above the newer version, inside the same sen
 
 ## Activity log as an event stream
 
-Most windows treat the log as their display, filtering `ActivityLog.Line`. `TransmissionTally` even derives "what aired" from event tags, so **changing an event tag can break a feature**.
+Most windows treat the log as their display, filtering `ActivityLog.Line`. `TransmissionTally` even derives "what aired" from event tags, so **changing an event tag can break a feature**. The tag prefix also decides the database table a line is kept in (`LogDatabase.AreaOf`): `edl.` goes to EDL, `delay.` and `tidallock.` to On air, `liveair.` to Live Edit, `capture.`, `rx.` and `board.` to Capture, `playout.` to Playback. Other lines go by their source. `ResourceSampler` also starts and ends a recording session on `capture.started` and `capture.finished`.
 
 Tags in use:
 
 | Area | Tags |
 |---|---|
-| App | `app.started`, `app.crashed`, `app.softwarerender`, `log.dropped`, `monitor.api.*`, `monitor.readfailed` |
+| App | `app.started`, `app.crashed`, `app.softwarerender`, `app.databasefailed`, `app.memorylog`, `log.dropped`, `monitor.api.*`, `monitor.readfailed` |
 | Board and RX | `board.scanned`, `board.scanfailed`, `rx.stuck`, `rx.taken` |
 | Media | `media.limit`, `media.limitfailed`, `media.pruned`, `media.codecs` |
-| Capture | `capture.started`, `.finished`, `.segment`, `.dropped`, `.format`, `.folder`, `.source`, `.problem`, `.newday`, `.rollfailed`, `.profile`, `.audio.pairs`, `.audio.added`, `.audio.removed`, `.audio.level`, `.audio.detected`, `.audio.pair`, `.audio.listen` |
-| Delay | `delay.<phase>`, `delay.ready`, `.readyfailed`, `.dropped`, `.segment`, `.fromstart`, `.trouble`, `.releasefailed`, `.stopfailed` |
+| Capture | `capture.started`, `.finished`, `.segment`, `.dropped`, `.format`, `.folder`, `.folders`, `.source`, `.problem`, `.newday`, `.rollfailed`, `.profile`, `.audio.pairs`, `.audio.added`, `.audio.removed`, `.audio.level`, `.audio.detected`, `.audio.pair`, `.audio.listen` |
+| Delay | `delay.<phase>`, `delay.ready`, `.readyfailed`, `.dropped`, `.segment`, `.fromstart`, `.trouble`, `.releasefailed`, `.stopfailed`, `.samedisk` |
 | Lock | `tidallock.<state>`, `liveair.<state>`, `liveair.<phase>`, `liveair.cue.*`, `liveair.releasefailed` |
 | EDL | `edl.queued`, `edl.video`, `edl.audio`, `edl.recordonair`, and `edl.<action>` from `EdlLogger` |
 | Playout | `playout.video`, `.audio`, `.audiofailed`, `.audioonair`, `.videoload`, `.drop`, `.frames`, `.videoend`, `.<state>` |

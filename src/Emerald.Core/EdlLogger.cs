@@ -101,18 +101,17 @@ public sealed record EdlLogEntry
 public readonly record struct EdlFrameRun(long First, long Last);
 
 /// <summary>
-/// The EDL log: every step of every edit, written three ways - kept in memory for the window and
-/// for tests, put in the activity log so it shows with everything else, and appended whole, as one
-/// JSON object a line, to <c>edl-yyyyMMdd.jsonl</c> beside the activity log.
+/// The EDL log: every step of every edit, kept in memory for the window and for tests, and put in
+/// the activity record, which stores it in the database's <c>log_edl</c> table.
 ///
-/// The third is the one to trace an edit with. The activity log trims long detail, and an edit
-/// across a hundred segments has a long list of sources; this file never trims.
+/// The database copy is the one to trace an edit with: the activity log trims long detail on
+/// screen, but stores it whole, and an edit across a hundred segments has a long list of sources.
 /// </summary>
 public sealed class EdlLogger
 {
-    public static EdlLogger Shared { get; } = new(ActivityLog.Shared, () => ActivityLog.Shared.Folder);
+    public static EdlLogger Shared { get; } = new(ActivityLog.Shared);
 
-    /// <summary>How many entries are kept in memory. The file keeps them all.</summary>
+    /// <summary>How many entries are kept in memory. The database keeps them all.</summary>
     public const int Keep = 5000;
 
     private static readonly JsonSerializerOptions Json = new()
@@ -123,31 +122,10 @@ public sealed class EdlLogger
     };
 
     private readonly ActivityLog? _activity;
-    private readonly Func<string?> _folder;
     private readonly List<EdlLogEntry> _entries = new();
     private readonly object _gate = new();
 
-    // Appends run one after another, off the caller's thread: the window logs from its UI thread,
-    // and a slow disk must not be felt there.
-    private Task _writing = Task.CompletedTask;
-
-    /// <summary>
-    /// Appends that may wait on the disk at once. Each holds its whole entry, so a disk that has
-    /// stopped answering would otherwise be an entry kept in memory for every edit made since.
-    /// </summary>
-    public const int PendingLimit = 2000;
-
-    private int _pending;
-    private long _notWritten;
-
-    /// <summary>Entries not written to the file because too many were already waiting. Still in the activity record.</summary>
-    public long NotWritten => Interlocked.Read(ref _notWritten);
-
-    public EdlLogger(ActivityLog? activity = null, Func<string?>? folder = null)
-    {
-        _activity = activity;
-        _folder = folder ?? (static () => null);
-    }
+    public EdlLogger(ActivityLog? activity = null) => _activity = activity;
 
     /// <summary>What the locks are doing, asked for every entry that does not say itself.</summary>
     public Func<string> LockState { get; set; } = static () => "";
@@ -180,8 +158,6 @@ public sealed class EdlLogger
                          @event: $"edl.{JsonNamingPolicy.CamelCase.ConvertName(entry.Action.ToString())}",
                          correlation: entry.EditId ?? entry.TransactionId, detail: json);
 
-        if (_folder() is { } folder) Append(folder, entry.Timestamp, json);
-
         foreach (Delegate handler in Logged?.GetInvocationList() ?? Array.Empty<Delegate>())
         {
             try { ((Action<EdlLogEntry>)handler).Invoke(entry); }
@@ -193,38 +169,8 @@ public sealed class EdlLogger
 
     public static string ToJson(EdlLogEntry entry) => JsonSerializer.Serialize(entry, Json);
 
-    /// <summary>Waits for every append so far to reach the disk. For tests and for closing.</summary>
-    public void Flush(TimeSpan timeout)
-    {
-        Task pending;
-        lock (_gate) pending = _writing;
-
-        try { pending.Wait(timeout); }
-        catch (AggregateException) { }
-    }
-
-    private void Append(string folder, DateTimeOffset at, string json)
-    {
-        string path = Path.Combine(folder, $"edl-{at:yyyyMMdd}.jsonl");
-
-        if (Interlocked.Increment(ref _pending) > PendingLimit)
-        {
-            Interlocked.Decrement(ref _pending);
-            Interlocked.Increment(ref _notWritten);
-            return;
-        }
-
-        lock (_gate)
-        {
-            _writing = _writing.ContinueWith(_ =>
-            {
-                try { File.AppendAllText(path, json + Environment.NewLine); }
-                catch (IOException) { }
-                catch (UnauthorizedAccessException) { }
-                finally { Interlocked.Decrement(ref _pending); }
-            }, TaskScheduler.Default);
-        }
-    }
+    /// <summary>Waits for every entry so far to reach the database. For tests and for closing.</summary>
+    public void Flush(TimeSpan timeout) => _activity?.Flush(timeout);
 
     private string SafeLockState()
     {

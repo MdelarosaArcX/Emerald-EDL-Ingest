@@ -2,9 +2,11 @@
 rem ---------------------------------------------------------------------------
 rem  Installs Emerald on this machine.
 rem
-rem    install.bat                       - install, asking where recordings go
-rem    install.bat D:\Emerald\media      - install, recordings there, no questions
-rem    install.bat D:\Emerald\media -q   - the same, and no pauses (for a rollout)
+rem    install.bat                                - install, asking where things go
+rem    install.bat D:\Emerald\media               - recordings in its high\ and low\,
+rem                                                 the database where it always was
+rem    install.bat D:\Masters E:\Proxies D:\Data   - high-res, low-res and database folders
+rem    ... -q                                     - the same, and no pauses (for a rollout)
 rem
 rem  Run it as administrator: it writes to Program Files, the Start Menu and the
 rem  firewall. It will say so and stop if it is not elevated.
@@ -24,10 +26,21 @@ set "EXE=%TARGET%\Emerald.App.exe"
 set "SETTINGS=%APPDATA%\Emerald\settings.json"
 set "UNINSTALL_KEY=HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\Emerald"
 
-set "MEDIA=%~1"
+set "MEDIA="
+set "HIGH="
+set "LOW="
+set "DATA="
 set "QUIET=0"
-if /i "%~2"=="-q" set "QUIET=1"
-if /i "%~1"=="-q" set "QUIET=1" & set "MEDIA="
+for %%A in (%*) do if /i "%%~A"=="-q" set "QUIET=1"
+
+rem Three folders given: high-res, low-res and the database. One: the store as it always
+rem was, masters in its high\ and proxies in its low\.
+if not "%~3"=="" if /i not "%~3"=="-q" (
+    set "HIGH=%~1"
+    set "LOW=%~2"
+    set "DATA=%~3"
+)
+if not defined HIGH if not "%~1"=="" if /i not "%~1"=="-q" set "MEDIA=%~1"
 
 rem See build.bat for why find.exe is fully qualified.
 set "INTERACTIVE=0"
@@ -70,25 +83,53 @@ if not errorlevel 1 (
     goto :fail
 )
 
-rem -------------------------------------------------------------- where media goes
+rem -------------------------------------------------------------- where things go
 rem
 rem This matters more than it looks. Left alone, Emerald puts its store beside its
 rem own executable, which after an install is inside Program Files - not writable
 rem by a standard user, and the wrong place for terabytes of video besides. So the
-rem store is settled here, at install time, and written into the settings.
+rem folders are settled here, at install time, and written into the settings.
+rem
+rem Three of them. The high-res masters (DNxHD, about 15 MB/s while recording) and
+rem the low-res proxies Live Edit plays can go on different drives: on one spinning
+rem disk, every read of a proxy takes the head away from the masters being written.
+rem And the database - the log of everything, the recordings' resource samples, the
+rem ingest schedule - can go on any drive, ideally not the one the masters go to.
+rem
+rem Already configured: an update asks only for what is not set yet, and never
+rem moves a store that has terabytes in it.
 
-rem Already configured: an update must not re-ask where recordings go, and must not
-rem move a store that has terabytes in it.
-if exist "%SETTINGS%" (
-    for /f "delims=" %%F in ('powershell -NoProfile -Command "try { (Get-Content -Raw ''%SETTINGS%'' ^| ConvertFrom-Json).captureFolder } catch { '''' }"') do set "MEDIA=%%F"
+set "SETTINGSPS=%HERE%settings.ps1"
+set "HAVE_CAPTURE="
+set "HAVE_HIGH="
+set "HAVE_LOW="
+set "HAVE_DATA="
+
+if exist "%SETTINGS%" if exist "%SETTINGSPS%" (
+    for /f "usebackq tokens=1,* delims==" %%K in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%SETTINGSPS%" -Settings "%SETTINGS%" -Read`) do (
+        if /i "%%K"=="captureFolder" set "HAVE_CAPTURE=%%L"
+        if /i "%%K"=="highResFolder" set "HAVE_HIGH=%%L"
+        if /i "%%K"=="lowResFolder" set "HAVE_LOW=%%L"
+        if /i "%%K"=="dataFolder" set "HAVE_DATA=%%L"
+    )
 )
 
-if defined MEDIA goto :havemedia
+rem One store given on the command line stands for both halves of it.
+if defined MEDIA (
+    if not defined HIGH set "HIGH=%MEDIA%\high"
+    if not defined LOW set "LOW=%MEDIA%\low"
+)
+
+rem What is already set stays; a store set the old way already says where both go.
+if not defined HIGH if defined HAVE_HIGH set "HIGH=!HAVE_HIGH!"
+if not defined LOW if defined HAVE_LOW set "LOW=!HAVE_LOW!"
+if not defined HIGH if defined HAVE_CAPTURE set "HIGH=!HAVE_CAPTURE!\high"
+if not defined LOW if defined HAVE_CAPTURE set "LOW=!HAVE_CAPTURE!\low"
+if not defined DATA if defined HAVE_DATA set "DATA=!HAVE_DATA!"
 
 rem Offer the roomiest fixed drive that is not the system one, since that is almost
 rem always where a plant wants its recordings.
 set "BEST="
-set "BESTFREE=0"
 for /f "skip=1 tokens=1,2" %%D in ('powershell -NoProfile -Command "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Sort-Object -Property FreeSpace -Descending | Select-Object DeviceID,FreeSpace | Format-Table -HideTableHeaders"') do (
     if not defined BEST if not "%%D"=="" (
         if /i not "%%D"=="%SystemDrive%" set "BEST=%%D"
@@ -96,20 +137,57 @@ for /f "skip=1 tokens=1,2" %%D in ('powershell -NoProfile -Command "Get-CimInsta
 )
 if not defined BEST set "BEST=%SystemDrive%"
 
-set "MEDIA=%BEST%\Emerald\media"
+set "ASKING=0"
+if not defined HIGH set "ASKING=1"
+if not defined LOW set "ASKING=1"
+if not defined DATA set "ASKING=1"
 
-echo Recordings need a folder with room for them. Emerald will not put them in
-echo Program Files.
-echo.
-set "ANSWER="
-set /p "ANSWER=Where should recordings go? [%MEDIA%] "
-if not "!ANSWER!"=="" set "MEDIA=!ANSWER!"
+if "%ASKING%"=="1" if "%INTERACTIVE%"=="1" (
+    echo The drives on this machine:
+    echo.
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SETTINGSPS%" -Drives
+    echo.
+    echo Recordings need folders with room for them. Emerald will not put them in
+    echo Program Files. The masters and the proxies can be on different drives.
+    echo.
+)
 
-:havemedia
+if not defined HIGH (
+    set "HIGH=%BEST%\Emerald\media\high"
+    if "%INTERACTIVE%"=="1" (
+        set "ANSWER="
+        set /p "ANSWER=High-res folder, for the DNxHD masters? [!HIGH!] "
+        if not "!ANSWER!"=="" set "HIGH=!ANSWER!"
+    )
+)
+
+if not defined LOW (
+    set "LOW=%BEST%\Emerald\media\low"
+    if "%INTERACTIVE%"=="1" (
+        set "ANSWER="
+        set /p "ANSWER=Low-res folder, for the proxies Live Edit plays? [!LOW!] "
+        if not "!ANSWER!"=="" set "LOW=!ANSWER!"
+    )
+)
+
+if not defined DATA (
+    set "DATA=%APPDATA%\Emerald"
+    if "%INTERACTIVE%"=="1" (
+        echo.
+        echo The database holds the log of everything Emerald does and the machine's
+        echo CPU, memory, graphics and disk figures while it records. It grows by a
+        echo few hundred megabytes a week and is trimmed to the last 14 days.
+        set "ANSWER="
+        set /p "ANSWER=Database folder? [!DATA!] "
+        if not "!ANSWER!"=="" set "DATA=!ANSWER!"
+    )
+)
 
 echo.
 echo   Program        %TARGET%
-echo   Recordings     %MEDIA%
+echo   High-res       !HIGH!
+echo   Low-res        !LOW!
+echo   Database       !DATA!
 echo   Settings       %SETTINGS%
 echo.
 
@@ -120,35 +198,36 @@ if not exist "%TARGET%" mkdir "%TARGET%" 2>nul
 
 rem /e all subdirectories, /purge remove what is no longer shipped, /njh /njs /ndl /nc /ns
 rem quiet. Robocopy returns 0-7 for success; 8 and above is a real failure.
-robocopy "%HERE%." "%TARGET%" /e /purge /xf install.bat uninstall.bat update.bat READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
+robocopy "%HERE%." "%TARGET%" /e /purge /xf install.bat uninstall.bat update.bat settings.ps1 READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
 if errorlevel 8 (
     echo [ERROR] Copying to %TARGET% failed.
     goto :fail
 )
 
-if not exist "%MEDIA%" mkdir "%MEDIA%" 2>nul
-if not exist "%MEDIA%" (
-    echo [WARN] Could not create %MEDIA%. Set the store folder on the capture deck
-    echo        after installing.
+for %%F in ("!HIGH!" "!LOW!" "!DATA!") do (
+    if not exist "%%~F" mkdir "%%~F" 2>nul
+    if not exist "%%~F" (
+        echo [WARN] Could not create %%~F. Set it on the capture deck after installing.
+    )
 )
 
 rem ---------------------------------------------------------------- the settings
 rem
-rem Written only if there is no settings file yet, so reinstalling over a working
-rem machine never overwrites what the operator has set up. Just the store folder:
-rem everything else is better left to Emerald's own defaults.
+rem Merged into the settings file: a folder already chosen is never overwritten, and
+rem nothing else in the file is touched, so reinstalling over a working machine keeps
+rem what the operator has set up.
 
-if exist "%SETTINGS%" (
-    echo Settings already exist - left alone.
-) else (
-    if not exist "%APPDATA%\Emerald" mkdir "%APPDATA%\Emerald" 2>nul
-    powershell -NoProfile -Command "$p='%MEDIA%'.Replace('\','\\'); Set-Content -LiteralPath '%SETTINGS%' -Encoding utf8 -Value ('{' + [char]10 + '  \"captureFolder\": \"' + $p + '\"' + [char]10 + '}')"
+if exist "%SETTINGSPS%" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SETTINGSPS%" -Settings "%SETTINGS%" -High "!HIGH!" -Low "!LOW!" -Data "!DATA!"
     if errorlevel 1 (
-        echo [WARN] Could not write the settings file. Set the store folder on the
-        echo        capture deck after installing.
+        echo [WARN] Could not write the settings file. Set the folders on the capture
+        echo        deck after installing.
     ) else (
-        echo Settings written, store set to %MEDIA%.
+        echo Settings written.
     )
+) else (
+    echo [WARN] settings.ps1 is not beside install.bat, so the folders were not saved.
+    echo        Set them on the capture deck after installing.
 )
 
 rem --------------------------------------------------------------- the shortcuts
@@ -236,11 +315,9 @@ if exist "%TARGET%\ffprobe.exe" (
     )
 )
 
-if exist "%MEDIA%" (
-    echo   [ok]   Store ready at %MEDIA%
-) else (
-    echo   [--]   Store folder %MEDIA% does not exist.
-)
+if exist "!HIGH!" (echo   [ok]   High-res folder ready at !HIGH!) else (echo   [--]   High-res folder !HIGH! does not exist.)
+if exist "!LOW!" (echo   [ok]   Low-res folder ready at !LOW!) else (echo   [--]   Low-res folder !LOW! does not exist.)
+if exist "!DATA!" (echo   [ok]   Database folder ready at !DATA!) else (echo   [--]   Database folder !DATA! does not exist.)
 
 echo.
 if "%READY%"=="1" (

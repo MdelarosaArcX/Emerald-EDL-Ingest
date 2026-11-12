@@ -17,31 +17,21 @@ Effects at the card, such as what goes down the wire on an underrun, are Not ver
 
 | Area | Fully working by code review | Partial or broken |
 |---|---|---|
-| Capture deck | Record, stop, preview, meters, midnight rollover, storage limit while recording | Board, port, profile, output path and limit change handlers never run (A1). Clip stage is dead code. |
+| Capture deck | Record, stop, preview, meters, midnight rollover, separate high-res and low-res folders (locked while recording), a storage limit per folder while recording | Clip stage is dead code. (A1, the handlers that never ran, is fixed.) |
 | Playback deck | Arm, count down, on air, multiple TX | End of drain (A2). Close prompt (B5). Clip audition was removed; only stale comments remain. |
 | EDL | Compose, validate, queue, cue, play, loop, gain, solo, offset | SOM with embedded audio (A5). Multi-port path has no caller. |
 | Ingest | Validate, schedule, roll, register, recover | Runs only with its window open (B7). Verification is shallow (B10). |
 | Live Edit | Timeline, player, marks, placement, delete scene, undo, levels, bookmarks, export, Go Live, EDL handshake | Placements not saved. Export ignores edits and has an offset fault (B2). |
-| Monitor | Log, filters, strip, transmitted view, remote page | Ingest stage never written. Live Edit absent from strip (C5). |
+| Monitor | Log from the database by area and day, filters, strip, resource tiles, transmitted view, remote page with history and resources | Ingest stage never written. Live Edit absent from strip (C5). |
 | Installer | Install, update, uninstall, EDL product | Version is written twice |
 
 ## A. Highest impact: Verified and Re-checked
 
-### A1. `_loading` is never cleared, so five shell handlers never run
+### A1. `_loading` was never cleared, so five shell handlers never ran
 
-`src/Emerald.App/ShellWindow.xaml.cs:110` starts it true. Every other assignment sets it true or restores the saved value (`:259`, `:292`, `:306`, `:315`, `:488`, `:501`). Nothing sets it false. So these return at their first line:
+**Fixed.** `src/Emerald.App/ShellWindow.xaml.cs:110` starts it true, and nothing ever set it false, so these returned at their first line: `BoardBox_SelectionChanged` (another board did not repopulate the ports or move the preview), `PortBox_SelectionChanged` (the preview stayed on the old port, so what was monitored differed from what would be recorded), `Profile_Changed` (settings not written through until Record, and `recordingSegmentChosen` never set, so a 2-minute segment reset to 30 s), the output-path box (now `StorePath_LostFocus` for the High-res and Low-res boxes: not saved for Live Edit until Record), and `StorageLimit_Changed` (no log and no immediate sweep). `ShowModule`'s closed handler had the same guard.
 
-| Handler | Line | Consequence |
-|---|---|---|
-| `BoardBox_SelectionChanged` | `:418` | Another board does not repopulate ports or move the preview. A recording then uses the new board with a port from the old list. |
-| `PortBox_SelectionChanged` | `:428` | The preview stays on the old port, so what is monitored differs from what will be recorded. |
-| `Profile_Changed` | `:525` | Settings not written through until Record or close, no log, no note refresh, and `recordingSegmentChosen` is never set, so a 2-minute segment resets to 30 s at the next start. |
-| `OutputPath_LostFocus` | `:582` | Path not saved for Live Edit until Record. |
-| `StorageLimit_Changed` | `:1854` | No log and no immediate sweep. |
-
-`ShowModule`'s closed handler (`:2570`) has the same guard, so the deck never reloads its profile fields after a module closes.
-
-The monitored-versus-recorded mismatch is the one that matters most on air. `StartRecording` reads the boxes, so a changed port is what gets recorded, while the preview stays on the old one. `PlaybackWindow` clears its own equivalent flag correctly.
+`ShellWindow_Loaded` now clears it once the controls hold what was saved, so all of them run on an operator's change. The monitored-versus-recorded mismatch was the one that mattered most on air.
 
 ### A2. The delay freezes about half a second after a recording stops
 
@@ -116,7 +106,7 @@ Consequences:
 | B16 | **Segments slide on a gap.** A missing or unreadable middle segment moves all later ones earlier by its length. | `src/Emerald.Media/MediaLibrary.cs:293` |
 | B17 | **Go Live overwrites settings with a stale copy.** `LiveEditWindow` holds its own `AppSettings`, so saves in each direction undo the other. | `src/Emerald.LiveEdit/GoLiveDialog.xaml.cs:197`, `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:66` |
 | B18 | **The last segment stays "still being recorded"** after a stop, since the fingerprint excludes the newest file. It also blocks day rollover until a relist. | `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:655` |
-| B19 | **Crash reporting gaps.** No `AppDomain.UnhandledException` or `TaskScheduler.UnobservedTaskException` handler exists, and the log is never flushed at exit, so `app.crashed` can be lost. | `src/Emerald.App/App.xaml.cs:134` |
+| B19 | **Crash reporting gaps.** No `AppDomain.UnhandledException` or `TaskScheduler.UnobservedTaskException` handler exists, and the log is never flushed at exit, so `app.crashed` can be lost. Partly changed: a normal exit flushes the log to the database (`App.OnExit`), and the `DispatcherUnhandledException` handler flushes it after writing `app.crashed`. The other two handlers are still missing. | `src/Emerald.App/App.xaml.cs:134` |
 | B20 | **Inserts placed before Go Live skip the capacity check,** which can cause repeated Resync and black. | `src/Emerald.LiveEdit/LiveEditWindow.Live.cs:116`, `:852` |
 | B21 | **The storage warden follows the text box.** Typing another folder during a recording applies deletion there, and stops limiting the real store. | `src/Emerald.App/ShellWindow.xaml.cs:1899` |
 | B22 | **The warden can delete ingest clips** when the ingest directory is the store, which is the default path when blank. Their database rows remain. | `src/Emerald.Media/StorageWarden.cs:151` |
@@ -125,7 +115,7 @@ Consequences:
 | B25 | **Stopping a recording during the countdown leaves the transmitter running.** Tidal lock returns to Armed, the playback deck does not stop the transmitter, and it holds black. The next recording's `StartDelayTransmitter` returns early, so the lock sits in CountingDown with the old transmitter. | `src/Emerald.App/PlaybackWindow.xaml.cs:658` |
 | B26 | **A ring write fault holds the feed without failing the lock.** `Write` sets `Fault` and seals, with `sealedAt` above `written`. The pacer then repeats, and `Fail` is not called. The only reader of `Fault` is a status line at release. | `src/Emerald.Video/DelayLine.cs:432` |
 | B27 | **Audio after a silent pair is not recorded.** `PairsPresent` stops at the first silent pair, so audio on pairs 1 and 3 with pair 2 empty records one pair, and pair 3 is lost. | `src/Emerald.Video/SdiAudioReader.cs:263` |
-| B28 | **Installers misread the existing store on an update.** A quoting fault in the PowerShell fragment leaves `MEDIA` as `'`, so the report is wrong and a folder named `'` is created. `settings.json` and the store are not changed. The fragment was reproduced in isolation; the full script was read, not run. | `installer/install.bat:83`, `installer/edl/install.bat:96` |
+| B28 | **Installers misread the existing store on an update.** A quoting fault in the PowerShell fragment leaves `MEDIA` as `'`, so the report is wrong and a folder named `'` is created. `settings.json` and the store are not changed. The fragment was reproduced in isolation; the full script was read, not run. **Fixed in `installer/install.bat`**, which now reads the folders through `settings.ps1 -Read`. **Still open in `installer/edl/install.bat`** (reproduced again in isolation), and now worse there: that installer merges its folders through `settings.ps1`, so a settings file with no `captureFolder` gets `'` written into it. | `installer/install.bat:83`, `installer/edl/install.bat:96` |
 
 ## C. Other Verified issues: medium and low
 
@@ -135,11 +125,11 @@ Consequences:
 | C2 | Record during "Stopping..." re-enters a stop, with unlocked `_cts` and `_worker` | `src/Emerald.App/ShellWindow.xaml.cs:987`, `src/Emerald.Video/SdiCapture.cs:172` |
 | C3 | **Fixed.** Cue decoders could leak on timeout, or when a cue is passed but stays listed: 2 ffmpeg processes and about 112 MB each | `src/Emerald.Video/LiveAirTransmitter.cs:560` |
 | C4 | TX thread blocks on media preparation (up to 3 s + 3 s) and on inline disposal | `src/Emerald.Video/LiveAirTransmitter.cs:293`, `:560` |
-| C5 | `PipelineState.Ingest` has no writer, and Live Edit's transmission is not in the strip or `/api/state` | `src/Emerald.Core/PipelineState.cs`, `src/Emerald.Core/MonitorFeed.cs:28` |
+| C5 | **Fixed.** `PipelineState.Ingest` had no writer, and Live Edit's transmission was not in the strip or `/api/state`, so TIDAL LOCK, EDL QUEUE, ON AIR and INGEST read idle while Live Edit was live or an ingest was booked. Both Monitors now draw from `PlantStatus.Read` (deck tidal lock, else `LiveAir`; EDL window, else Live Edit's EDL), the ingest controller writes its card, and Live Edit's cues are in the Transmitted view. | `src/Emerald.Core/PlantStatus.cs`, `src/Emerald.Ingest/Services/IngestStage.cs` |
 | C6 | Remote page skips log lines on catch-up: `since` jumps to `lastSeq`, the newest in the ring, not the last received | `src/Emerald.Core/MonitorPage.cs:257` |
 | C7 | Remote page stalls after a master restart, duplicates rows on overlapping polls, and shows a false BEHIND count | `src/Emerald.Core/MonitorPage.cs:194`, `:275` |
-| C8 | `dropped` counter resets within about 500 ms, and a failed log folder loses lines uncounted | `src/Emerald.Core/ActivityLog.cs:539`, `:573` |
-| C9 | `edl-*.jsonl` is never pruned, and retention runs only at startup | `src/Emerald.Core/ActivityLog.cs:489` |
+| C8 | `dropped` counter resets within about 500 ms, and a failed log folder loses lines uncounted. Second half changed: the log is now a database, and a batch it refuses is counted as dropped. If the database cannot be opened at all, nothing is queued and the start-up line says the record is memory only. The first half still holds. | `src/Emerald.Core/ActivityLog.cs:539`, `:573` |
+| C9 | `edl-*.jsonl` is never pruned, and retention runs only at startup. **Fixed:** EDL entries are rows in `log_edl`, and the database is swept once a day. Old `.jsonl` files, `edl-` included, are deleted at startup past retention. | `src/Emerald.Core/ActivityLog.cs:489` |
 | C10 | HEAD responses carry a body | `src/Emerald.Core/MonitorServer.cs:338` |
 | C11 | A rejected conform's status is not retried by a resend, contrary to its comment. The edit stays Rejected even if a later revision containing it is accepted. | `src/Emerald.Core/EdlLedger.cs:287` |
 | C12 | The ledger isn't told about day changes: stale conform state, and `EdlLedger.Clear` has no caller. Air is unaffected. | `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:892` |
@@ -154,7 +144,7 @@ Consequences:
 | C21 | Every deck recording logs "stopped early" | `src/Emerald.App/ShellWindow.xaml.cs:1559` |
 | C22 | Title sanitised for one name but not the other, so `SegmentWatch` can miss segments. The box is read-only, so only a hand-edited setting is exposed. | `src/Emerald.App/ShellWindow.xaml.cs:1034` |
 | C23 | Probe and thumbnail "timeouts" do not bound anything: `ReadToEnd` blocks first. The thumbnail path is currently dead code. | `src/Emerald.Media/MediaProbe.cs:179`, `src/Emerald.App/ClipThumbnails.cs:82` |
-| C24 | A failed waveform is cached as silence | `src/Emerald.Media/Waveform.cs:167` |
+| C24 | **Fixed.** A failed waveform was cached as silence. An empty read is no longer kept, in memory or in `<data folder>\peaks`, so it is tried again. | `src/Emerald.Media/Waveform.cs` |
 | C25 | Failed export leaves partial output and possibly the list file. A second preview encode is wasted for `.mp4`. | `src/Emerald.Media/RangeExport.cs:190`, `:214` |
 | C26 | Stack allocation in a loop (build warning CA2014). Harmless on Emerald's own files. | `src/Emerald.Media/MediaCodec.cs:341` |
 | C27 | Modules opened before the shell get duplicated | `src/Emerald.App/App.xaml.cs:161` |
@@ -180,9 +170,9 @@ Consequences:
 | C47 | A late-starting signal permanently marks a good recording failed | `src/Emerald.Video/SdiCapture.cs:451` |
 | C48 | Playout reuses an open output when only the rate changed | `src/Emerald.EDL/PlayoutService.cs:366` |
 | C49 | **Fixed.** Preview placeholder text read "about every 0 min": integer division with a 30 s default. It now uses the offered label ("30 s"), as does the EDL deck's folder hint. | `src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:1157` |
-| C50 | The installers use the elevated account's `%APPDATA%`, so when the administrator is not the operator, the store setting goes to the wrong profile | `installer/install.bat:24` |
+| C50 | The installers use the elevated account's `%APPDATA%`, so when the administrator is not the operator, the store setting goes to the wrong profile. The same now applies to the high-res, low-res and database folders. | `installer/install.bat:24` |
 | C51 | `update.bat -q` with no folder takes `-q` as the source path | `installer/update.bat:25` |
-| C52 | Uninstall's prompt says "settings and logs" but deleting removes all of `%APPDATA%\Emerald`, including `ingest.db` and bookmarks | `installer/uninstall.bat:78` |
+| C52 | **Fixed.** Uninstall's prompt said "settings and logs" but deleting removed all of `%APPDATA%\Emerald`, including `ingest.db` and bookmarks. Now the database (`emerald.db`, `ingest.db`, `peaks`) is asked about first and on its own, and deleting the settings removes only `settings.json`, `logs` and `bookmarks`. | `installer/uninstall.bat` |
 | C53 | A process started with `--monitor` alone never connects the clock | `src/Emerald.App/MonitorWindow.xaml.cs:80` |
 | C54 | `SdiCapture` logs the proxy as 960x540 when it is full raster, and the deck's profile note says half-size | `src/Emerald.Video/SdiCapture.cs:306`, `src/Emerald.App/ShellWindow.xaml.cs:561` |
 
@@ -257,13 +247,35 @@ Unmeasured, from reading the code.
 - `ShowHeld` reads and converts a full frame on the UI thread each tick.
 - All windows share one UI thread, so one window's stall affects all of them.
 
+### Recording drive at 100% active
+
+Reported on the plant: `Disk 1 (E:)` at 100% active while recording and on air.
+
+**Measured on the plant machine.** E: is one Seagate ST3000VN007 (IronWolf, 5900 rpm SATA hard disk). The recorder writes about 15 to 16 MB/s (DNxHD at 25p is CID 1238, about 121 Mb/s) in IOs of about 850 KB. In steady recording E: was 85 to 90% idle, with no spike when a master closed. So 100% comes from readers seeking on that disk, not from the writer.
+
+**Fixed in the code:**
+
+- Live Edit waveforms are cached on disk (`<data folder>\peaks`, one `.peaks` file per segment keyed on path, length and write time, about 1.5 KB per 30 s), so each segment's sound is read from E: once.
+- One waveform ffmpeg at a time, not two. An overlay's waveform is read from its `.preview.mp4` when there is one.
+- Waveform, export and export-preview ffmpegs run at below-normal CPU and very low I/O priority (`BackgroundPriority`).
+- `StoreIndex` opens 2 files at a time, not 6.
+- Picture lengths are read once per finished file for the whole app (`MediaLengths`), shared by `StoreIndex` and `StorageWarden`.
+- The storage limit sizes folders from the directory listing; the deck's figure comes from the sweep's own measurement or is measured off the UI thread.
+- The masters and the proxies can be put on different drives.
+- A delay ring folder on either recording drive is refused for `%LOCALAPPDATA%\Emerald\delay` (`delay.samedisk`).
+
+**Still open, outside the code:** exclude the media folders from Windows Search indexing and Defender real-time scanning, and put the low-res folder on a different drive from the high-res one. Not measured after the fixes on the plant machine.
+
+**Not changed, and why.** The delay ring: a 420 s ready line at 1080p25 is about 44 GB on C:, and its write-back was measured at roughly 80 to 100 MB/s to C: while held. That is inherent to holding that much picture; only a shorter delay and headroom, or **Delay ready** Off, reduce it. An earlier suspicion that creating the ring zero-fills 44 GB synchronously was tested and **not confirmed**: creation took milliseconds. The ring creation code was left as it was.
+
 ## Memory and resource management
 
 - **Leaks found and fixed:** cue decoders (C3, both paths), the held ring claim (C17), and `MediaCodec.Cache`, which had no cap and kept an entry for every look at a file still being written. It is now capped at 20,000 and keeps answers only.
-- **Bounded caches:** `MediaProbe` clears at 20,000, `Waveform` at 5,000.
+- **Bounded caches:** `MediaProbe` clears at 20,000, `Waveform` at 5,000 in memory, `MediaLengths` at 200,000. The waveform disk cache is bounded by age instead: `.peaks` files unused for `max(30, logRetentionDays)` days are deleted at startup.
+- **Log and samples:** the activity log's ring stays at 5000 lines and its queue at 20,000. The database is trimmed to `logRetentionDays` once a day. `ResourceSampler` keeps 600 samples (10 minutes) in memory and samples only while a Monitor, the remote server or a recording wants it.
 - **SDK handles:** no leaks were found. All open paths close in `finally` or `Dispose`, stream before board. There is no finalizer.
 - **Encoder threads:** ffmpeg's thread counts are stated on every recording, because its defaults follow the CPU count and held 3.7 GB on this machine. See [the flags](05_MEDIA_PROCESSING.md).
-- **Rings** rely on reference counts, and on the startup sweep after a crash. A ring is memory-mapped, and it used to show as working set up to its full size: 41 GB for the default ready line at 1080p25 (120 s delay, 300 s headroom). `DelayLine.TrimBehind` now gives back pages once a second with `VirtualUnlock`, keeping the newest 10 s, or the farthest reader's distance plus 2 s if that is more (about 13 GB at a 120 s delay). The cost is that trimmed pages get written to the ring file, up to about 100 MB/s, on the system drive unless `tidalLockRingFolder` says otherwise; before trimming, a recording measured no writes to C:. Trimmed pages normally wait in the standby list, where a read or an overwrite takes a soft fault (about 2 ms a frame, measured on a test mapping). Under memory pressure they can be evicted, and then either one reads from disk. Lower headroom makes the ring smaller.
+- **Rings** rely on reference counts, and on the startup sweep after a crash. A ring is memory-mapped, and it used to show as working set up to its full size: 41 GB for the default ready line at 1080p25 (120 s delay, 300 s headroom). `DelayLine.TrimBehind` now gives back pages once a second with `VirtualUnlock`, keeping the newest 4 s, or a reader's distance plus 2 s when that reader is within 15 s of the writer. A reader further back (a transmitter a whole delay behind) holds nothing: the pages it has read are trimmed again 2 s behind it (`TrimReaderWake`). Keeping its whole distance resident was measured on air at 14.3 GB of working set with 745 MB of it Emerald's own. A flusher thread (`FlushLoop`, below normal priority) writes the ring to its file half a second behind the writer with `FlushViewOfFile`, so trimmed pages go to the standby list (available memory) instead of the modified list: Windows had left 28 GB of the ring there, counted as in use. Measured with a 1080p25 ring on C: and a reader 60 s behind: working set about 640 MB, system modified list flat at about 250 MB, about 60 MB not yet on disk, no slow reads. C: sustains about 155 MB/s of writes against the ring's 104 MB/s. The cost is that trimmed pages get written to the ring file, up to about 100 MB/s, on the system drive unless `tidalLockRingFolder` says otherwise; before trimming, a recording measured no writes to C:. Trimmed pages normally wait in the standby list, where a read or an overwrite takes a soft fault (about 2 ms a frame, measured on a test mapping). Under memory pressure they can be evicted, and then either one reads from disk. Lower headroom makes the ring smaller.
 - **Ring size and release:** the ready ring holds about 100 MB/s of 1080p25 until it is full, then stops growing: about 29 GB at its 300 s minimum, 41 GB by default. **Delay ready** on the Capture deck turns it off. A ring is deleted without flushing it first. Flushing took 37 s and wrote about 5.9 GB to C: for a 4 GB ring; without it, the same release took about 1 s and wrote nothing.
 - **Frame buffers are reused.** The capture loop used to allocate a 4 MB array for every frame, about 99 MB/s on the large object heap. `FramePool` now hands the same buffers round, with a count of holders on each (`FrameLease`): the loop, the encoder's queue and each ring's queue take a claim and give it up once they have copied the frame. A buffer goes back to the pool only when the count reaches nothing. One pool per recording; at most 16 idle buffers (66 MB) are kept.
 - **Measured, recorder path without the card** (real ffmpeg command, real ring, 8-frame queues, 25 fps, 5 minutes each, quiet machine): per-frame allocation ran 294 full collections and 182 ms of GC pause, with the frame copy averaging 1.08 ms and 361 copies over 5 ms. Reused buffers ran 0 full collections, the copy averaged 0.69 ms and 0 copies were over 5 ms. No frames were dropped either way. A 30-minute run of the reused path: 0 full collections, 0 drops, managed heap 54 to 59 MB, ffmpeg 356 to 369 MB, one buffer reused for all 45,000 frames.
@@ -271,7 +283,7 @@ Unmeasured, from reading the code.
 - **Live Edit over a long run.** Live Edit read the whole store again every time a segment closed: a recursive file walk every 2 s, then a listing and probe of every file of every day, then a layout over all of them on the UI thread. Over a day that was O(n²) in the number of files, and past 20,000 files the probe caches emptied themselves partway through every listing. `StoreIndex` keeps what it has read: a refresh walks only folders that can have changed and reads only new or just-closed files, with a full walk every 60 s for deletions.
 - **Live Edit per frame.** The timeline's edit list was sorted again on every lookup, several times a frame. It is now handed over in order and walked as it is. Finding the segment under the playhead is a binary search; drawing finds the visible run of segments by halving and draws sub-pixel segments and drop marks as one block per run or pixel. The scrollbar is set only when a value changes.
 - **Live Edit over days.** Placed items, deleted scenes and sound edits that ended before yesterday are let go of at each day change (they used to be shifted back a day for ever). The player held ready behind the big screen and the small monitor close after 5 minutes idle. Waveforms are kept for an hour either side of the view. An export is called off when the window closes, and background work finishing after close leaves the window alone.
-- **Other limits added:** `SegmentWatch` forgets segments the storage limit has deleted; `EdlLogger` allows 2,000 appends to wait on the disk and counts the rest; Live Edit keeps waveforms only for files on the timeline; ffprobe is killed after 15 s; playout copies its last frame into one buffer instead of cloning it per file.
+- **Other limits added:** `SegmentWatch` forgets segments the storage limit has deleted; `EdlLogger` no longer writes a file of its own, so its separate queue of appends is gone; Live Edit keeps waveforms only for files on the timeline; ffprobe is killed after 15 s; playout copies its last frame into one buffer instead of cloning it per file.
 - **Not tested on the card.** The pool, the ring release and the cue fixes are unit tested and were run in the harness, not through `SdiCapture` with a receiver.
 - **Still open:** `TransmissionTally` grows while the Monitor window stays open; the `MediaProbe` and `Waveform` caches clear all at once at their caps (Live Edit no longer re-reads through them, but other callers do); the big screen's player keeps its file open while idle, because it shows the frame left on; `LOAD` is logged for every segment played through.
 - **Window event subscriptions** to shared objects are removed on close. `_capture` and `_preview` subscriptions share the window's lifetime.
@@ -280,7 +292,7 @@ Unmeasured, from reading the code.
 
 | Concern | Status |
 |---|---|
-| Authentication on the monitoring server | **None.** Verified. Anyone on the network can read the log when it is on. |
+| Authentication on the monitoring server | **None.** Verified. Anyone on the network can read the log when it is on, including every retained day through `/api/history`. |
 | Encryption | None. Plain HTTP. |
 | CORS | `*`. Any page in a browser on the network can read it. |
 | Firewall | `installer/install.bat` opens TCP 8787 **even if the feature is never used**. Nothing listens until switched on. Once switched on, the setting is saved, and it starts again whenever the Monitor window opens. |
@@ -348,7 +360,7 @@ Do not copy these without checking.
 | `LiveAirTransmitter.cs:9`: deleted scene is skipped | It is blacked out |
 | `StorageWarden.cs:132`: pairs by the timestamp in the name | By write time |
 | `VideoMasterHD.cs:6`: "limited to enumerating boards" | Full surface |
-| `uninstall.bat:5`: asks about the recordings | Asks about settings and logs |
+| `uninstall.bat:5`: asks about the recordings | Asks about the settings, then separately about the database |
 | `SdiAudioReader.cs:255`: a silent pair is recorded to hold the position | Counting stops at the first silent pair |
 | `IngestSchedulerService.cs:498`: `Move` is "the only way" a status changes | `Recover` writes it directly |
 
@@ -359,7 +371,7 @@ If fixing in order of on-air risk:
 1. **A2, B24:** every drain and every source loss at a delay over half a second.
 2. **A3:** every placed item with sound. Fixed; listen to one at the card.
 3. **A7:** deleted picture reaching air.
-4. **A1:** monitoring one port while recording another.
+4. **A1:** monitoring one port while recording another. Fixed; change port and check the preview follows.
 5. **A4:** any multi-language feed on the air path.
 6. **B3, B4:** faults that look like everything is fine.
 7. **B1:** the session-long block.

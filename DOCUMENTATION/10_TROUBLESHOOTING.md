@@ -4,19 +4,22 @@ Messages are quoted from the code, except the ffmpeg errors, which are ffmpeg's 
 
 ## First steps for any problem
 
-1. **Open the Monitor** (`--monitor`, or the deck's button). It shows every stage and the whole log. Filter by source and level. Double-click a line to filter by its correlation ID.
-2. **Read the log files** in `%APPDATA%\Emerald\logs`, or `logFolder` if set. Each day has one `emerald-yyyyMMdd.jsonl`, plus `-001` and onward past 32 MiB, and those are swept at startup after `logRetentionDays` (14). `edl-yyyyMMdd.jsonl` is kept indefinitely.
+1. **Open the Monitor** (`--monitor`, or the deck's button). It shows every stage, the machine's CPU, memory, graphics and disks, and the whole log. Filter by area (choose **Errors** for every warning and error), day and level. Double-click a line to filter by its correlation ID. An earlier day is read back from the database, as far back as `logRetentionDays` (14).
+2. **Read the database** if the Monitor is not enough. Everything is in `emerald.db` in the data folder (`dataFolder`, `%APPDATA%\Emerald` by default). Open it read-only with any SQLite tool. `log_error` holds every warning and error with the area it came from; `log_edl` holds each EDL entry whole, as JSON in `detail`. **Export** in the Monitor saves the rows shown, and **Open folder** opens the database folder.
 3. **Search by event tag** (below). Tags are more reliable than message text.
 
-```powershell
-Select-String -Path "$env:APPDATA\Emerald\logs\emerald-*.jsonl" -Pattern '"Level":"Error"'
+```sql
+select at, area, source, event, message from log_error order by at_ms desc limit 200;
 ```
 
 ## Log events worth knowing
 
 | Event | Meaning |
 |---|---|
-| `app.crashed` | UI thread exception. The line can be lost, since the log isn't flushed. |
+| `app.crashed` | UI thread exception. The log is flushed to the database straight after it. |
+| `app.databasefailed` | `emerald.db` could not be opened in the data folder, and maybe not in `%APPDATA%\Emerald` either. If neither opened, `app.started` says the record is in memory only. |
+| `log.dropped` | Lines the database could not take. Reported once it keeps up again. |
+| `delay.samedisk` | The ring folder was on a recording drive, so the default `%LOCALAPPDATA%\Emerald\delay` is used instead |
 | `capture.problem` | A problem shown on the deck |
 | `capture.dropped` | Encoder could not keep up |
 | `capture.newday` | Recording moved to the next day's folder |
@@ -28,7 +31,7 @@ Select-String -Path "$env:APPDATA\Emerald\logs\emerald-*.jsonl" -Pattern '"Level
 | `rx.stuck`, `rx.taken` | Receiver handover |
 | `media.pruned`, `media.limitfailed` | Storage limit activity |
 | `playout.audiofailed` | An audio track could not be decoded, or decoded to nothing, and is silent |
-| `edl.operationFailed` | EDL step failed. Look in `edl-yyyyMMdd.jsonl`. |
+| `edl.operationFailed` | EDL step failed. The whole entry is in `log_edl`, as JSON in `detail`. |
 
 ## Startup
 
@@ -43,6 +46,7 @@ Select-String -Path "$env:APPDATA\Emerald\logs\emerald-*.jsonl" -Pattern '"Level
 | Blank or corrupt rendering | GPU or remote session | Close Emerald, set `softwareRendering` in `settings.json` or `EMERALD_SOFTWARE_RENDER=1`, then start it. |
 | Build fails on a locked file | Emerald is running | Close it |
 | All settings went back to defaults | `settings.json` was corrupt, which is silent | Restore from a copy. There is no automatic backup. |
+| The Monitor shows no earlier days, and the footer says "not being written to disk" | `emerald.db` could not be opened, so the record is memory only. See `app.databasefailed`. | Check the data folder exists and is writable, or clear `dataFolder` in `settings.json` (Emerald closed) to use `%APPDATA%\Emerald`. |
 
 ## Clock
 
@@ -63,10 +67,11 @@ Select-String -Path "$env:APPDATA\Emerald\logs\emerald-*.jsonl" -Pattern '"Level
 | Recording refused for this raster | PAL and NTSC can't go to DNxHD | Not supported |
 | "Capture: the encoder stopped at frame N" | ffmpeg exited. The reason follows in the log. | See the next section |
 | Dropped frames | Disk too slow, or CPU too busy | Faster disk, and check `capture.dropped` |
-| After changing board or port, the preview stays on the old receiver and the port list does not update | Known issue: `_loading` is never cleared. The next recording uses what the boxes show, not what the preview shows. | Press Refresh after changing. That saves the choice, refills the ports and moves the preview. |
-| Storage limit not saved | Known issue, same cause | Start a recording after choosing it, then close the deck normally. Starting the recording copies the limit into the in-memory settings, and closing the deck saves them. A crash before that loses it. The limit is enforced during recording either way. |
+| After changing board or port, the preview stays on the old receiver and the port list does not update | Fixed in this build (`_loading` is now cleared after start-up). On an older build, the next recording uses what the boxes show, not what the preview shows. | On an older build, press Refresh after changing. |
+| Storage limits not saved | Known issue, same cause | Start a recording after choosing them, then close the deck normally. Starting the recording copies both limits into the in-memory settings, and closing the deck saves them. A crash before that loses them. The limits are enforced during recording either way. |
 | 2-minute segment length resets to 30 s after a restart | Known issue, same cause | Choose it again after starting. |
-| Output folder not seen by Live Edit | Known issue, same cause | It takes effect on Record |
+| A high-res or low-res path typed on the deck is not seen by Live Edit | Known issue, same cause: leaving the box does nothing | Use the folder button beside the box, which saves at once, or press Record, which saves both. |
+| High-res and low-res paths greyed out | A recording is running. The folders are locked until it stops, because the recorder, the segment watch and the storage limit are told them once. | Stop the recording first. |
 | Signal lost mid-recording, no warning | Known issue: not reported once frames have arrived | Watch the deck's frame count. |
 | A good recording is logged "stopped early" | Known issue: every deck recording | Ignore this line |
 | A later recording shows an old encoder error | Known issue: `_encoderErrors` is never cleared | Restart Emerald to clear it |
@@ -133,7 +138,7 @@ Select-String -Path "$env:APPDATA\Emerald\logs\emerald-*.jsonl" -Pattern '"Level
 | Deleted picture briefly on air | Known issue: Repeat during a deleted scene | Check `delay.trouble` |
 | Export is off by the length of an insert | Known issue: ruler and captured frames mixed | Export before placing inserts |
 | Placements gone after closing | Not saved, by design | Finish before closing |
-| Clip will not play | Master can't play, as Media Foundation has no DNxHD decoder. Proxy might be open. | Proxy is used automatically. Check `low\`. |
+| Clip will not play | Master can't play, as Media Foundation has no DNxHD decoder. Proxy might be open. | Proxy is used automatically. Check the low-res folder. |
 | "Cannot go live: TXn (owner) already in use" | Another module holds it | Stop that module |
 
 ## Monitor and remote page
@@ -147,6 +152,8 @@ Select-String -Path "$env:APPDATA\Emerald\logs\emerald-*.jsonl" -Pattern '"Level
 | Red BEHIND count on the page | Known issue: false count when armed mid-recording | Trust the deck |
 | INGEST stage is always idle | Known issue: nothing writes it | Look at the Ingest window |
 | Live Edit's air isn't on the strip | Known issue | Look at Live Edit's header |
+| No GPU tile | The machine has no graphics engine counters | Nothing to fix. CPU, RAM and disks still show. |
+| An earlier day shows fewer lines than happened | More than the limit: the window holds 20,000 rows, the remote page the newest 5000 of a day | Narrow by area, or read `emerald.db` directly |
 
 ## Hardware checks
 
@@ -164,6 +171,37 @@ Select-String -Path "$env:APPDATA\Emerald\logs\emerald-*.jsonl" -Pattern '"Level
 | Symptom | Check |
 |---|---|
 | Tests or the ring refuse, "The delay line needs X on D:\ for ... and only Y is free." (X and Y in MB or GB) | Free space on the ring's drive |
-| Unexpected disk growth | `edl-*.jsonl`, `ingest\`, snapshots, thumbnails and `ingest.db` aren't limited by any rule |
+| Unexpected disk growth | The exports folder (exports and snapshots), thumbnails and `ingest.db` aren't limited by any rule. `emerald.db` keeps `logRetentionDays` of rows but does not shrink on disk. With the folders chosen apart, exports sit inside the high-res folder but are not counted towards its limit. |
 | Very large files in `%LOCALAPPDATA%\Emerald\delay` | Rings. They delete on release or at the next start. Close Emerald first. |
-| Old recordings vanished | `StorageWarden`. Look for `media.pruned`. |
+| Old recordings vanished | `StorageWarden`. Look for `media.pruned`; each line says high-res or low-res. |
+| Proxies gone but masters still there | The low-res limit. It deletes only proxies; their masters stay until the high-res limit takes them. |
+| "only N GB is free where this recording is going" | Both recording drives are checked; the folder named is the one with less room |
+
+### A disk shows 100% active
+
+The Monitor's tile for a drive, for example `Disk 1 (E:)`, shows its active time as Task Manager does (100 minus idle time). 100% means the disk is busy all the time, not that it is full.
+
+**What was measured on the plant machine.** E: is one Seagate ST3000VN007 (IronWolf, 5900 rpm SATA hard disk). The recorder writes about 15 to 16 MB/s there (DNxHD at 25p is CID 1238, about 121 Mb/s) in IOs of about 850 KB, and in steady recording E: was 85 to 90% idle, with no spike when a master closed. So the writer alone does not fill the disk. 100% comes from **readers making the head seek** on the drive being written to.
+
+Readers on the recording drive, and what was done about each:
+
+| Reader | Now |
+|---|---|
+| Live Edit waveforms, which decode a whole file's sound | Read once per segment and kept in `<data folder>\peaks`. One ffmpeg at a time, at very low disk priority. An overlay's sound comes from its small `.preview.mp4`. |
+| Live Edit's store index opening new segments | 2 files at a time, not 6. Each finished file's length is read once for the whole app (`MediaLengths`), shared with the storage limit. |
+| Storage limit measuring the folders | Sizes from the directory listing, without opening files. Shown from the sweep's own measurement. |
+| Exports and their previews | Below-normal CPU and very low disk priority, so the recorder's writes go first |
+| Proxies read by Live Edit, on the same drive as the masters | Choose a low-res folder on another drive (capture deck, **Low-res path**) |
+| A delay ring on the recording drive | Refused: the default `%LOCALAPPDATA%\Emerald\delay` is used instead (`delay.samedisk`) |
+
+What to check:
+
+1. In the Monitor, compare the drive's **R** and **W** figures. High reads with a steady ~15 MB/s write means readers.
+2. Is the low-res folder on the same drive as the high-res one? Move it to another drive if one is available.
+3. Exclude the high-res, low-res and database folders from Windows Search indexing and from Defender real-time scanning. Both read new files as they are written. This is outside Emerald.
+4. Is Live Edit open on a day it has not shown before? The first view of each segment reads its sound once; after that it comes from the cache.
+5. Is an export running? It reads the masters, at low priority.
+
+**RAM rising while recording and on air.** This was the delay ring, not the segment length or Live Edit: on air with a 120 s delay, Emerald's working set reached 14.3 GB (745 MB of it its own memory) and Windows held 28 GB of the ring as modified pages. Fixed: the ring keeps about 4 s in memory and writes the rest ahead to its file. If RAM still climbs, look at the Memory gauge "ring not yet on disk": a growing figure means the ring's drive cannot keep up with about 104 MB/s; put `tidalLockRingFolder` on a faster drive that is not a recording drive.
+
+**Not changed: the delay ring's write load.** A 420 s ready line at 1080p25 is about 44 GB on C:, and while held its write-back was measured at roughly 80 to 100 MB/s to C:. That is inherent to holding that much picture, and it loads C:, not the recording drive. Only a shorter delay and headroom, or **Delay ready** Off, reduce it. An earlier suspicion that creating the ring zero-fills 44 GB at once was tested and not confirmed: creation took milliseconds, so the ring code was left as it was.

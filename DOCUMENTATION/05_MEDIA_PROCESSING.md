@@ -169,6 +169,8 @@ Then one of three destinations:
     -strftime 1 {root}\{low|high}\{prefix}_%Y-%m-%d_%H-%M-%S.{ext}     (legacy: no Names given; only tests reach it)
 ```
 
+`{root}\low` and `{root}\high` stand for the low-res and high-res folders (`StorePaths.Low` and `StorePaths.High`, `src/Emerald.Video/StorePaths.cs`). Each can be chosen apart, on a drive of its own. `StorePaths.Under(root)` gives the old layout, `low` and `high` inside one folder, and every caller that still has one folder goes through it.
+
 Worked example: 1080p25, one audio pair, default settings.
 
 ```
@@ -231,12 +233,28 @@ This letterboxes, conforms the rate and drops audio. There is no deinterlacer in
 | Purpose | Location | Arguments |
 |---|---|---|
 | Probe | `src/Emerald.Media/MediaProbe.cs:170` | `ffprobe -v error -print_format json -show_format -show_streams {path}` |
-| Export | `src/Emerald.Media/RangeExport.cs:165` | `ffmpeg -hide_banner -loglevel error -nostdin -y -f concat -safe 0 -i {list} -ss {from} -t {length} -c copy -avoid_negative_ts make_zero {output}` |
-| Export preview | `src/Emerald.Media/RangeExport.cs:299` | `ffmpeg -hide_banner -loglevel error -nostdin -y -i {export} -c:v libx264 -preset veryfast -profile:v high -crf 20 -pix_fmt yuv420p -bf 0 -g {max(1,rate/2)} -sc_threshold 0 -c:a aac -b:a 192k {name}.preview.mp4` |
-| Waveform | `src/Emerald.Media/Waveform.cs:123` | `ffmpeg -v error -nostdin -i {path} -vn -ac 1 -ar 8000 -f s16le -acodec pcm_s16le -` |
+| Export (below-normal CPU, very low disk priority) | `src/Emerald.Media/RangeExport.cs:165` | `ffmpeg -hide_banner -loglevel error -nostdin -y -f concat -safe 0 -i {list} -ss {from} -t {length} -c copy -avoid_negative_ts make_zero {output}` |
+| Export preview (the same priorities) | `src/Emerald.Media/RangeExport.cs:299` | `ffmpeg -hide_banner -loglevel error -nostdin -y -i {export} -c:v libx264 -preset veryfast -profile:v high -crf 20 -pix_fmt yuv420p -bf 0 -g {max(1,rate/2)} -sc_threshold 0 -c:a aac -b:a 192k {name}.preview.mp4` |
+| Waveform (the same priorities; one at a time; cached on disk) | `src/Emerald.Media/Waveform.cs:123` | `ffmpeg -v error -nostdin -i {path} -vn -ac 1 -ar 8000 -f s16le -acodec pcm_s16le -` |
 | Thumbnail | `src/Emerald.App/ClipThumbnails.cs:73` | `ffmpeg -hide_banner -loglevel error -nostdin -y -threads 2 -ss 1 -i {clip} -frames:v 1 -vf scale=294:-1 {cache}.png` |
 
 **Listing the store.** `MediaLibrary.List` does not start ffprobe for the recorder's own segments. `MediaCodec.ReadSegment` reads the same facts from the container when the file has one H.264 or HEVC video track and at most one AAC track. Anything else, including a recording with several audio tracks, a timecode track, a file outside a recording folder or the segment still being written, goes to ffprobe. Measured on a store of 686 proxies during a recording: a fresh process listed it in about 0.3 s, against 10.9 s before, and the 685 closed segments gave the same fields and lengths as ffprobe. The disk cache was already warm for the after figures. A file deleted during a listing is now skipped. Before, it ended the listing, and on a store at its size limit the first listing could come back empty.
+
+**Reading the store gently.** The recording drive is often one spinning disk, where more readers mean more seeking, not more speed. So:
+
+- `StoreIndex` opens 2 files at a time (it was 6).
+- `MediaLengths` (`src/Emerald.Media/MediaLengths.cs`) reads each finished file's picture length once for the whole app, keyed on path, length and write time. `StoreIndex` and `StorageWarden` share it, so a master is not opened twice.
+- `BackgroundPriority.Apply` (`src/Emerald.Core/BackgroundPriority.cs`) puts the waveform, export and export-preview ffmpegs at below-normal CPU priority and very low I/O priority (`NtSetInformationProcess`, `ProcessIoPriority` 0). Windows then serves the recorder's writes first. It is best effort, and never used for anything that feeds the air.
+- Waveforms are kept on disk once read. See [waveforms](#waveforms).
+
+### Waveforms
+
+`src/Emerald.Media/Waveform.cs`. A waveform is read by decoding a whole file's sound, which reads the whole file.
+
+- **Disk cache.** `<data folder>\peaks\`, one `.peaks` file per file, named by a hash of its path, length and write time. 50 peaks a second, one byte a peak, so a 30-second segment is about 1.5 KB. A file that changes is read again.
+- **Kept while used.** Reading a cached waveform touches the file. `SweepCache` runs at startup and deletes `.peaks` files not used for `max(30, logRetentionDays)` days.
+- **One at a time.** Live Edit runs one waveform ffmpeg at a time (it was two).
+- **Overlays.** An overlay's waveform is read from its `.preview.mp4` when there is one, not from a DNxHD export of gigabytes.
 
 ## Recording profile
 
@@ -244,7 +262,7 @@ This letterboxes, conforms the rate and drops audio. There is no deinterlacer in
 
 | | `LowRes`, proxy | `HighRes`, master |
 |---|---|---|
-| Folder and container | `low`, MP4 | `high`, MOV |
+| Folder and container | Low-res folder (`low` in the old layout), MP4 | High-res folder (`high` in the old layout), MOV |
 | Video | H.264 High or HEVC Main, 4:2:0, **full raster**, on the video card or the CPU | dnxhd, 145 Mb/s, yuv422p, always on the CPU |
 | Audio | AAC | AAC |
 
@@ -305,7 +323,9 @@ The count starts from the folder stamp, while frame 0 comes at least 2 seconds l
 
 A ring of raw frames in a memory-mapped file: `src/Emerald.Video/DelayLine.cs`.
 
-- **Location:** `tidalLockRingFolder`, default `%LOCALAPPDATA%\Emerald\delay`, named `tidal-<pid>-<guid>.ring`.
+- **Location:** `tidalLockRingFolder`, default `%LOCALAPPDATA%\Emerald\delay`, named `tidal-<pid>-<guid>.ring`. A folder on the same drive as either recording folder is refused: `App.TidalLockRingFolder` uses the default instead and logs `delay.samedisk` once (unless the default is on that drive too).
+- **Write load:** while a delay is held the ring takes roughly 80 to 100 MB/s of writes (measured on the plant machine, 420 s ready line, about 44 GB on C:). That is inherent to holding that much picture. Only a shorter delay and headroom, or **Delay ready** Off, reduce it. Creating the ring takes milliseconds: it does not zero-fill the file first (tested).
+- **Memory:** about 4 s of the ring stays in the working set, plus up to 15 s for a reader close behind the writer. A flusher thread writes the ring to its file half a second behind the writer, so nothing piles up as dirty memory, and a transmitter a delay behind reads its frames back from the standby cache. `FlushedThrough` and the Memory gauge "ring not yet on disk" show how far behind the disk is.
 - **Layout:** 4096-byte header with magic `EMLDLY01`, then slots at `header + seq % SlotCount * stride`. Each slot has a 64-byte header, video and audio.
 - **Audio capacity:** four frames of stereo.
 - **Free-space guard:** requires size plus 2,000,000,000 bytes.
@@ -412,12 +432,12 @@ flowchart LR
     Warden --> Ledger["PruneLedger records what went"]
     Rec --> List["StoreIndex.Refresh: reads only new or just-closed files"]
     Ledger --> List
-    List --> Probe["Container read of own segments, ffprobe otherwise, 6 at a time"]
+    List --> Probe["Container read of own segments, ffprobe otherwise, 2 at a time, lengths shared through MediaLengths"]
     List --> Pair["Masters laid out on their own lengths"]
     Probe --> Starts["LayEndToEnd works out segment starts"]
     Pair --> Starts
     Starts --> Place["Live Edit Place: timeline"]
-    Place --> Wave["Waveform: ffmpeg at 8 kHz mono, cached in memory"]
+    Place --> Wave["Waveform: ffmpeg at 8 kHz mono, low priority, cached in memory and in the peaks folder"]
     Place --> Export["RangeExport: concat, stream copy"]
     Export --> Sidecar["name.json and name.preview.mp4"]
     Ingest["Ingest job: single file"] --> Reg["MediaLibraryRegistrar: verifies the files"]
@@ -472,7 +492,7 @@ At 1080p25:
 | Slot lock | Timeout | Retry until stopped. Before the first frame and after 3 s, one `Fail`, which marks the result failed. After the first frame, silent. |
 | Encoder slow | Queue full | Frame and its audio dropped, logged, recording continues |
 | Encoder stalled | No frame taken for 10 s, process still alive (for example a full disk) | `EncoderWatch` raises one error with ffmpeg's last message. The recording is not stopped, so the delay line and anything on air carry on. Said again when frames are taken. |
-| Disk low | Under 10 GB free, checked every 30 s | One warning, repeated only if the space returns and goes again |
+| Disk low | Under 10 GB free, checked every 30 s on both recording drives; the one with less room is reported | One warning, repeated only if the space returns and goes again |
 | Encoder dead | Process exit | Detected within about a second of frames, recording stops, no restart |
 | Midnight encoder | Open fails | Stays in old folder, tries again next midnight |
 | Ring create | No space or IO | `DelayLineException`, lock fails, recording continues |

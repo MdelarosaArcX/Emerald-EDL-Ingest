@@ -106,10 +106,11 @@ public sealed class ActivityLog : IDisposable
     /// </summary>
     public const int PendingLimit = 20_000;
 
-    /// <summary>Roll to a new file past this, so no single day's file becomes unopenable.</summary>
-    public const long MaxFileBytes = 32L * 1024 * 1024;
-
-    /// <summary>A very long line is a mistake somewhere; keep the head of it and move on.</summary>
+    /// <summary>
+    /// A very long line is a mistake somewhere; the ring keeps the head of it. The database gets
+    /// it whole: an EDL entry across a hundred segments is long on purpose, and the database is
+    /// where an edit is traced.
+    /// </summary>
     public const int MaxDetailChars = 4096;
 
     private static readonly JsonSerializerOptions Json = new()
@@ -146,8 +147,9 @@ public sealed class ActivityLog : IDisposable
 
     private Thread? _writer;
     private CancellationTokenSource? _cts;
-    private string? _folder;
+    private LogDatabase? _database;
     private int _retentionDays;
+    private DateTime _sweptFor;
 
     // The house clock, sampled rather than asked. See SampleTimecode.
     private string? _timecodeCache;
@@ -174,7 +176,7 @@ public sealed class ActivityLog : IDisposable
     public long Dropped => Interlocked.Read(ref _dropped);
 
     /// <summary>Where the record is being written, or null when it is memory only.</summary>
-    public string? Folder => _folder;
+    public LogDatabase? Database => _database;
 
     // ------------------------------------------------------------------ writing
 
@@ -198,6 +200,7 @@ public sealed class ActivityLog : IDisposable
         string? trimmed = Trim(detail);
 
         LogLine line;
+        LogLine whole;
 
         // The number and the place in the ring are taken together, under one lock.
         //
@@ -225,13 +228,15 @@ public sealed class ActivityLog : IDisposable
             while (_ring.Count > RingSize) _ring.Dequeue();
         }
 
+        whole = ReferenceEquals(trimmed, detail) ? line : line with { Detail = detail };
+
         // Transient lines are for the screen. Queuing them would fill the record with the
         // playout engine's once-a-second progress and bury the events among it.
         if (!transient && _writer is not null)
         {
             if (Interlocked.Increment(ref _pendingCount) <= PendingLimit)
             {
-                _pending.Enqueue(line);
+                _pending.Enqueue(whole);
                 _wake.Set();
             }
             else
@@ -317,48 +322,29 @@ public sealed class ActivityLog : IDisposable
     }
 
     /// <summary>
-    /// Reads a day back off the disk, oldest first.
+    /// Reads a day back, oldest first, from the database.
     ///
     /// The ring holds five thousand lines, which on a busy plant is an hour or two. Anything
     /// that wants to answer a question about the whole day — what went to air this morning,
-    /// which clip a message used before lunch — has to come back here for it.
-    ///
-    /// Opened <see cref="FileShare.ReadWrite"/> so it reads the file Emerald is still writing
-    /// to, and a line that will not parse is skipped rather than throwing: a half-written last
-    /// line is what a crash leaves behind, and the rest of the day is still good.
+    /// which clip a message used before lunch — has to come back here for it. With no database
+    /// (a test, or one that could not be opened) it is what the ring still holds of that day.
     /// </summary>
-    public static LogLine[] ReadDay(string folder, DateTime day)
+    public LogLine[] ReadDay(DateTime day, LogArea? area = null)
     {
-        var lines = new List<LogLine>();
-
-        for (int index = 0; index < 100; index++)
+        if (_database is { } db)
         {
-            string path = Path.Combine(folder, Name(day, index));
+            Flush(TimeSpan.FromSeconds(2));
 
-            if (!File.Exists(path)) break;
-
-            try
-            {
-                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
-                                                  FileShare.ReadWrite);
-                using var reader = new StreamReader(stream);
-
-                while (reader.ReadLine() is { } text)
-                {
-                    if (text.Length == 0) continue;
-
-                    try
-                    {
-                        if (JsonSerializer.Deserialize<LogLine>(text, Json) is { } line) lines.Add(line);
-                    }
-                    catch (JsonException) { /* a torn line; the rest of the day still counts */ }
-                }
-            }
-            catch (IOException) { break; }
-            catch (UnauthorizedAccessException) { break; }
+            try { return db.ReadDay(day, area); }
+            catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException) { }
         }
 
-        return lines.ToArray();
+        return Snapshot()
+            .Where(l => l.At.Date == day.Date && !l.Transient)
+            .Where(l => area is null || (area == LogArea.Errors
+                ? l.Level is LogLevel.Warn or LogLevel.Error
+                : LogDatabase.AreaOf(l) == area))
+            .ToArray();
     }
 
     private static string? Trim(string? detail) =>
@@ -394,29 +380,22 @@ public sealed class ActivityLog : IDisposable
         return value;
     }
 
-    // ------------------------------------------------------------------ the file
+    // ------------------------------------------------------------------ the database
 
     /// <summary>
-    /// Starts writing the record to <paramref name="folder"/>, one JSON object per line.
+    /// Starts writing the record to <paramref name="database"/>, a batch a transaction.
     ///
     /// Called once, by the application. Tests and anything hosting the log without a disk
     /// simply never call it, and the log stays in memory — which is why nothing here is done
-    /// in the constructor.
+    /// in the constructor. Rows older than <paramref name="retentionDays"/> are deleted at the
+    /// start and then once a day; negative keeps everything.
     /// </summary>
-    public void StartWriting(string folder, int retentionDays)
+    public void StartWriting(LogDatabase database, int retentionDays)
     {
         if (_writer is { IsAlive: true }) return;
 
-        _folder = folder;
+        _database = database;
         _retentionDays = retentionDays;
-
-        try { Directory.CreateDirectory(folder); }
-        catch (Exception ex)
-        {
-            _folder = null;
-            Warn(LogSource.App, $"The activity log cannot be written to {folder}: {ex.Message}");
-            return;
-        }
 
         _cts = new CancellationTokenSource();
         CancellationToken ct = _cts.Token;
@@ -434,11 +413,11 @@ public sealed class ActivityLog : IDisposable
     }
 
     /// <summary>
-    /// Waits until everything written so far has reached the disk.
+    /// Waits until everything written so far has reached the database.
     ///
-    /// For anything that wants to read the file back straight after writing to it — an export,
-    /// a test. Nothing on the hot path calls this, and nothing on the hot path should: waiting
-    /// for a disk is the one thing <see cref="Write"/> exists not to do.
+    /// For anything that wants to read the record back straight after writing to it — an
+    /// export, a test, closing. Nothing on the hot path calls this, and nothing on the hot path
+    /// should: waiting for a disk is the one thing <see cref="Write"/> exists not to do.
     /// </summary>
     public bool Flush(TimeSpan timeout)
     {
@@ -458,14 +437,11 @@ public sealed class ActivityLog : IDisposable
     }
 
     /// <summary>
-    /// Deletes records older than the retention window.
-    ///
-    /// By the date in the name rather than the file's timestamp: a copy or a restore rewrites
-    /// the timestamp and would throw away a day that was asked to be kept. Run once at start-up,
-    /// beside the delay line's own sweep, for the same reason — last run's leftovers go before
-    /// this run allocates more.
+    /// Deletes the log files earlier builds wrote (emerald-, edl- and memory-yyyyMMdd.jsonl)
+    /// once they are older than the retention window. By the date in the name rather than the
+    /// file's timestamp: a copy or a restore rewrites the timestamp.
     /// </summary>
-    public int Sweep(string folder, int retentionDays)
+    public static int SweepOldFiles(string folder, int retentionDays)
     {
         if (retentionDays < 0 || !Directory.Exists(folder)) return 0;
 
@@ -486,18 +462,21 @@ public sealed class ActivityLog : IDisposable
 
     private static IEnumerable<string> SafeFiles(string folder)
     {
-        try { return Directory.EnumerateFiles(folder, "emerald-*.jsonl").ToList(); }
+        try { return Directory.EnumerateFiles(folder, "*.jsonl").ToList(); }
         catch (IOException) { return Array.Empty<string>(); }
         catch (UnauthorizedAccessException) { return Array.Empty<string>(); }
     }
 
-    /// <summary>"emerald-20260909.jsonl" and "emerald-20260909-001.jsonl" both give that day.</summary>
+    private static readonly string[] OldPrefixes = { "emerald-", "edl-", "memory-" };
+
+    /// <summary>"emerald-20260909.jsonl", "emerald-20260909-001.jsonl" and "edl-20260909.jsonl" all give that day.</summary>
     public static DateTime? DateFromName(string path)
     {
         string name = Path.GetFileNameWithoutExtension(path);
-        if (!name.StartsWith("emerald-", StringComparison.OrdinalIgnoreCase)) return null;
+        string? prefix = OldPrefixes.FirstOrDefault(p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+        if (prefix is null) return null;
 
-        string stamp = name["emerald-".Length..];
+        string stamp = name[prefix.Length..];
         if (stamp.Length > 8) stamp = stamp[..8];
 
         return DateTime.TryParseExact(stamp, "yyyyMMdd", null,
@@ -508,69 +487,39 @@ public sealed class ActivityLog : IDisposable
 
     private void WriteLoop(CancellationToken ct)
     {
-        StreamWriter? file = null;
-        DateTime openFor = default;
-        int index = 0;
-        long bytes = 0;
+        var batch = new List<LogLine>(256);
 
         try
         {
-            while (!ct.IsCancellationRequested)
+            while (true)
             {
-                _wake.WaitOne(500);
+                bool stopping = ct.IsCancellationRequested;
+                if (!stopping) _wake.WaitOne(500);
 
-                bool wrote = false;
+                batch.Clear();
+                while (batch.Count < 5000 && _pending.TryDequeue(out LogLine? line)) batch.Add(line);
 
-                int taken = 0;
-
-                while (_pending.TryDequeue(out LogLine? line))
+                if (batch.Count > 0)
                 {
-                    taken++;
-
-                    DateTime day = line.At.Date;
-
-                    // A new day, or a file that has grown past what anything will happily open.
-                    if (file is null || day != openFor || bytes >= MaxFileBytes)
+                    try { _database?.WriteLines(batch); }
+                    catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or InvalidOperationException)
                     {
-                        if (file is not null && day == openFor && bytes >= MaxFileBytes) index++;
-                        else if (day != openFor) index = 0;
-
-                        file?.Dispose();
-                        (file, bytes) = Open(day, ref index);
-                        openFor = day;
-
-                        if (file is null) break;   // the folder went away; stop trying
+                        // The database answered badly. Drop this batch rather than spin on it;
+                        // the count is reported below and the next batch gets its own chance.
+                        Interlocked.Add(ref _dropped, batch.Count);
                     }
 
-                    try
-                    {
-                        string json = JsonSerializer.Serialize(line, Json);
-                        file.WriteLine(json);
-                        bytes += json.Length + 2;
-                        wrote = true;
-                    }
-                    catch (IOException)
-                    {
-                        // The disk answered badly. Drop this line rather than spin on it; the
-                        // count is reported below and the next line gets its own chance.
-                        Interlocked.Increment(ref _dropped);
-                    }
+                    // Counted down only now, after the batch is in the database rather than as
+                    // each line leaves the queue: Flush watches this number.
+                    Interlocked.Add(ref _pendingCount, -batch.Count);
+                    continue;
                 }
 
-                // One flush per drain rather than per line: a crash costs at most this batch,
-                // and the disk is not asked to do a hundred small writes a second.
-                if (wrote)
-                {
-                    try { file?.Flush(); } catch (IOException) { }
-                }
-
-                // Counted down only now, after the batch is on the disk rather than as each
-                // line leaves the queue. Flush watches this number, and decrementing it first
-                // let it report a drain while the lines were still in the writer's hand — an
-                // export, or a test, would then read a file that did not have them yet.
-                if (taken > 0) Interlocked.Add(ref _pendingCount, -taken);
+                // Stopping, and everything queued is written: closing loses nothing.
+                if (stopping) return;
 
                 ReportDrops();
+                SweepIfDue();
             }
         }
         catch (Exception ex)
@@ -578,51 +527,18 @@ public sealed class ActivityLog : IDisposable
             // The record failing must not be silent, and must not take anything else with it.
             try { Warn(LogSource.App, $"The activity log writer stopped: {ex.Message}"); } catch { }
         }
-        finally
-        {
-            try { file?.Flush(); } catch (IOException) { }
-            file?.Dispose();
-        }
     }
 
-    /// <summary>
-    /// Opens today's file, appending to whatever is already there.
-    ///
-    /// <see cref="FileShare.ReadWrite"/> deliberately: an operator watching a problem wants to
-    /// tail the file while Emerald still holds it, and a lock that made that impossible would
-    /// be a lock for no one's benefit.
-    /// </summary>
-    private (StreamWriter? File, long Bytes) Open(DateTime day, ref int index)
+    /// <summary>Once a day, on the writer's own thread: rows past the retention window go.</summary>
+    private void SweepIfDue()
     {
-        if (_folder is null) return (null, 0);
+        if (_retentionDays < 0 || _database is null || _sweptFor == DateTime.Today) return;
 
-        for (int attempt = 0; attempt < 100; attempt++)
-        {
-            string path = Path.Combine(_folder, Name(day, index));
+        _sweptFor = DateTime.Today;
 
-            try
-            {
-                var info = new FileInfo(path);
-                long existing = info.Exists ? info.Length : 0;
-
-                // Already full from a previous run: take the next index rather than appending
-                // to something that is over the cap.
-                if (existing >= MaxFileBytes) { index++; continue; }
-
-                var stream = new FileStream(path, FileMode.Append, FileAccess.Write,
-                                            FileShare.ReadWrite);
-
-                return (new StreamWriter(stream) { AutoFlush = false }, existing);
-            }
-            catch (IOException) { index++; }
-            catch (UnauthorizedAccessException) { return (null, 0); }
-        }
-
-        return (null, 0);
+        try { _database.Sweep(new DateTimeOffset(DateTime.Today.AddDays(-_retentionDays))); }
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException) { }
     }
-
-    private static string Name(DateTime day, int index) =>
-        index == 0 ? $"emerald-{day:yyyyMMdd}.jsonl" : $"emerald-{day:yyyyMMdd}-{index:D3}.jsonl";
 
     /// <summary>
     /// Says how many lines the disk lost, once it is keeping up again.
@@ -651,10 +567,11 @@ public sealed class ActivityLog : IDisposable
     {
         if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
 
+        // The writer drains what is queued before it stops.
         _cts?.Cancel();
         _wake.Set();
 
-        _writer?.Join(TimeSpan.FromSeconds(3));
+        _writer?.Join(TimeSpan.FromSeconds(5));
         _writer = null;
 
         _cts?.Dispose();

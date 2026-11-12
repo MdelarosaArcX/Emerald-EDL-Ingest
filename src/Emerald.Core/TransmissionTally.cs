@@ -142,7 +142,50 @@ public sealed class TransmissionTally
             case "playout.audio":
                 if (line.File is { Length: > 0 }) File(line, TrackOf(line)).AiredAt.Add(line.At);
                 break;
+
+            // Live Edit's own transmission. Each time it goes live is one EDL here - every
+            // edit on its timeline is an entry of the EDL it sends - and a cue's media is
+            // queued when the transmitter opens it and aired when it starts playing.
+            case "liveair.armed":
+                _live = $"liveedit-{line.At.ToLocalTime():yyyyMMdd-HHmmss}";
+                Edl(_live).Headline = $"Live Edit on air from {line.At.ToLocalTime():HH:mm:ss}";
+                Edl(_live).At = line.At;
+                break;
+
+            case "liveair.cue.prepared":
+                if (line.File is { Length: > 0 }) File(line, track: 0, LiveEdl(line)).Queued ??= line.At;
+                break;
+
+            case "liveair.cue.playing":
+                if (line.File is { Length: > 0 })
+                {
+                    TransmittedFile file = File(line, track: 0, LiveEdl(line));
+                    file.Queued ??= line.At;
+                    file.AiredAt.Add(line.At);
+                }
+                break;
         }
+    }
+
+    /// <summary>The Live Edit session the lines now belong to; null until one is seen going live.</summary>
+    private string? _live;
+
+    /// <summary>
+    /// The EDL a Live Edit cue goes under: the session it went live in, or - for a page opened
+    /// on a record that starts part-way through one - a heading for that day.
+    /// </summary>
+    private string LiveEdl(LogLine line)
+    {
+        if (_live is not null) return _live;
+
+        string id = $"liveedit-{line.At.ToLocalTime():yyyyMMdd}";
+        if (!_edls.ContainsKey(id))
+        {
+            Edl(id).Headline = "Live Edit on air";
+            Edl(id).At = line.At;
+        }
+
+        return id;
     }
 
     /// <summary>
@@ -191,9 +234,9 @@ public sealed class TransmissionTally
         return edl;
     }
 
-    private TransmittedFile File(LogLine line, int track)
+    private TransmittedFile File(LogLine line, int track, string? edl = null)
     {
-        string id = line.Correlation ?? "";
+        string id = edl ?? line.Correlation ?? "";
         Edl(id);
 
         var key = (id, track, line.File!);

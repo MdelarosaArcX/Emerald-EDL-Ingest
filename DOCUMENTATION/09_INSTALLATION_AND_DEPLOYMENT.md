@@ -110,33 +110,41 @@ The version is set in `Directory.Build.props`. `installer\install.bat` and `inst
 
 1. Copy the published folder to the machine.
 2. Right-click `install.bat`, Run as administrator.
-3. Accept the suggested recordings folder or type another.
+3. It lists the fixed drives with their free space, then asks for three folders. Accept each suggestion or type another:
+   - **High-res folder**, for the DNxHD masters. Suggested: `<roomiest non-system drive>\Emerald\media\high`.
+   - **Low-res folder**, for the proxies Live Edit plays. Suggested: `<same drive>\Emerald\media\low`. A different drive from the high-res one is better on a spinning disk.
+   - **Database folder**, for `emerald.db`, `ingest.db` and the waveform cache. Suggested: `%APPDATA%\Emerald`. Ideally not the drive the masters go to.
 4. Start Menu, Emerald.
 
 ```
-install.bat                       install, asking where recordings go
-install.bat D:\Emerald\media      recordings there, no question
-install.bat D:\Emerald\media -q   the same, no pauses, for a rollout
+install.bat                                  install, asking where things go
+install.bat D:\Emerald\media                 masters in its high\, proxies in its low\
+install.bat D:\Masters E:\Proxies D:\Data    high-res, low-res and database folders
+... -q                                       the same, no questions and no pauses, for a rollout
 ```
 
-The path applies only when the running account has no `settings.json`. Otherwise the argument is ignored and the store stays as configured, so change it on the deck. `install.bat -q` with no path still stops at the prompt, so only the path-plus-`-q` form is unattended.
+It asks only when started from Explorer (Run as administrator) and without `-q`. Run from a command prompt, or with `-q`, it takes the suggestions for anything not given. With one folder given, the database folder is not given, so it is asked for or defaults to `%APPDATA%\Emerald`.
 
-`%APPDATA%` here is the elevated account's. If the administrator who runs the installer is not the operator, `captureFolder` lands in the administrator's profile, and the operator's Emerald falls back to `media` beside the executable, inside Program Files. In that case set the store on the deck as the operator.
+**An update asks only for what is not set.** The folders already in `settings.json` are read first (`highResFolder`, `lowResFolder`, `dataFolder`, and a `captureFolder` set the old way stands for its `high` and `low`). On a machine installed before this change, that means it asks only for the database folder.
+
+`%APPDATA%` here is the elevated account's. If the administrator who runs the installer is not the operator, the folders land in the administrator's profile, and the operator's Emerald falls back to `media` beside the executable, inside Program Files, and to `%APPDATA%\Emerald` for the database. In that case set the folders on the deck as the operator.
 
 What it does:
 
 | Step | Detail |
 |---|---|
 | Checks | Elevated, `Emerald.App.exe` beside it, Emerald not running |
-| Media folder | Suggests the roomiest fixed drive other than the system drive. When a settings file exists it does not ask, and leaves that file and the store alone. Known issue: the script means to read the existing `captureFolder`, but its quoting fails (`installer/install.bat:83`, `installer/edl/install.bat:96`), so the summary and final report show the store as `'`, and a folder named `'` is created in the current directory. Delete that folder and ignore those lines. |
-| Copy | `robocopy` to `%ProgramFiles%\Emerald` with `/e /purge` |
-| Settings | Writes `captureFolder` only if no settings file exists |
+| Folders | Reads what is already set through `settings.ps1 -Read`, lists the drives (`settings.ps1 -Drives`), then asks for the high-res, low-res and database folders not yet set. Creates all three. |
+| Copy | `robocopy` to `%ProgramFiles%\Emerald` with `/e /purge`. `settings.ps1` is not copied. |
+| Settings | Merged by `settings.ps1`: it adds `highResFolder`, `lowResFolder` and `dataFolder` only where they are missing or empty, never overwrites a folder already chosen, touches no other setting, and writes through a temporary file. A `settings.json` it cannot read is left alone, with a warning. If `settings.ps1` is not beside `install.bat`, nothing is saved and it says so. |
 | Shortcuts | Start Menu: Emerald, Emerald EDL, Emerald Ingest, Emerald Monitor. Plus a Desktop shortcut. |
 | Registry | Add/Remove Programs entry under `HKLM` |
 | Firewall | Rule `Emerald monitoring 8787`, inbound TCP. This is added even if remote monitoring is never switched on. |
-| Report | Whether the driver, ffmpeg, ffprobe and store are ready |
+| Report | Whether the driver, ffmpeg, ffprobe and the high-res, low-res and database folders are ready |
 
-`READ-ME-FIRST.txt` travels with the folder. The EDL product has its own set in `installer\edl\`.
+`READ-ME-FIRST.txt` travels with the folder. The EDL product has its own set in `installer\edl\`. `publish.bat` copies `installer\settings.ps1` into both published folders.
+
+**EDL installer.** Asks for the media folder as before, then for the database folder, with the same drive list and the same rule: asked only if `dataFolder` is not set. It merges `captureFolder` and `dataFolder` through `settings.ps1`. Known issue, still open there: its fragment that reads the existing `captureFolder` has the old quoting fault (`installer/edl/install.bat:96`), so on an update the summary shows the media folder as `'`. Because the settings are now merged rather than left alone, a settings file with no `captureFolder` would get `'` written into it. Check `captureFolder` after an EDL update.
 
 ## Configuring a site
 
@@ -146,7 +154,12 @@ Three things are machine-specific, all set in the UI and stored in `settings.jso
 2. **Board and port.** Rescan lists what is present.
 3. **ffmpeg.** Found automatically, or set `ffmpegPath` in `settings.json`.
 
-Also consider the ring folder. `tidalLockRingFolder` defaults to `%LOCALAPPDATA%`, usually the system drive, where tens of gigabytes are written constantly while recording with `keepDelayReady` on. There is no UI field for it found in this review, so it means editing `settings.json`.
+Also consider the ring folder. `tidalLockRingFolder` defaults to `%LOCALAPPDATA%`, usually the system drive, where tens of gigabytes are written constantly while recording with `keepDelayReady` on (roughly 80 to 100 MB/s while a delay is held). There is no UI field for it found in this review, so it means editing `settings.json`. A folder on the same drive as either recording folder is refused and the default used instead (`delay.samedisk`).
+
+And the recording drives. Outside Emerald:
+
+- Exclude the high-res, low-res and database folders from Windows Search indexing and from Defender real-time scanning. Both read files as they are written.
+- Put the low-res folder on a different drive from the high-res one where you can.
 
 Edit `settings.json` only with Emerald closed. The running process holds its own copy, does not re-read these values, and overwrites the file when it next saves.
 
@@ -169,21 +182,25 @@ Stop any recording before closing Emerald. A segment being written has no index 
 ## Uninstalling
 
 ```
-uninstall.bat      remove the program, ask whether to delete settings and logs
+uninstall.bat      remove the program, show the folders, ask about settings, then about the database
 uninstall.bat -q   remove the program, keep everything else, no questions
 ```
 
-Recordings are never touched. Answering `y` removes the whole of `%APPDATA%\Emerald`, which includes `ingest.db` and bookmarks, though the prompt says only settings and logs.
+Recordings are never touched. It shows the high-res, low-res, settings and database folders, then asks two questions:
+
+1. **Delete the settings?** `y` removes the whole of `%APPDATA%\Emerald`, which includes bookmarks, and, when the database folder is the default, the database too, before the second question is asked.
+2. **Delete the database?** Asked only if `emerald.db` is still in the database folder. `y` deletes `emerald.db`, `emerald.db-wal`, `emerald.db-shm`, `ingest.db` and the `peaks` folder there.
 
 ## Where things go
 
 | Item | Location |
 |---|---|
 | Program | `C:\Program Files\Emerald` |
-| Recordings | Chosen at install |
-| Settings, database, bookmarks | `%APPDATA%\Emerald` |
-| Logs | `%APPDATA%\Emerald\logs` by default (`logFolder`). `emerald-*.jsonl` older than `logRetentionDays` (14) are removed at startup. `edl-*.jsonl` are never removed. |
-| Delay rings | `%LOCALAPPDATA%\Emerald\delay` |
+| High-res and low-res recordings | Chosen at install (`highResFolder`, `lowResFolder`); changeable on the capture deck |
+| Settings, bookmarks | `%APPDATA%\Emerald` |
+| Databases and waveform cache | The database folder chosen at install (`dataFolder`), `%APPDATA%\Emerald` by default: `emerald.db` (the log, kept `logRetentionDays`, 14), `ingest.db`, `peaks\` |
+| Old log files | `%APPDATA%\Emerald\logs` (`logFolder`). Nothing new is written there; `.jsonl` files from earlier builds are removed at startup once older than `logRetentionDays`. |
+| Delay rings | `%LOCALAPPDATA%\Emerald\delay`. Never on a recording drive: a ring folder there is passed over for this default. |
 
 **EDL product.** Program in `C:\Program Files\Emerald EDL`, updated from `dist\Emerald-EDL` by its own `update.bat`. It removes only itself. If a full Emerald is also installed, its `uninstall.bat` does not offer to delete settings. Both products share `%APPDATA%\Emerald`, so a board or port changed in one changes in the other.
 

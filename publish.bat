@@ -167,6 +167,9 @@ copy /y "%INSTALLSRC%\install.bat" "%DIST%\install.bat" >nul
 copy /y "%INSTALLSRC%\uninstall.bat" "%DIST%\uninstall.bat" >nul
 copy /y "%INSTALLSRC%\update.bat" "%DIST%\update.bat" >nul
 copy /y "%INSTALLSRC%\READ-ME-FIRST.txt" "%DIST%\READ-ME-FIRST.txt" >nul
+rem The settings helper both installers share: it merges the folders chosen into
+rem settings.json instead of overwriting it.
+copy /y "%~dp0installer\settings.ps1" "%DIST%\settings.ps1" >nul
 
 echo.
 echo ---------------------------------------------------------------------------

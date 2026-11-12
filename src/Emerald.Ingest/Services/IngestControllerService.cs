@@ -71,15 +71,17 @@ public sealed class IngestControllerService : IIngestControllerService
         IClipNameService? clipNames = null,
         ITimecodeCalculationService? timecodes = null,
         Func<IIngestRecorder>? recorderFactory = null,
-        IIngestMediaRegistrar? registrar = null)
+        IIngestMediaRegistrar? registrar = null,
+        PipelineState? pipeline = null)
     {
+        _pipeline = pipeline;
         _settings = settings;
         Clock = clock;
         Hardware = hardware;
         Log = log ?? new IngestLog();
         ClipNames = clipNames ?? new ClipNameService();
         Timecodes = timecodes ?? TimecodeCalculationService.Instance;
-        _store = store ?? new SqliteIngestStore();
+        _store = store ?? new SqliteIngestStore(settings.IngestDatabasePath());
 
         // Mock hardware records through the simulated recorder, real hardware through
         // Emerald.Video. The pairing is decided here rather than at each call site, so there
@@ -93,6 +95,34 @@ public sealed class IngestControllerService : IIngestControllerService
             Clock, recorders, _store,
             registrar ?? new MediaLibraryRegistrar(settings, Log),
             Log, Timecodes);
+
+        // The Monitors' INGEST card. Written on every change to the queue or to a job in it,
+        // so the card follows a booking from scheduled to recording to done.
+        if (_pipeline is not null)
+        {
+            Scheduler.QueueChanged += PublishStage;
+            Scheduler.JobChanged += OnJobChanged;
+        }
+    }
+
+    /// <summary>Where the queue is told to the Monitors. Null in tests and anywhere else that does not ask.</summary>
+    private readonly PipelineState? _pipeline;
+
+    private void OnJobChanged(IngestJob _) => PublishStage();
+
+    private void PublishStage()
+    {
+        if (_pipeline is null) return;
+
+        try
+        {
+            _pipeline.Ingest = IngestStage.Of(Scheduler.Snapshot(), DateTime.Now);
+        }
+        catch (Exception ex)
+        {
+            // A status card is never worth failing a recording over.
+            Log.Write($"The Monitor's ingest card could not be updated: {ex.Message}", IngestLogLevel.Warn);
+        }
     }
 
     public IIngestSchedulerService Scheduler { get; }
@@ -115,6 +145,7 @@ public sealed class IngestControllerService : IIngestControllerService
 
         Recover();
         Scheduler.Start();
+        PublishStage();
     }
 
     /// <summary>
@@ -453,5 +484,17 @@ public sealed class IngestControllerService : IIngestControllerService
 
     private static string Short(IngestJob job) => job.Id.ToString("N")[..8];
 
-    public void Dispose() => Scheduler.Dispose();
+    public void Dispose()
+    {
+        if (_pipeline is not null)
+        {
+            Scheduler.QueueChanged -= PublishStage;
+            Scheduler.JobChanged -= OnJobChanged;
+        }
+
+        Scheduler.Dispose();
+
+        // A closed module's last state would be a card that lies.
+        _pipeline?.ClearIngest();
+    }
 }

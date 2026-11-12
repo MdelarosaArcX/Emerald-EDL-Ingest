@@ -22,10 +22,11 @@ public static class MonitorFeed
     };
 
     /// <summary>What the strip across the top draws: every stage, the delay, and the frame counts.</summary>
-    public static string State(ActivityLog log, PipelineState state, TidalLock tidal, Func<Timecode?> clock)
+    public static string State(ActivityLog log, PipelineState state, TidalLock tidal, Func<Timecode?> clock,
+                               LiveAir? live = null)
     {
         FrameLedger frames = state.Frames;
-        TidalLockState phase = tidal.State;
+        PlantStatus plant = PlantStatus.Read(state, tidal, live ?? LiveAir.Shared);
 
         var payload = new
         {
@@ -35,19 +36,23 @@ public static class MonitorFeed
             dropped = log.Dropped,
             recording = state.Recording,
 
-            capture = Stage(state.Capture),
-            edl = Stage(state.Edl),
-            onAir = Stage(state.OnAir),
-            ingest = Stage(state.Ingest),
+            capture = Stage(plant.Capture),
+            edl = Stage(plant.Edl),
+            onAir = Stage(plant.OnAir),
+            ingest = Stage(plant.Ingest),
 
+            // Whichever transmitter holds the delay: the playback deck's tidal lock or Live
+            // Edit's own. "owner" says which; the card itself is drawn from "stage".
             delay = new
             {
-                phase = phase.ToString(),
-                detail = tidal.Detail,
-                behind = TidalLock.Describe(tidal.Delay),
-                fill = tidal.FillFraction,
-                framesToAir = tidal.FramesToAir,
-                targetFrames = tidal.TargetFrames,
+                phase = plant.Phase,
+                owner = plant.Owner,
+                detail = plant.DelayDetail,
+                behind = TidalLock.Describe(plant.Behind),
+                fill = plant.Fill,
+                framesToAir = plant.FramesToAir,
+                targetFrames = plant.TargetFrames,
+                stage = Stage(plant.Delay),
             },
 
             frames = new
@@ -78,9 +83,10 @@ public static class MonitorFeed
     /// has missed, so a page left open overnight catches up in one request rather than
     /// re-reading the whole ring on every poll.
     /// </summary>
-    public static string Log(ActivityLog log, long since, int limit)
+    public static string Log(ActivityLog log, long since, int limit, LogArea? area = null)
     {
         LogLine[] lines = log.Since(since, Math.Clamp(limit, 1, 2000));
+        if (area is { } only) lines = lines.Where(l => InArea(l, only)).ToArray();
 
         var payload = new
         {
@@ -88,6 +94,7 @@ public static class MonitorFeed
             count = lines.Length,
             lines = lines.Select(l => new
             {
+                area = LogDatabase.AreaOf(l).ToString(),
                 seq = l.Seq,
                 at = l.At,
                 time = l.Time,
@@ -100,6 +107,73 @@ public static class MonitorFeed
                 file = l.FileText,
                 path = l.File,
                 detail = l.Detail,
+            }),
+        };
+
+        return JsonSerializer.Serialize(payload, Json);
+    }
+
+    /// <summary>A line belongs to an area; every warning and error also belongs to Errors.</summary>
+    public static bool InArea(LogLine line, LogArea area) =>
+        area == LogArea.Errors ? line.Level is LogLevel.Warn or LogLevel.Error : LogDatabase.AreaOf(line) == area;
+
+    /// <summary>"capture", "Errors", "liveedit" - an area named in a query, any case; null for all or for nonsense.</summary>
+    public static LogArea? ParseArea(string? text) =>
+        Enum.TryParse(text, ignoreCase: true, out LogArea area) && Enum.IsDefined(area) ? area : null;
+
+    /// <summary>
+    /// A whole day from the database, newest last, at most <paramref name="limit"/> lines (the
+    /// newest of them). For a remote page reading back a day the ring no longer holds.
+    /// </summary>
+    public static string History(ActivityLog log, DateTime day, LogArea? area, int limit)
+    {
+        LogLine[] all = log.ReadDay(day, area);
+        LogLine[] lines = all.Skip(Math.Max(0, all.Length - Math.Clamp(limit, 1, 5000))).ToArray();
+
+        var payload = new
+        {
+            day = day.ToString("yyyy-MM-dd"),
+            total = all.Length,
+            count = lines.Length,
+            lines = lines.Select(l => new
+            {
+                area = LogDatabase.AreaOf(l).ToString(),
+                at = l.At,
+                time = l.Time,
+                timecode = l.Timecode,
+                source = l.SourceText,
+                level = l.Level.ToString(),
+                message = l.Message,
+                @event = l.Event,
+                id = l.Correlation,
+                file = l.FileText,
+                path = l.File,
+            }),
+        };
+
+        return JsonSerializer.Serialize(payload, Json);
+    }
+
+    /// <summary>
+    /// The machine now and over the last ten minutes: processor, memory, graphics and each drive,
+    /// as the Monitor's resource strip draws them.
+    /// </summary>
+    public static string Resources(ResourceSampler sampler)
+    {
+        ResourceSample[] history = sampler.History();
+        ResourceSample? now = history.Length == 0 ? null : history[^1];
+
+        var payload = new
+        {
+            recording = sampler.Session,
+            now,
+            history = history.Select(s => new
+            {
+                at = s.At,
+                cpu = s.CpuPercent,
+                ram = s.RamTotalBytes > 0 ? Math.Round(100.0 * s.RamUsedBytes / s.RamTotalBytes, 1) : 0,
+                gpu = s.GpuPercent,
+                disks = s.Disks.Select(d => new { name = d.Name, active = d.ActivePercent }),
             }),
         };
 

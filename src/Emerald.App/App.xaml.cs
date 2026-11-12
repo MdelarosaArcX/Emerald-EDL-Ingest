@@ -48,13 +48,54 @@ public partial class App : Application
     /// </summary>
     public static AppSettings Settings { get; } = AppSettings.Load();
 
-    /// <summary>Where the tidal lock delay ring is written. Local by default: it needs a fast disk.</summary>
-    public static string TidalLockRingFolder(AppSettings settings) =>
-        string.IsNullOrWhiteSpace(settings.TidalLockRingFolder)
-            ? System.IO.Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Emerald", "delay")
-            : settings.TidalLockRingFolder;
+    /// <summary>
+    /// Where the tidal lock delay ring is written. Local by default: it needs a fast disk.
+    ///
+    /// Never the drive the recordings go to. The ring takes about 100 MB/s of writes while a
+    /// delay is held; on the drive the masters are written to it would leave no room for
+    /// anything else. A ring folder set there is passed over for the default, and said so.
+    /// </summary>
+    public static string TidalLockRingFolder(AppSettings settings)
+    {
+        string fallback = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Emerald", "delay");
+
+        if (string.IsNullOrWhiteSpace(settings.TidalLockRingFolder)) return fallback;
+
+        string chosen = settings.TidalLockRingFolder;
+        Emerald.Video.StorePaths store = Emerald.Media.MediaLibrary.PathsFor(settings);
+
+        bool OnStore(string folder) => SameVolume(folder, store.High) || SameVolume(folder, store.Low);
+
+        if (!OnStore(chosen) || OnStore(fallback)) return chosen;
+
+        if (Interlocked.Exchange(ref _ringWarned, 1) == 0)
+            ActivityLog.Shared.Warn(LogSource.Capture,
+                $"The delay ring folder {chosen} is on the drive recordings go to, so the ring is kept in " +
+                $"{fallback} instead. Choose a folder on another drive for it.",
+                @event: "delay.samedisk");
+
+        return fallback;
+    }
+
+    private static int _ringWarned;
+
+    private static bool SameVolume(string a, string b)
+    {
+        try
+        {
+            return string.Equals(System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(a)),
+                                 System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(b)),
+                                 StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException) { return false; }
+    }
+
+    /// <summary>
+    /// The log database (<c>emerald.db</c> in the data folder), or null when it could not be
+    /// opened anywhere - then the record is memory only and the start-up line says why.
+    /// </summary>
+    public static LogDatabase? Database { get; private set; }
 
     private CancellationTokenSource? _listener;
 
@@ -133,40 +174,76 @@ public partial class App : Application
         MemoryGauges.Register("Media", "probes remembered", () => Emerald.Media.MediaProbe.Remembered, "count");
         MemoryGauges.Register("Media", "codecs remembered", () => Emerald.Media.MediaCodec.Remembered, "count");
         MemoryGauges.Register("Media", "waveforms remembered", () => Emerald.Media.Waveform.Remembered, "count");
+        MemoryGauges.Register("Media", "lengths remembered", () => Emerald.Media.MediaLengths.Remembered, "count");
 
         if (!Settings.MemoryDiagnostics &&
             Environment.GetEnvironmentVariable(MemoryMonitor.EnvironmentSwitch) != "1")
             return;
 
-        string folder = Settings.LogFolderOrDefault;
-        MemoryMonitor.Start(folder, TimeSpan.FromSeconds(10));
+        if (Database is null) return;
+
+        MemoryMonitor.Start(Database, TimeSpan.FromSeconds(10));
 
         ActivityLog.Shared.Info(LogSource.App,
-            $"Memory use is being recorded every 10 s to {folder} (memory-yyyyMMdd.jsonl).",
+            $"Memory use is being recorded every 10 s to {Database.Path} (resource_process).",
             @event: "app.memorylog");
     }
 
     private void StartActivityLog()
     {
         ActivityLog log = ActivityLog.Shared;
-        string folder = Settings.LogFolderOrDefault;
+        string? problem = null;
 
-        int swept = log.Sweep(folder, Settings.LogRetentionDays);
-        log.StartWriting(folder, Settings.LogRetentionDays);
+        // The data folder the installer or the operator chose; if that cannot be opened (a
+        // drive that is not there today), the default one, so the record is not lost with it.
+        Database = OpenDatabase(Settings.DataFolderOrDefault, ref problem);
+        if (Database is null && !string.Equals(Settings.DataFolderOrDefault, AppSettings.DefaultDataFolder,
+                                                StringComparison.OrdinalIgnoreCase))
+            Database = OpenDatabase(AppSettings.DefaultDataFolder, ref problem);
+
+        int swept = ActivityLog.SweepOldFiles(Settings.LogFolderOrDefault, Settings.LogRetentionDays);
+        if (Database is not null) log.StartWriting(Database, Settings.LogRetentionDays);
+
+        ResourceSampler.Shared.Attach(log, Database);
+
+        // Waveforms, once read, are kept beside the database rather than read again from the
+        // recording disk every time Live Edit shows them.
+        Emerald.Media.Waveform.CacheFolder = System.IO.Path.Combine(
+            Database is null ? AppSettings.DefaultDataFolder : System.IO.Path.GetDirectoryName(Database.Path)!, "peaks");
+        _ = Task.Run(() => Emerald.Media.Waveform.SweepCache(Math.Max(30, Settings.LogRetentionDays)));
 
         DispatcherUnhandledException += (_, e) =>
         {
             log.Error(LogSource.App, $"Emerald stopped: {e.Exception.Message}",
                       @event: "app.crashed", detail: e.Exception.ToString());
+
+            // Into the database before the process goes, which it may be about to.
+            log.Flush(TimeSpan.FromSeconds(2));
         };
 
         log.Info(LogSource.App,
-                 $"Emerald started. Recording activity to {folder}, keeping " +
-                 (Settings.LogRetentionDays < 0
-                     ? "everything."
-                     : $"{Settings.LogRetentionDays} day(s).") +
-                 (swept > 0 ? $" {swept} older file(s) swept." : ""),
+                 (Database is null
+                     ? "Emerald started. The log database could not be opened, so the record is in memory only."
+                     : $"Emerald started. Recording activity to {Database.Path}, keeping " +
+                       (Settings.LogRetentionDays < 0 ? "everything." : $"{Settings.LogRetentionDays} day(s).")) +
+                 (swept > 0 ? $" {swept} old log file(s) swept." : ""),
                  @event: "app.started");
+
+        if (problem is not null)
+            log.Warn(LogSource.App, $"The log database: {problem}", @event: "app.databasefailed");
+    }
+
+    private static LogDatabase? OpenDatabase(string folder, ref string? problem)
+    {
+        try
+        {
+            return new LogDatabase(LogDatabase.PathIn(folder));
+        }
+        catch (Exception ex)
+        {
+            problem = (problem is null ? "" : problem + " ") + $"{folder}: {ex.Message}";
+            return null;
+        }
     }
 
     // ------------------------------------------------------------------ windows
@@ -285,6 +362,12 @@ public partial class App : Application
         // module happened to be shut last.
         TimecodeLink.Shutdown();
         MemoryMonitor.Stop();
+        ResourceSampler.Shared.Dispose();
+
+        // What is still queued reaches the database before it closes.
+        ActivityLog.Shared.Flush(TimeSpan.FromSeconds(3));
+        ActivityLog.Shared.Dispose();
+        Database?.Dispose();
 
         _listener?.Cancel();
         _listener?.Dispose();

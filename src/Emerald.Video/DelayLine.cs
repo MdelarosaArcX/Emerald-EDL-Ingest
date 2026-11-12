@@ -100,10 +100,23 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private const int OffRecordingFrame = 24; // long
     private const int FlagAudioReal = 1;
 
-    // What stays in the working set. Seconds behind the writer, or behind the farthest reader
-    // with the margin added, so a reader never walks into pages trimmed just ahead of it.
-    private const int ResidentSeconds = 10;
+    // What stays in the working set: seconds behind the writer. A reader within NearReaderSeconds
+    // of the writer keeps its distance and a margin resident too, so it never walks into pages
+    // trimmed just ahead of it.
+    //
+    // A reader further back - a transmitter a whole delay behind - no longer does. Keeping
+    // everything between it and the writer resident is what put 12.7 GB in Emerald's working set
+    // with a 2-minute delay on air (measured 2026-11-12: 14.3 GB working set, 745 MB of it
+    // Emerald's own). Its frames are written to the file and left in the standby cache instead
+    // (see FlushLoop), where they cost a soft fault to read back and count as available memory,
+    // and the pages it has read are trimmed again behind it.
+    private const int ResidentSeconds = 4;
     private const int ReaderMarginSeconds = 2;
+    private const int NearReaderSeconds = 15;
+
+    // How often the flusher looks, and how much it hands the disk at a time.
+    private const int FlushEveryMs = 250;
+    private const int FlushChunkFrames = 25;
 
     // A reader that has not been heard from for this long no longer holds its pages. Long enough
     // to ride out a stalled transmitter, short enough that a scrub does not hold them for good.
@@ -161,6 +174,11 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private long _dropped;
     private long _dropSaidAt;
     private long _trimmedThrough;
+    private long _readerTrimmedThrough;
+    private long _flushedThrough;
+    private readonly ManualResetEventSlim _stopFlushing = new(false);
+    private readonly Thread _flusher;
+    private readonly IDisposable _dirtyGauge;
     private long _readerDistance;
     private long _readerSeenAt;
     private int _refs = 1;
@@ -186,6 +204,13 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
     /// <summary>Frames before this one have been given back to the operating system. They can still be read.</summary>
     public long TrimmedThrough => Volatile.Read(ref _trimmedThrough);
+
+    /// <summary>
+    /// Frames before this one have been handed to the disk. What lies between this and
+    /// <see cref="FramesWritten"/> is only in memory, and is what the ring costs in RAM beyond its
+    /// few resident seconds.
+    /// </summary>
+    public long FlushedThrough => Volatile.Read(ref _flushedThrough);
 
     /// <summary>Set when a write failed. The line seals itself rather than failing the recording.</summary>
     public string? Fault { get; private set; }
@@ -230,6 +255,18 @@ public sealed class DelayLine : IDelayLine, IDisposable
         // A target rather than a measurement: a reader's cold frames come back in until they are trimmed again.
         _heldGauge = MemoryGauges.Register("Delay", $"ring held in memory, target ({System.IO.Path.GetFileName(path)})",
             () => Math.Min(FramesWritten - TrimmedThrough, slotCount) * stride);
+
+        _dirtyGauge = MemoryGauges.Register("Delay", $"ring not yet on disk ({System.IO.Path.GetFileName(path)})",
+            () => Math.Min(Math.Max(0, FramesWritten - FlushedThrough), slotCount) * stride);
+
+        _flusher = new Thread(FlushLoop)
+        {
+            IsBackground = true,
+            Name = "tidal delay flusher",
+            Priority = ThreadPriority.BelowNormal,
+        };
+
+        _flusher.Start();
 
         // Eight frames of slack between the receiver and the disk - the same depth the
         // recorder allows its encoder, and for the same reason.
@@ -483,8 +520,17 @@ public sealed class DelayLine : IDelayLine, IDisposable
         int rate = Math.Max(1, FrameRate);
         long keep = (long)rate * ResidentSeconds;
 
-        if (Environment.TickCount64 - Volatile.Read(ref _readerSeenAt) <= ReaderLapseMs)
-            keep = Math.Max(keep, Volatile.Read(ref _readerDistance) + (long)rate * ReaderMarginSeconds);
+        bool reading = Environment.TickCount64 - Volatile.Read(ref _readerSeenAt) <= ReaderLapseMs;
+        long distance = Volatile.Read(ref _readerDistance);
+        bool near = distance <= (long)rate * NearReaderSeconds;
+
+        if (reading && near)
+            keep = Math.Max(keep, distance + (long)rate * ReaderMarginSeconds);
+
+        // A reader a long way back faults its frames in from the standby cache as it reads them;
+        // those go out of the working set again a margin behind it.
+        if (reading && !near)
+            TrimReaderWake(written - distance - (long)rate * ReaderMarginSeconds, written);
 
         long target = Math.Max(0, written - keep);
         long from = Math.Max(Volatile.Read(ref _trimmedThrough), written - SlotCount);
@@ -505,6 +551,85 @@ public sealed class DelayLine : IDelayLine, IDisposable
         }
 
         Volatile.Write(ref _trimmedThrough, target);
+    }
+
+    /// <summary>
+    /// Takes the frames a far reader has already read back out of the working set. At most a few
+    /// seconds at a time - the reader moves a second a second - and never anything the ring no
+    /// longer holds.
+    /// </summary>
+    private unsafe void TrimReaderWake(long upTo, long written)
+    {
+        long from = Math.Max(Math.Max(_readerTrimmedThrough, written - SlotCount),
+                             upTo - (long)Math.Max(1, FrameRate) * ResidentSeconds);
+
+        if (upTo > from)
+        {
+            long first = from % SlotCount;
+            long count = upTo - from;
+            long toEnd = Math.Min(count, SlotCount - first);
+
+            VirtualUnlock(_base + FileHeaderBytes + first * _stride, (nuint)(toEnd * _stride));
+
+            if (count > toEnd)
+                VirtualUnlock(_base + FileHeaderBytes, (nuint)((count - toEnd) * _stride));
+        }
+
+        _readerTrimmedThrough = Math.Max(_readerTrimmedThrough, upTo);
+    }
+
+    /// <summary>
+    /// Writes the ring to its file a moment behind the writer, so its pages are clean.
+    ///
+    /// Left to Windows, the dirty pages of a mapped file wait in the modified list until the
+    /// mapped page writer gets round to them, and on a machine with plenty of memory that is a
+    /// long wait: 28 GB of the ring was sitting there, counted as memory in use, while it was
+    /// measured on air. Written straight away they move to the standby cache, which Windows
+    /// counts as available and gives up the moment anything else wants it.
+    ///
+    /// On its own thread, below normal priority: a flush waits for the disk, and the writer has
+    /// only eight frames of slack. Half a second behind the writer, so the slot being written
+    /// is never the one being flushed, and a second at a time so a dispose is never kept waiting.
+    /// </summary>
+    private unsafe void FlushLoop()
+    {
+        int rate = Math.Max(1, FrameRate);
+        long lag = Math.Max(1, rate / 2);
+        bool said = false;
+
+        while (!_stopFlushing.Wait(FlushEveryMs))
+        {
+            while (!_stopFlushing.IsSet && Volatile.Read(ref _disposed) == 0)
+            {
+                long written = Volatile.Read(ref _written);
+                long upTo = written - lag;
+
+                // Never further back than the ring still holds: older frames have been written over.
+                long from = Math.Max(Volatile.Read(ref _flushedThrough), written - SlotCount + lag);
+                if (upTo <= from) break;
+
+                long count = Math.Min(upTo - from, FlushChunkFrames);
+                long first = from % SlotCount;
+                long toEnd = Math.Min(count, SlotCount - first);
+
+                bool ok = FlushViewOfFile(_base + FileHeaderBytes + first * _stride, (nuint)(toEnd * _stride));
+                if (count > toEnd)
+                    ok &= FlushViewOfFile(_base + FileHeaderBytes, (nuint)((count - toEnd) * _stride));
+
+                // Not fatal: Windows writes the pages itself in the end. Worth a line once,
+                // because until it does they stay in memory.
+                if (!ok && !said)
+                {
+                    said = true;
+                    ActivityLog.Shared.Warn(LogSource.TidalLock,
+                        $"The delay ring could not be written ahead to disk (error {Marshal.GetLastWin32Error()}); " +
+                        "Windows will write it in its own time, using more memory meanwhile.",
+                        @event: "delay.flushfailed", file: Path);
+                }
+
+                Volatile.Write(ref _flushedThrough, from + count);
+            }
+        }
     }
 
     /// <summary>
@@ -777,6 +902,12 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
         _gauge.Dispose();
         _heldGauge.Dispose();
+        _dirtyGauge.Dispose();
+
+        // The flusher works on the mapping, so it stops first. A chunk is a second of frames;
+        // this waits for the one in hand and no more.
+        _stopFlushing.Set();
+        if (_flusher.IsAlive) _flusher.Join(TimeSpan.FromSeconds(10));
 
         // Let the writer finish what it has in hand before the mapping goes away underneath it.
         try { _queue?.CompleteAdding(); } catch (ObjectDisposedException) { }
@@ -816,4 +947,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
     // On a range that was never locked, this takes the pages out of the working set.
     [DllImport("kernel32.dll")]
     private static extern unsafe bool VirtualUnlock(void* address, nuint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern unsafe bool FlushViewOfFile(void* address, nuint size);
 }

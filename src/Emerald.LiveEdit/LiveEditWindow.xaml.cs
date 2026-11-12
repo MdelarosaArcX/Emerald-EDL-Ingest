@@ -425,10 +425,10 @@ public partial class LiveEditWindow : Window
 
     private StoreIndex Store()
     {
-        string folder = MediaLibrary.FolderFor(_settings);
+        StorePaths paths = MediaLibrary.PathsFor(_settings);
 
-        if (_store is null || !string.Equals(_store.Root, folder, StringComparison.OrdinalIgnoreCase))
-            _store = new StoreIndex(folder, MediaProbe.LocateFfprobe(Ffmpeg.Locate(_settings.FfmpegPath)));
+        if (_store is null || _store.Paths != paths)
+            _store = new StoreIndex(paths, MediaProbe.LocateFfprobe(Ffmpeg.Locate(_settings.FfmpegPath)));
 
         return _store;
     }
@@ -592,15 +592,23 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private bool FollowCaptureFolder()
     {
-        if (AppSettings.SavedCaptureFolder() is not { } saved || saved == _settings.CaptureFolder) return false;
+        if (AppSettings.SavedStoreFolders() is not { } saved ||
+            (saved.Capture == _settings.CaptureFolder && saved.High == _settings.HighResFolder &&
+             saved.Low == _settings.LowResFolder))
+            return false;
 
-        string was = MediaLibrary.FolderFor(_settings);
+        StorePaths was = MediaLibrary.PathsFor(_settings);
 
-        _settings.CaptureFolder = saved;
+        _settings.CaptureFolder = saved.Capture;
+        _settings.HighResFolder = saved.High;
+        _settings.LowResFolder = saved.Low;
+
+        StorePaths now = MediaLibrary.PathsFor(_settings);
+        if (now == was) return false;
 
         ActivityLog.Shared.Info(LogSource.App,
-            $"Live Edit now reads capture media from {MediaLibrary.FolderFor(_settings)} " +
-            $"(was {was}), the capture recording's output path.",
+            $"Live Edit now reads capture media from {now.Low} and masters from {now.High} " +
+            $"(was {was.Low} and {was.High}), the capture deck's folders.",
             @event: "liveedit.capturefolder");
 
         return true;
@@ -691,7 +699,7 @@ public partial class LiveEditWindow : Window
         _listing = true;
 
         StoreIndex store = Store();
-        string folder = store.Root;
+        string folder = store.Paths.Root ?? store.Paths.Low;
 
         if (!onlyIfChanged) StoreText.Text = $"reading {folder}...";
 
@@ -4662,8 +4670,8 @@ public partial class LiveEditWindow : Window
     /// </summary>
     private void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
-        string store = MediaLibrary.FolderFor(_settings);
-        string folder = _showingIngest ? RangeExport.FolderFor(store) : store;
+        StorePaths store = MediaLibrary.PathsFor(_settings);
+        string folder = _showingIngest ? store.Exports : store.Root ?? store.Low;
 
         try
         {
@@ -4698,8 +4706,8 @@ public partial class LiveEditWindow : Window
         if (_listingIngest) return;
         _listingIngest = true;
 
-        string store = MediaLibrary.FolderFor(_settings);
-        string folder = RangeExport.FolderFor(store);
+        StorePaths store = MediaLibrary.PathsFor(_settings);
+        string folder = store.Exports;
         string? ffprobe = MediaProbe.LocateFfprobe(Ffmpeg.Locate(_settings.FfmpegPath));
         int rate = _rate;
 
@@ -4931,7 +4939,7 @@ public partial class LiveEditWindow : Window
             extension,
             new Timecode(inFrame, _rate), new Timecode(outFrame, _rate),
             _rate, waitFor is null ? parts : new[] { new RangePart("the master being recorded", 0, outFrame - inFrame) },
-            MediaLibrary.FolderFor(_settings))
+            MediaLibrary.PathsFor(_settings))
         {
             Owner = this,
         };
@@ -5013,7 +5021,7 @@ public partial class LiveEditWindow : Window
             return;
         }
 
-        string store = MediaLibrary.FolderFor(_settings);
+        StorePaths store = MediaLibrary.PathsFor(_settings);
         int rate = _rate;
 
         ActivityLog.Shared.Info(LogSource.App,

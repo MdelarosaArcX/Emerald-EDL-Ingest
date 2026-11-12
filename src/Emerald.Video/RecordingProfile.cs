@@ -291,6 +291,9 @@ public sealed record RecordingProfile(
     public static string FolderFor(RecordingOutput output, string root) =>
         Path.Combine(root, output.Folder);
 
+    /// <summary>Where an output's files land with the high-res and low-res folders chosen apart.</summary>
+    public static string FolderFor(RecordingOutput output, StorePaths store) => store.For(output);
+
     /// <summary>The folders a recording writes into, both of which must exist first.</summary>
     public static IEnumerable<string> FoldersFor(string root) =>
         Outputs.Select(o => FolderFor(o, root));
@@ -339,8 +342,12 @@ public sealed record RecordingProfile(
                                                 bool singleFile = false, string? startTimecode = null,
                                                 IReadOnlyList<CaptureAudioTrack>? extraAudio = null,
                                                 int embeddedPairs = 1,
-                                                RecordingNames? names = null)
+                                                RecordingNames? names = null,
+                                                StorePaths? store = null)
     {
+        // Where each output goes: the folders given, or high\ and low\ under the one folder.
+        StorePaths paths = store ?? StorePaths.Under(folder);
+
         // The receiver's audio arrives on one pipe carrying every channel it had. One pair is
         // the ordinary case and is left exactly as it always was, straight through as stereo.
         // More than one has to be split, because a feed carrying four languages on four pairs
@@ -536,7 +543,7 @@ public sealed record RecordingProfile(
                 // already on disk. The ingest checks for the file before it ever gets here,
                 // and this is the backstop for the race between that check and the encoder.
                 args.Add("-f"); args.Add(output.Muxer);
-                args.Add(Path.Combine(FolderFor(output, folder), $"{namePrefix}.{output.Extension}"));
+                args.Add(Path.Combine(paths.For(output), $"{namePrefix}.{output.Extension}"));
             }
             else
             {
@@ -555,7 +562,7 @@ public sealed record RecordingProfile(
                     // in the folder instead, which is where it belongs anyway.
                     args.Add("-segment_start_number"); args.Add(naming.Start.ToString());
 
-                    args.Add(Path.Combine(FolderFor(output, folder), naming.Folder,
+                    args.Add(Path.Combine(paths.For(output), naming.Folder,
                                           naming.PatternFor(output.Extension)));
                 }
                 else
@@ -563,7 +570,7 @@ public sealed record RecordingProfile(
                     // The scheme recordings were written under before folders and numbers. Kept
                     // so an old caller, and the tests that pin the old command, still work.
                     args.Add("-strftime"); args.Add("1");
-                    args.Add(Path.Combine(FolderFor(output, folder),
+                    args.Add(Path.Combine(paths.For(output),
                                           $"{namePrefix}_%Y-%m-%d_%H-%M-%S.{output.Extension}"));
                 }
             }

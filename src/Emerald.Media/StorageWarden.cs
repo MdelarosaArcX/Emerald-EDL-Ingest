@@ -64,28 +64,93 @@ public static class StorageWarden
     public const int AlwaysKeep = 3;
 
     /// <summary>Total bytes of both halves of the store.</summary>
-    public static long Size(string root) =>
-        Half(root, RecordingProfile.LowRes) + Half(root, RecordingProfile.HighRes);
+    public static long Size(string root)
+    {
+        (long high, long low) = Size(StorePaths.Under(root));
+        return high + low;
+    }
 
-    private static long Half(string root, RecordingOutput output)
+    /// <summary>Bytes in the high-res folder and in the low-res folder.</summary>
+    public static (long High, long Low) Size(StorePaths paths) =>
+        (Bytes(paths.High, except: paths.Exports), Bytes(paths.Low, except: paths.Exports));
+
+    /// <summary>
+    /// Every file's size, from the directory listing itself. Asking each file again for its length
+    /// was a second trip to the disk per file, every ten seconds, while the recorder wrote to it.
+    /// </summary>
+    /// <param name="except">
+    /// Not counted: exports and snapshots, which sit inside the high-res folder when the two
+    /// folders are apart. The warden never deletes them, so counting them would only make it
+    /// delete more masters to make up.
+    /// </param>
+    private static long Bytes(string folder, string? except = null)
     {
         try
         {
-            string folder = RecordingProfile.FolderFor(output, root);
             if (!Directory.Exists(folder)) return 0;
 
-            long total = 0;
+            string? skip = except is null ? null
+                : Path.GetFullPath(except).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
 
-            foreach (string path in Directory.EnumerateFiles(folder, "*", SearchOption.AllDirectories))
+            long total = 0;
+            foreach (FileInfo file in new DirectoryInfo(folder).EnumerateFiles("*", SearchOption.AllDirectories))
             {
-                try { total += new FileInfo(path).Length; }
-                catch (IOException) { }
+                if (skip is not null && file.FullName.StartsWith(skip, StringComparison.OrdinalIgnoreCase)) continue;
+                total += file.Length;
             }
 
             return total;
         }
         catch (IOException) { return 0; }
         catch (UnauthorizedAccessException) { return 0; }
+    }
+
+    /// <summary>
+    /// Keeps each folder under its own limit, with the high-res and low-res folders chosen apart.
+    ///
+    /// Past the high-res limit the oldest master goes with the proxies it holds, as a pair always
+    /// has. Past the low-res limit only proxies go, oldest first: their masters stay until the
+    /// high-res limit takes them, and can still be exported from the folder. A limit of zero or
+    /// less is no limit. The newest <see cref="AlwaysKeep"/> groups are never touched by either.
+    /// </summary>
+    public static (StorageSweep High, StorageSweep Low) Enforce(StorePaths paths, long highLimitBytes,
+                                                                long lowLimitBytes, DateTime now)
+    {
+        (long highBefore, long lowBefore) = Size(paths);
+        long high = highBefore, low = lowBefore;
+        int highDeleted = 0, lowDeleted = 0;
+
+        bool highOver = highLimitBytes > 0 && high > highLimitBytes;
+        bool lowOver = lowLimitBytes > 0 && low > lowLimitBytes;
+
+        if (highOver || lowOver)
+        {
+            List<Segment> segments = Oldest(paths, now);
+            int deletable = Math.Max(0, segments.Count - AlwaysKeep);
+
+            for (int i = 0; i < deletable && highLimitBytes > 0 && high > highLimitBytes; i++)
+            {
+                (long fromHigh, long fromLow) = segments[i].Delete(paths.High);
+                if (fromHigh + fromLow == 0) continue;
+
+                high -= fromHigh;
+                low -= fromLow;
+                highDeleted++;
+            }
+
+            for (int i = 0; i < deletable && lowLimitBytes > 0 && low > lowLimitBytes; i++)
+            {
+                (long fromHigh, long fromLow) = segments[i].Delete(paths.High, onlyUnder: paths.Low);
+                if (fromLow == 0) continue;
+
+                low -= fromLow;
+                high -= fromHigh;
+                lowDeleted++;
+            }
+        }
+
+        return (new StorageSweep(highDeleted, highBefore - high, highBefore, high, highLimitBytes),
+                new StorageSweep(lowDeleted, lowBefore - low, lowBefore, low, lowLimitBytes));
     }
 
     /// <summary>
@@ -103,7 +168,7 @@ public static class StorageWarden
         if (limitBytes <= 0 || before <= limitBytes)
             return new StorageSweep(0, 0, before, before, limitBytes);
 
-        List<Segment> segments = Oldest(root, now);
+        List<Segment> segments = Oldest(StorePaths.Under(root), now);
 
         long freed = 0;
         int deleted = 0;
@@ -137,13 +202,13 @@ public static class StorageWarden
     /// were last written, which put a master with whichever single proxy happened to close in the
     /// same second and left the rest to go on their own, ahead of the master that held them.
     /// </summary>
-    private static List<Segment> Oldest(string root, DateTime now)
+    private static List<Segment> Oldest(StorePaths paths, DateTime now)
     {
-        var all = new List<Segment>(Loose(root));
+        var all = new List<Segment>(Loose(paths));
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        string low = RecordingProfile.FolderFor(RecordingProfile.LowRes, root);
-        string high = RecordingProfile.FolderFor(RecordingProfile.HighRes, root);
+        string low = paths.Low;
+        string high = paths.High;
 
         foreach (string name in RecordingFolders(low).Union(RecordingFolders(high), StringComparer.OrdinalIgnoreCase))
         {
@@ -180,9 +245,7 @@ public static class StorageWarden
         }
 
         // What was read of files that are gone is no use to anybody.
-        lock (Lengths)
-            foreach (string gone in Lengths.Keys.Where(k => !seen.Contains(k)).ToList())
-                Lengths.Remove(gone);
+        MediaLengths.KeepOnly(seen);
 
         return all.Where(s => s.Written + TooRecent < now).OrderBy(s => s.Written).ToList();
     }
@@ -190,12 +253,6 @@ public static class StorageWarden
     /// <summary>One file of a recording folder, placed on the clock.</summary>
     private sealed record Piece(string Path, long Bytes, DateTime Written, DateTime Starts, TimeSpan? Runs);
 
-    /// <summary>
-    /// The picture lengths read so far, so a sweep reads only a file it has not seen. A sweep runs
-    /// every time a segment closes, over a store of tens of thousands of files.
-    /// </summary>
-    private static readonly Dictionary<string, (long Bytes, long Ticks, TimeSpan? Runs)> Lengths =
-        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>A recording folder's files in numbered order, each placed end to end on its own length.</summary>
     private static List<Piece> Pieces(string directory, DateTime rolled, HashSet<string> seen)
@@ -226,20 +283,11 @@ public static class StorageWarden
                     .ToList();
     }
 
-    private static TimeSpan? LengthOf(FileInfo file)
-    {
-        lock (Lengths)
-            if (Lengths.TryGetValue(file.FullName, out var known) &&
-                known.Bytes == file.Length && known.Ticks == file.LastWriteTimeUtc.Ticks)
-                return known.Runs;
-
-        // The picture's length, as the timeline lays segments end to end by (see MediaInfo.Runs).
-        TimeSpan? runs = MediaCodec.ReadPictureDuration(file.FullName) ?? MediaCodec.ReadDuration(file.FullName);
-        if (runs is { } r && r <= TimeSpan.Zero) runs = null;
-
-        lock (Lengths) Lengths[file.FullName] = (file.Length, file.LastWriteTimeUtc.Ticks, runs);
-        return runs;
-    }
+    /// <summary>
+    /// The picture's length, read once per file for the whole application (see <see cref="MediaLengths"/>):
+    /// a sweep runs every ten seconds over a store of thousands of files, and Live Edit reads the same lengths.
+    /// </summary>
+    private static TimeSpan? LengthOf(FileInfo file) => MediaLengths.Picture(file);
 
     private static IEnumerable<string> RecordingFolders(string directory)
     {
@@ -264,12 +312,12 @@ public static class StorageWarden
     /// <see cref="MediaLibrary"/> does: ffmpeg stamps each output when that muxer opens it, so
     /// the two halves of one recording routinely differ by a second.
     /// </summary>
-    private static IEnumerable<Segment> Loose(string root)
+    private static IEnumerable<Segment> Loose(StorePaths paths)
     {
         var byTime = new SortedDictionary<DateTime, Segment>();
 
-        Gather(RecordingProfile.FolderFor(RecordingProfile.LowRes, root));
-        Gather(RecordingProfile.FolderFor(RecordingProfile.HighRes, root));
+        Gather(paths.Low);
+        Gather(paths.High);
 
         return byTime.Values;
 
@@ -333,11 +381,22 @@ public static class StorageWarden
         /// <summary>Deletes every file of it and returns what was actually freed.</summary>
         public long Delete()
         {
-            long freed = 0;
+            (long a, long b) = Delete(highFolder: null);
+            return a + b;
+        }
+
+        /// <summary>
+        /// Deletes its files - all of them, or only those under <paramref name="onlyUnder"/> - and
+        /// returns what was freed from the high-res folder and from everywhere else.
+        /// </summary>
+        public (long High, long Other) Delete(string? highFolder, string? onlyUnder = null)
+        {
+            long freedHigh = 0, freedOther = 0;
 
             // Oldest first within each folder, so the ledger, which keeps only the last one
             // deleted, moves forward through them.
             var files = _files
+                .Where(f => onlyUnder is null || IsUnder(f.Path, onlyUnder))
                 .OrderBy(f => Path.GetDirectoryName(f.Path), StringComparer.OrdinalIgnoreCase)
                 .ThenBy(f => RecordingSequence.NumberIn(Path.GetFileName(f.Path)) ?? 0)
                 .ToList();
@@ -352,7 +411,8 @@ public static class StorageWarden
                 try
                 {
                     File.Delete(path);
-                    freed += bytes;
+                    if (highFolder is not null && IsUnder(path, highFolder)) freedHigh += bytes;
+                    else freedOther += bytes;
 
                     if (length is { } ran && ran > TimeSpan.Zero &&
                         Path.GetDirectoryName(path) is { } folder &&
@@ -368,7 +428,14 @@ public static class StorageWarden
                 catch (UnauthorizedAccessException) { }
             }
 
-            return freed;
+            _files.RemoveAll(f => !File.Exists(f.Path));
+            return (freedHigh, freedOther);
+        }
+
+        private static bool IsUnder(string path, string folder)
+        {
+            string full = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return Path.GetFullPath(path).StartsWith(full, StringComparison.OrdinalIgnoreCase);
         }
     }
 }

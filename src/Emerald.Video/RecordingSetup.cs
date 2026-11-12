@@ -69,12 +69,21 @@ public sealed record CaptureRequest(
     /// and has to be read from and written back to the settings — which the recorder has no
     /// business touching.
     /// </summary>
-    RecordingNames? Names = null)
+    RecordingNames? Names = null,
+
+    /// <summary>
+    /// The high-res and low-res folders when they were chosen apart; null for high\ and low\
+    /// under <see cref="Folder"/>, as every recording was before.
+    /// </summary>
+    StorePaths? Store = null)
 {
+    /// <summary>Where the masters and the proxies go.</summary>
+    public StorePaths Paths => Store ?? StorePaths.Under(Folder);
+
     /// <summary>The files this request will write, proxy first — the order ffmpeg is given them in.</summary>
     public IReadOnlyList<string> OutputPaths => SingleFile
         ? RecordingProfile.Outputs
-            .Select(o => Path.Combine(RecordingProfile.FolderFor(o, Folder), $"{NamePrefix}.{o.Extension}"))
+            .Select(o => Path.Combine(Paths.For(o), $"{NamePrefix}.{o.Extension}"))
             .ToList()
         : Array.Empty<string>();
 }
@@ -103,9 +112,14 @@ public static class RecordingSetup
         bool singleFile = false,
         string? startTimecode = null,
         IReadOnlyList<CaptureAudioTrack>? extraAudio = null,
-        int? audioPairs = null)
+        int? audioPairs = null,
+        StorePaths? store = null)
     {
         request = null;
+
+        // Chosen apart, the folder stands for the store in messages and names the place
+        // snapshots and exports go; the recording itself goes to the two folders.
+        if (store is not null) folder = store.Root ?? store.High;
         folder = folder.Trim();
 
         if (folder.Length == 0)
@@ -150,7 +164,7 @@ public static class RecordingSetup
         // Both files are written under the folder the operator chose, one per output.
         try
         {
-            foreach (string output in RecordingProfile.FoldersFor(folder)) Directory.CreateDirectory(output);
+            foreach (string output in (store ?? StorePaths.Under(folder)).All) Directory.CreateDirectory(output);
         }
         catch (Exception ex)
         {
@@ -173,7 +187,8 @@ public static class RecordingSetup
             SingleFile: singleFile,
             StartTimecode: startTimecode,
             ExtraAudio: extraAudio,
-            AudioPairs: audioPairs);
+            AudioPairs: audioPairs,
+            Store: store);
 
         problem = null;
         return true;

@@ -37,7 +37,8 @@ graph TD
     FF --> Store["Media store: low and high"]
     Lib --> FF
     Lib --> Store
-    Shared --> Cfg["settings.json and logs"]
+    Shared --> Cfg["settings.json"]
+    Shared --> LogDb["emerald.db: log, recordings, resource samples"]
     Engines --> DB["ingest.db"]
 ```
 
@@ -79,7 +80,7 @@ flowchart TD
     E1 -- "Yes" --> E2["Shutdown 0"]
     E1 -- "No" --> F
     D -- "Yes" --> F["DelayLine.SweepOrphans deletes rings of dead processes"]
-    F --> G["StartActivityLog: sweep, start writer, log app.started"]
+    F --> G["StartActivityLog: open emerald.db, sweep old .jsonl files, start writer and resource sampler, log app.started"]
     G --> H["Software rendering if configured"]
     H --> I["StartListening: pipe server task"]
     I --> J["OpenModule mode"]
@@ -170,11 +171,12 @@ Marshalling is by convention, not enforced. Every event handler that touches a c
 | Object | Holds | Written by | Read by |
 |---|---|---|---|
 | `App.Settings` | Settings instance for most windows | Windows | Windows. `LiveEditWindow` loads its own copy (see the assessment). |
-| `ActivityLog.Shared` | Log ring | Everything | Monitor, deck panels, server |
+| `ActivityLog.Shared` | Log ring, and the queue to `emerald.db` | Everything | Monitor, deck panels, server |
+| `ResourceSampler.Shared` | Last 10 minutes of CPU, RAM, GPU and disk samples | Its own thread | Monitor, server |
 | `TimecodeLink.Service` | Station clock | HTTP poll | All decks |
 | `TidalLock.Shared` | Tidal state | Shell, Playback | Shell, Playback, Monitor, Live Edit, server |
 | `LiveAir.Shared` | Live Edit state, cues, levels, position | Shell, Live Edit, transmitter | Same |
-| `PipelineState.Shared` | Stage status, frame ledgers, on-air time | Shell, EDL, `SdiCapture`, `DelayTransmitter` | Monitor, Playback, Live Edit, server |
+| `PipelineState.Shared` | Stage status, frame ledgers, on-air time | Shell, EDL, Ingest controller, `SdiCapture`, `DelayTransmitter` | Monitor, Playback, Live Edit, server (the Monitors through `PlantStatus`, with `TidalLock` and `LiveAir`) |
 | `SdiPorts.Shared` | Advisory TX ownership | Engines | Playback, `GoLiveDialog` |
 | `RecordingPicture.Shared` | Newest preview frame, ready ring | Shell | Live Edit |
 | `DropMarks.Shared` | Frame-loss moments | `SdiCapture`, `DelayTransmitter` | Live Edit |
@@ -243,7 +245,9 @@ stateDiagram-v2
 |---|---|---|---|
 | UI dispatcher (shared by all windows) | Normal | WPF | Exit |
 | Pipe listener task | Pool | `App.StartListening` | `OnExit` cancels |
-| `activity log` writer | BelowNormal | `ActivityLog.StartWriting` | Never explicitly; ends with the process |
+| `activity log` writer | BelowNormal | `ActivityLog.StartWriting` | `App.OnExit` flushes it (3 s) and disposes it, which drains the queue (5 s join) |
+| `resource sampler`, once a second | BelowNormal | `ResourceSampler` when a Monitor, the remote server or a recording wants it | Ends when nothing wants it; `App.OnExit` disposes it |
+| `memory monitor`, every 10 s | BelowNormal | `MemoryMonitor.Start`, only when switched on and the database opened | `MemoryMonitor.Stop` at exit |
 | `SDI capture` | Normal | `SdiCapture.Start` | `Stop`: 2 s join, close pipes, 6 s join |
 | `capture video writer`, `capture audio writer` | Normal | `Encoder` | `Drain`, `Finish` |
 | `RX preview` | Normal | `RxPreview.Launch` | `StopWorker`, 3 s join |
@@ -257,7 +261,7 @@ stateDiagram-v2
 | `MonitorServer` accept loop and one task per connection | Pool | `TryStart` | `Stop` |
 | Short pool tasks: ring release, warden, segment poll (shell); transmitter release (playback, Live Edit); media listing, export, waveform (Live Edit); next-day encoder open and old encoder finish (`SdiCapture`); cue pre-roll (`LiveAirTransmitter`); held picture (`HeldPicture`); spent-source disposal (`PlayoutService`) | Pool | As listed | Not tracked. Most are not cancellable. |
 
-Timers: the shell runs `_clock` at 25 ms, `_tick` at 500 ms and `_cue` at 400 ms. Playback runs `_clock` at 25 ms. Monitor runs `_drain` at 25 ms and `_strip` at 200 ms. EDL runs a 25 ms timer. Ingest runs `_uiTimer` at 25 ms. Live Edit runs `_tick` at one frame, `_watch` at 2 s and `_monitorTick` at 250 ms. `LiveLogWindow` runs `_timer` at 500 ms.
+Timers: the shell runs `_clock` at 25 ms, `_tick` at 500 ms and `_cue` at 400 ms. Playback runs `_clock` at 25 ms. Monitor runs `_drain` at 25 ms, `_strip` at 200 ms and `_resources` at 1 s. EDL runs a 25 ms timer. Ingest runs `_uiTimer` at 25 ms. Live Edit runs `_tick` at one frame, `_watch` at 2 s and `_monitorTick` at 250 ms. `LiveLogWindow` runs `_timer` at 500 ms.
 
 ## 10. Error handling and recovery
 

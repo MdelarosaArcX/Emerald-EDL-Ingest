@@ -56,10 +56,10 @@ public sealed record TransmittedRow(
 public partial class MonitorWindow : Window
 {
     /// <summary>
-    /// Rows held on screen. Larger than the log's own ring is pointless; smaller would throw
-    /// away lines the operator can still see in the file.
+    /// Rows held on screen: the newest of a day read back from the database, then live lines.
+    /// The list virtualizes, so this many costs memory and not drawing.
     /// </summary>
-    private const int MaxRows = ActivityLog.RingSize;
+    private const int MaxRows = 20_000;
 
     private readonly AppSettings _settings;
     private readonly ObservableCollection<MonitorRow> _rows = new();
@@ -83,8 +83,22 @@ public partial class MonitorWindow : Window
     private bool _following = true;
 
     // Filters, read on every row rather than re-queried from the controls.
-    private LogSource? _source;
+    private LogArea? _area;
+    /// <summary>The day picked, or default for today live.</summary>
+    private DateTime _day;
     private LogLevel _minimum = LogLevel.Info;
+
+    /// <summary>
+    /// Live lines at or below this sequence are already on screen from the database, or are
+    /// still being read from it (long.MaxValue). Only lines after it are added as they arrive.
+    /// </summary>
+    private long _shownThrough = long.MaxValue;
+    private int _rebuild;
+
+    private IDisposable? _sampling;
+
+    private readonly DispatcherTimer _resources =
+        new(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(1) };
     private string _search = "";
     private string _id = "";
 
@@ -102,15 +116,28 @@ public partial class MonitorWindow : Window
         grouped.GroupDescriptions.Add(new System.Windows.Data.PropertyGroupDescription(nameof(TransmittedRow.Group)));
         TransmittedList.ItemsSource = grouped.View;
 
-        SourceCombo.ItemsSource = new object[] { "All" }
-            .Concat(Enum.GetValues<LogSource>().Cast<object>()).ToList();
-        SourceCombo.SelectedIndex = 0;
+        AreaCombo.ItemsSource = new[] { new Choice<LogArea?>("All", null) }
+            .Concat(new[] { LogArea.Errors }.Concat(LogDatabase.Areas)
+                .Select(a => new Choice<LogArea?>(AreaName(a), a)))
+            .ToList();
+        AreaCombo.SelectedIndex = 0;
+
+        // As far back as the database keeps.
+        int keep = _settings.LogRetentionDays < 0 ? 60 : Math.Max(0, _settings.LogRetentionDays);
+        DayCombo.ItemsSource = Enumerable.Range(0, keep + 1)
+            .Select(d => DateTime.Today.AddDays(-d))
+            .Select(d => new Choice<DateTime>(
+                d == DateTime.Today ? "Today (live)" : d == DateTime.Today.AddDays(-1) ? "Yesterday" : d.ToString("ddd d MMM"),
+                d == DateTime.Today ? default : d))
+            .ToList();
+        DayCombo.SelectedIndex = 0;
 
         LevelCombo.ItemsSource = Enum.GetValues<LogLevel>();
         LevelCombo.SelectedIndex = 0;
 
         _drain.Tick += (_, _) => DrainAndDraw();
         _strip.Tick += (_, _) => DrawStrip();
+        _resources.Tick += (_, _) => DrawResources();
 
         Loaded += Window_Loaded;
         Closing += Window_Closing;
@@ -120,13 +147,13 @@ public partial class MonitorWindow : Window
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
     {
-        FolderText.Text = ActivityLog.Shared.Folder is { } folder
-            ? $"writing to {folder}"
+        FolderText.Text = ActivityLog.Shared.Database is { } db
+            ? $"database {db.Path}"
             : "not being written to disk";
 
-        // The whole of today off the disk, then everything still in memory. Opening this half
-        // an hour into a session must not show a blank page, and opening it at four must not
-        // claim nothing aired this morning.
+        // The whole of today from the database, then live. Opening this half an hour into a
+        // session must not show a blank page, and opening it at four must not claim nothing
+        // aired this morning.
         LoadToday();
 
         foreach (LogLine line in ActivityLog.Shared.Snapshot()) _incoming.Enqueue(line);
@@ -134,12 +161,18 @@ public partial class MonitorWindow : Window
         ActivityLog.Shared.Line += OnLine;
         PipelineState.Shared.Changed += OnPipelineChanged;
         TidalLock.Shared.Changed += OnTidalLockChanged;
+        LiveAir.Shared.Changed += OnLiveAirChanged;
 
+        Rebuild();
         DrainAndDraw();
         DrawStrip();
 
+        _sampling = ResourceSampler.Shared.Watch();
+        DrawResources();
+
         _drain.Start();
         _strip.Start();
+        _resources.Start();
 
         // On if it was left on. The toggle raises the handler, which does the starting.
         if (_settings.MonitorApi) RemoteToggle.IsChecked = true;
@@ -150,6 +183,10 @@ public partial class MonitorWindow : Window
     {
         _drain.Stop();
         _strip.Stop();
+        _resources.Stop();
+
+        _sampling?.Dispose();
+        _sampling = null;
 
         // All three are on objects that outlive this window. Without these it is held for the
         // life of the application, and every line written after it closes still runs its
@@ -157,6 +194,7 @@ public partial class MonitorWindow : Window
         ActivityLog.Shared.Line -= OnLine;
         PipelineState.Shared.Changed -= OnPipelineChanged;
         TidalLock.Shared.Changed -= OnTidalLockChanged;
+        LiveAir.Shared.Changed -= OnLiveAirChanged;
 
         // The port goes with the window. The setting remembers it was on, so it comes back.
         _remote?.Dispose();
@@ -179,6 +217,9 @@ public partial class MonitorWindow : Window
             _tally.Add(line);
             _tallyDirty = true;
 
+            // An earlier day is what the database holds; nothing arriving now belongs in it.
+            // And a line already read back from the database is not shown twice.
+            if (!Live || line.At.Date != DateTime.Today || line.Seq <= _shownThrough) continue;
             if (!Matches(line)) continue;
 
             _rows.Add(ToRow(line));
@@ -245,11 +286,11 @@ public partial class MonitorWindow : Window
     /// </summary>
     private void LoadToday()
     {
-        if (ActivityLog.Shared.Folder is not { } folder) return;
+        if (ActivityLog.Shared.Database is null) return;
 
         try
         {
-            foreach (LogLine line in ActivityLog.ReadDay(folder, DateTime.Today)) _tally.Add(line);
+            foreach (LogLine line in ActivityLog.Shared.ReadDay(DateTime.Today)) _tally.Add(line);
         }
         catch (Exception ex)
         {
@@ -342,7 +383,10 @@ public partial class MonitorWindow : Window
     private bool Matches(LogLine line)
     {
         if (line.Level < _minimum) return false;
-        if (_source is { } source && line.Source != source) return false;
+
+        if (_area is { } area &&
+            (area == LogArea.Errors ? line.Level < LogLevel.Warn : LogDatabase.AreaOf(line) != area))
+            return false;
 
         if (_id.Length > 0 &&
             (line.Correlation is null ||
@@ -363,7 +407,8 @@ public partial class MonitorWindow : Window
     {
         if (!IsLoaded) return;
 
-        _source = SourceCombo.SelectedItem as LogSource?;
+        _area = (AreaCombo.SelectedItem as Choice<LogArea?>)?.Value;
+        _day = (DayCombo.SelectedItem as Choice<DateTime>)?.Value ?? default;
         _minimum = LevelCombo.SelectedItem is LogLevel level ? level : LogLevel.Info;
         _search = SearchBox.Text.Trim();
         _id = IdBox.Text.Trim();
@@ -371,30 +416,99 @@ public partial class MonitorWindow : Window
         Rebuild();
     }
 
+    /// <summary>"Today (live)" is whatever today is, so a page left open past midnight carries on live.</summary>
+    private bool Live => _day == default;
+
+    private DateTime ShownDay => Live ? DateTime.Today : _day;
+
+    // The day last read from the database, kept so that typing in the search box filters it in
+    // memory rather than reading the whole day again on every key.
+    private (DateTime Day, LogArea? Area)? _cacheKey;
+    private LogLine[] _cache = Array.Empty<LogLine>();
+    private long _cacheThrough;
+
     /// <summary>
-    /// Re-applies the filter to everything in the log's ring.
+    /// Re-applies the filter to the whole day, read from the database off the UI thread.
     ///
-    /// From the log rather than from what is on screen: filtering the rows already shown would
-    /// mean a filter could only ever narrow, and widening one would silently show less than it
-    /// should.
+    /// From the record rather than from what is on screen: filtering the rows already shown
+    /// would mean a filter could only ever narrow. The day is read once per day and area; the
+    /// search, id and level filter what was read. For today, the lines written since the read
+    /// come from memory, and live lines carry on from there - in it or after it, never both.
     /// </summary>
-    private void Rebuild()
+    private async void Rebuild()
     {
+        int version = ++_rebuild;
+        DateTime day = ShownDay;
+        LogArea? area = _area;
+        bool live = Live;
+
+        _shownThrough = long.MaxValue;
+
+        // Today's read goes stale once more has been written since than memory still holds.
+        bool stale = _cacheKey != (day, area) ||
+                     (live && ActivityLog.Shared.LastSeq - _cacheThrough > ActivityLog.RingSize / 2);
+
+        if (stale)
+        {
+            CountText.Text = "ACTIVITY  (reading ...)";
+
+            long through = ActivityLog.Shared.LastSeq;
+            LogLine[] lines;
+
+            try { lines = await Task.Run(() => ActivityLog.Shared.ReadDay(day, area)); }
+            catch (Exception ex)
+            {
+                lines = Array.Empty<LogLine>();
+                ActivityLog.Shared.Warn(LogSource.App, $"The record for {day:d} could not be read: {ex.Message}",
+                                        @event: "monitor.readfailed");
+            }
+
+            // A newer filter was asked for while this one read.
+            if (version != _rebuild) return;
+
+            // Lines this session wrote after the read began are in the database too; they come
+            // from memory instead, so they are not here.
+            _cache = lines.Where(l => !(l.At >= SessionStarted && l.Seq > through)).ToArray();
+            _cacheKey = (day, area);
+            _cacheThrough = through;
+        }
+
+        IEnumerable<LogLine> all = _cache;
+        long newest = _cacheThrough;
+
+        // Today: what this session has written since the read, and the progress lines that are
+        // never stored, from memory; then live from here on.
+        if (live)
+        {
+            var extra = new List<LogLine>();
+
+            foreach (LogLine line in ActivityLog.Shared.Snapshot())
+            {
+                newest = Math.Max(newest, line.Seq);
+                if (line.At.Date != day) continue;
+                if (line.Transient || line.Seq > _cacheThrough) extra.Add(line);
+            }
+
+            all = _cache.Concat(extra).OrderBy(l => l.At).ThenBy(l => l.Seq);
+        }
+
+        var shown = all.Where(Matches).TakeLast(MaxRows).Select(ToRow).ToList();
+
         _rows.Clear();
+        foreach (MonitorRow row in shown) _rows.Add(row);
 
-        foreach (LogLine line in ActivityLog.Shared.Snapshot())
-            if (Matches(line)) _rows.Add(ToRow(line));
+        if (live) _shownThrough = newest;
 
-        while (_rows.Count > MaxRows) _rows.RemoveAt(0);
-
-        CountText.Text = $"ACTIVITY  ({_rows.Count} line{(_rows.Count == 1 ? "" : "s")} shown)";
+        CountText.Text = $"ACTIVITY  ({_rows.Count} line{(_rows.Count == 1 ? "" : "s")} shown" +
+                         (live ? ")" : $", {day:ddd d MMM})");
 
         if (_following && _rows.Count > 0) LogList.ScrollIntoView(_rows[^1]);
     }
 
     private void ClearFilters_Click(object sender, RoutedEventArgs e)
     {
-        SourceCombo.SelectedIndex = 0;
+        AreaCombo.SelectedIndex = 0;
+        DayCombo.SelectedIndex = 0;
         LevelCombo.SelectedIndex = 0;
         SearchBox.Text = "";
         IdBox.Text = "";
@@ -434,7 +548,7 @@ public partial class MonitorWindow : Window
     {
         _remote ??= new MonitorServer(ActivityLog.Shared, PipelineState.Shared, TidalLock.Shared,
                                       () => _timecode.TryGetCurrent(out Timecode now) ? now : null,
-                                      Environment.MachineName);
+                                      Environment.MachineName, LiveAir.Shared);
 
         int port = _settings.MonitorApiPort > 0 ? _settings.MonitorApiPort : MonitorServer.DefaultPort;
 
@@ -492,19 +606,26 @@ public partial class MonitorWindow : Window
 
     private void OnPipelineChanged() => Dispatcher.BeginInvoke(DrawStrip);
     private void OnTidalLockChanged(TidalLock _) => Dispatcher.BeginInvoke(DrawStrip);
+    private void OnLiveAirChanged(LiveAir _) => Dispatcher.BeginInvoke(DrawStrip);
 
+    /// <summary>
+    /// Every card from <see cref="PlantStatus"/>, the same reading the remote page draws: the
+    /// playback deck's tidal lock or Live Edit's transmission, whichever is in use, the EDL
+    /// window's queue or Live Edit's EDL, and the ingest queue.
+    /// </summary>
     private void DrawStrip()
     {
         PipelineState state = PipelineState.Shared;
+        PlantStatus plant = PlantStatus.Read(state, TidalLock.Shared, LiveAir.Shared);
 
         TcDisplay.Text = _timecode.TryGetCurrent(out Timecode now) ? now.ToString() : "--:--:--:--";
 
-        Show(CaptureHeadline, CaptureDetail, state.Capture);
-        Show(EdlHeadline, EdlDetail, state.Edl);
-        Show(AirHeadline, AirDetail, state.OnAir);
-        Show(IngestHeadline, IngestDetail, state.Ingest);
-        Show(DelayHeadline, DelayDetail, Delay());
-        DrawFrames();
+        Show(CaptureHeadline, CaptureDetail, plant.Capture);
+        Show(EdlHeadline, EdlDetail, plant.Edl);
+        Show(AirHeadline, AirDetail, plant.OnAir);
+        Show(IngestHeadline, IngestDetail, plant.Ingest);
+        Show(DelayHeadline, DelayDetail, plant.Delay);
+        DrawFrames(plant);
 
         RecordText.Text = ActivityLog.Shared.Dropped > 0
             ? $"{ActivityLog.Shared.Dropped} line(s) dropped"
@@ -517,13 +638,13 @@ public partial class MonitorWindow : Window
     /// being suspected from a picture.
     ///
     /// Under CAPTURE: what the recorder took, and what it could not hand on. Under TIDAL LOCK:
-    /// what went out against what was recorded — the difference should be the delay and
-    /// nothing else — and every repeat and skip on the way. Red the moment anything is lost.
+    /// what went out against what was recorded - the difference should be the delay and
+    /// nothing else - and every repeat and skip on the way. Red the moment anything is lost.
+    /// Whichever transmitter holds the delay, the playback deck's or Live Edit's.
     /// </summary>
-    private void DrawFrames()
+    private void DrawFrames(PlantStatus plant)
     {
         FrameLedger frames = PipelineState.Shared.Frames;
-        TidalLock lockState = TidalLock.Shared;
 
         if (frames.Recorded == 0 && !PipelineState.Shared.Recording)
         {
@@ -539,7 +660,7 @@ public partial class MonitorWindow : Window
             CaptureFrames.Foreground = Brush(frames.LostToDisk > 0 ? "Bad" : "Tc");
         }
 
-        if (lockState.State is TidalLockState.Off or TidalLockState.Armed || frames.Aired == 0)
+        if (!plant.Transmitting || frames.Aired == 0)
         {
             DelayFrames.Text = "";
             return;
@@ -547,11 +668,11 @@ public partial class MonitorWindow : Window
 
         // The delay itself accounts for exactly this many frames not yet being out. Anything
         // beyond it is a frame that was recorded and is not going to air.
-        long delay = lockState.TargetFrames;
+        long delay = plant.TargetFrames;
         // From the frame of the recording actually on air, not from frames sent: the line can have
         // been filling since the recording began, long before this transmitter started counting.
         // A second of slack, because the recorded count is only published once a second.
-        long slack = TidalLock.Shared.Line?.FrameRate ?? 25;
+        long slack = plant.FrameRate;
         long behind = PipelineState.Shared.AiredFrame is { } airedAt
             ? Math.Max(0, frames.Recorded - (airedAt + 1) - delay - slack)
             : 0;
@@ -567,26 +688,6 @@ public partial class MonitorWindow : Window
         DelayFrames.Foreground = Brush(frames.Skipped > 0 || behind > 0 ? "Bad"
                                      : frames.Repeated > 0 ? "Warn"
                                      : "Tc");
-    }
-
-    /// <summary>
-    /// Tidal lock reports itself, so it is read where it lives rather than mirrored into
-    /// <see cref="PipelineState"/> — one fewer thing that can disagree with the truth.
-    /// </summary>
-    private static StageState Delay()
-    {
-        TidalLock lockState = TidalLock.Shared;
-
-        return lockState.State switch
-        {
-            TidalLockState.Off => StageState.Idle,
-            TidalLockState.Armed => new StageState("ARMED", lockState.Detail, LogLevel.Warn),
-            TidalLockState.CountingDown =>
-                new StageState("FILLING", $"{lockState.FillFraction * 100:0}% - {lockState.Detail}", LogLevel.Warn),
-            TidalLockState.OnAir => new StageState("ON AIR", lockState.Detail, LogLevel.Ok),
-            TidalLockState.Draining => new StageState("DRAINING", lockState.Detail, LogLevel.Warn),
-            _ => new StageState("FAILED", lockState.Detail, LogLevel.Error),
-        };
     }
 
     private void Show(TextBlock headline, TextBlock detail, StageState stage)
@@ -694,9 +795,129 @@ public partial class MonitorWindow : Window
         }
     }
 
+    // ------------------------------------------------------------------ the machine
+
+    /// <summary>When this process started: lines stamped since are this session's.</summary>
+    private static readonly DateTimeOffset SessionStarted = Process.GetCurrentProcess().StartTime;
+
+    private sealed record Choice<T>(string Text, T Value)
+    {
+        public override string ToString() => Text;
+    }
+
+    private static string AreaName(LogArea area) => area switch
+    {
+        LogArea.LiveEdit => "Live Edit",
+        LogArea.Edl => "EDL",
+        LogArea.OnAir => "On air",
+        _ => area.ToString(),
+    };
+
+    /// <summary>One tile: a name, the figure now, a line under it, and the last ten minutes.</summary>
+    private sealed class Tile
+    {
+        public required TextBlock Value { get; init; }
+        public required TextBlock Detail { get; init; }
+        public required System.Windows.Shapes.Polyline Line { get; init; }
+        public required Border Border { get; init; }
+    }
+
+    private readonly Dictionary<string, Tile> _tiles = new();
+
+    private Tile TileFor(string name)
+    {
+        if (_tiles.TryGetValue(name, out Tile? tile)) return tile;
+
+        var label = new TextBlock { Text = name.ToUpperInvariant(), Style = (Style)FindResource("StageLabel") };
+        var value = new TextBlock { Style = (Style)FindResource("StageHeadline") };
+        var detail = new TextBlock { Style = (Style)FindResource("StageDetail"), TextTrimming = TextTrimming.CharacterEllipsis };
+        var line = new System.Windows.Shapes.Polyline { StrokeThickness = 1.2, Stroke = Brush("Tc") };
+        var graph = new Canvas { Height = 26, Margin = new Thickness(0, 4, 0, 0), ClipToBounds = true };
+        graph.Children.Add(line);
+
+        var panel = new StackPanel();
+        panel.Children.Add(label);
+        panel.Children.Add(value);
+        panel.Children.Add(detail);
+        panel.Children.Add(graph);
+
+        var border = new Border { Style = (Style)FindResource("StageCard"), Child = panel };
+        ResourcePanel.Children.Add(border);
+
+        return _tiles[name] = new Tile { Value = value, Detail = detail, Line = line, Border = border };
+    }
+
+    /// <summary>Redraws the tiles from the sampler's last ten minutes. Once a second.</summary>
+    private void DrawResources()
+    {
+        ResourceSample[] history = ResourceSampler.Shared.History();
+        if (history.Length == 0) return;
+
+        ResourceSample now = history[^1];
+
+        Show(TileFor("CPU"), $"{now.CpuPercent:0}%", $"{Environment.ProcessorCount} logical processors",
+             history.Select(s => s.CpuPercent), 100);
+
+        double ramPercent = now.RamTotalBytes > 0 ? 100.0 * now.RamUsedBytes / now.RamTotalBytes : 0;
+        Show(TileFor("RAM"), $"{ramPercent:0}%", $"{Gb(now.RamUsedBytes)} of {Gb(now.RamTotalBytes)} GB in use",
+             history.Select(s => s.RamTotalBytes > 0 ? 100.0 * s.RamUsedBytes / s.RamTotalBytes : 0), 100);
+
+        Show(TileFor("Emerald"), $"{Gb(now.EmeraldPrivateBytes + now.FfmpegPrivateBytes)} GB",
+             $"app {Gb(now.EmeraldPrivateBytes)} GB · ffmpeg {Gb(now.FfmpegPrivateBytes)} GB",
+             history.Select(s => (double)(s.EmeraldPrivateBytes + s.FfmpegPrivateBytes)),
+             Math.Max(1, now.RamTotalBytes), warnAt: double.MaxValue);
+
+        if (now.GpuPercent is { } gpu)
+            Show(TileFor("GPU"), $"{gpu:0}%",
+                 $"encode {now.GpuEncodePercent ?? 0:0}%" + (now.GpuMemoryBytes is { } m ? $" · {Gb(m)} GB memory" : ""),
+                 history.Select(s => s.GpuPercent ?? 0), 100);
+
+        foreach (DiskSample disk in now.Disks)
+        {
+            Show(TileFor(disk.Name), $"{disk.ActivePercent:0}% active",
+                 $"R {Mb(disk.ReadBytesPerSecond)} · W {Mb(disk.WriteBytesPerSecond)} MB/s" +
+                 (disk.TotalBytes > 0 ? $" · {Gb(disk.FreeBytes, 0)} GB free" : ""),
+                 history.Select(s => s.Disks.FirstOrDefault(d => d.Name == disk.Name)?.ActivePercent ?? 0), 100);
+        }
+
+        ResourcePanel.Columns = _tiles.Count;
+    }
+
+    private void Show(Tile tile, string value, string detail, IEnumerable<double> values, double max,
+                      double warnAt = 70)
+    {
+        double[] points = values.ToArray();
+        double latest = points.Length == 0 ? 0 : points[^1];
+        double level = max > 0 ? 100 * latest / max : 0;
+
+        tile.Value.Text = value;
+        tile.Detail.Text = detail;
+        tile.Value.Foreground = Brush(level >= 90 && warnAt < double.MaxValue ? "Bad" : level >= warnAt ? "Warn" : "Text");
+
+        double width = Math.Max(40, tile.Border.ActualWidth - 24);
+        const double height = 26;
+        var line = new PointCollection(points.Length);
+
+        for (int i = 0; i < points.Length; i++)
+        {
+            double x = width * (i + ResourceSampler.HistoryLength - points.Length) / (ResourceSampler.HistoryLength - 1);
+            double y = height - height * Math.Clamp(points[i] / max, 0, 1);
+            line.Add(new Point(x, y));
+        }
+
+        tile.Line.Points = line;
+    }
+
+    private static string Gb(long bytes, int decimals = 1) =>
+        (bytes / 1024.0 / 1024 / 1024).ToString(decimals == 0 ? "N0" : "N1");
+
+    private static string Mb(double bytesPerSecond) => (bytesPerSecond / 1024 / 1024).ToString("0.0");
+
     private void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
-        string folder = _settings.LogFolderOrDefault;
+        string folder = ActivityLog.Shared.Database is { } db
+            ? System.IO.Path.GetDirectoryName(db.Path)!
+            : _settings.DataFolderOrDefault;
 
         try
         {

@@ -19,6 +19,7 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
                 <Grid Grid.Row="0" Margin="0,0,0,10">
@@ -84,8 +85,14 @@
                     </Border>
                 </UniformGrid>
 
+                <!-- The machine: processor, memory, graphics, Emerald's own memory, and one tile
+                     per drive with its active time, as Task Manager shows them. Tiles are made in
+                     code, because the drives are whatever this machine has. Each carries the
+                     last ten minutes as a line. -->
+                <UniformGrid x:Name="ResourcePanel" Grid.Row="2" Rows="1" Margin="0,8,0,0"/>
+
                 <!-- The address to type on another machine, when remote monitoring is on. -->
-                <TextBlock x:Name="RemoteText" Grid.Row="2" Margin="0,10,0,0" FontFamily="Consolas"
+                <TextBlock x:Name="RemoteText" Grid.Row="3" Margin="0,10,0,0" FontFamily="Consolas"
                            FontSize="11.5" Foreground="{StaticResource Tc}" Visibility="Collapsed"
                            TextWrapping="Wrap"/>
             </Grid>
@@ -111,9 +118,16 @@
                                   FontSize="11" Margin="4,0,14,0" Click="View_Changed"
                                   ToolTip="Every file that has gone to air, per EDL"/>
 
-                    <TextBlock Text="Source" Style="{StaticResource FieldLabel}" Margin="0,0,7,0"
+                    <!-- The area is the database table a line is kept in. -->
+                    <TextBlock Text="Area" Style="{StaticResource FieldLabel}" Margin="0,0,7,0"
                                VerticalAlignment="Center"/>
-                    <ComboBox x:Name="SourceCombo" Width="120" SelectionChanged="Filter_Changed"/>
+                    <ComboBox x:Name="AreaCombo" Width="110" SelectionChanged="Filter_Changed"
+                              ToolTip="Errors shows every warning and error, from every area"/>
+
+                    <TextBlock Text="Day" Style="{StaticResource FieldLabel}" Margin="14,0,7,0"
+                               VerticalAlignment="Center"/>
+                    <ComboBox x:Name="DayCombo" Width="120" SelectionChanged="Filter_Changed"
+                              ToolTip="Today is live; an earlier day is read back from the database"/>
 
                     <TextBlock Text="Level" Style="{StaticResource FieldLabel}" Margin="14,0,7,0"
                                VerticalAlignment="Center"/>
@@ -141,7 +155,7 @@
                             ToolTip="Save what is shown"/>
                     <Button Content="Open folder" Style="{StaticResource GhostButton}" Margin="6,0,0,0"
                             Height="26" Padding="12,0" Click="OpenFolder_Click"
-                            ToolTip="Open the folder the record is written to"/>
+                            ToolTip="Open the folder the database is in"/>
 
                     <!-- Serving this page to other machines. Off until asked for. -->
                     <ToggleButton x:Name="RemoteToggle" Content="REMOTE" Margin="6,0,0,0"

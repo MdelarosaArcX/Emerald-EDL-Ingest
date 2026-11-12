@@ -515,13 +515,14 @@ public sealed class DelayLineTests : IDisposable
     }
 
     /// <summary>
-    /// A transmitter a long way behind keeps the pages it is about to read. A nearer reader beside
-    /// it does not shorten that, and once the far one stops they go.
+    /// A reader close behind the writer keeps the pages it is about to read. One a whole delay
+    /// behind does not: holding everything between it and the writer is what put 12.7 GB in the
+    /// working set on air. Its frames are read back from the file's cache instead.
     /// </summary>
     [Fact]
-    public void The_farthest_reader_holds_its_pages_until_it_goes_quiet()
+    public void Only_a_near_reader_holds_its_pages()
     {
-        using DelayLine line = Open(TimeSpan.FromSeconds(20));
+        using DelayLine line = Open(TimeSpan.FromSeconds(30));
         DelayFrameBuffer buffer = line.NewBuffer();
         byte[] frame = Pattern(line.FrameBytes, 0);
 
@@ -530,18 +531,41 @@ public sealed class DelayLineTests : IDisposable
             for (int i = 0; i < count; i++) line.Write(frame, frame.Length, null, 0, false);
         }
 
-        // Ten seconds at 25 is 250 frames kept, with nothing reading.
+        // Four seconds at 25 is 100 frames kept, with nothing reading.
         Write(500);
-        Assert.Equal(250, line.TrimmedThrough);
+        Assert.Equal(400, line.TrimmedThrough);
 
-        // 400 behind plus the two-second margin keeps 450, and the mark comes back to meet it.
-        Assert.Equal(DelayReadResult.Ok, line.TryRead(100, buffer));
-        Assert.Equal(DelayReadResult.Ok, line.TryRead(490, buffer));
+        // 200 behind (8 s, near) plus the two-second margin keeps 250, and the mark comes back to meet it.
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(300, buffer));
         Write(25);
-        Assert.Equal(75, line.TrimmedThrough);
+        Assert.Equal(275, line.TrimmedThrough);
 
         Thread.Sleep(2100);
         Write(25);
-        Assert.Equal(300, line.TrimmedThrough);
+        Assert.Equal(450, line.TrimmedThrough);
+
+        // 450 behind (18 s) is far: it holds nothing, and still reads.
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(100, buffer));
+        Write(25);
+        Assert.Equal(475, line.TrimmedThrough);
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(126, buffer));
+    }
+
+    /// <summary>
+    /// The ring is written to its file half a second behind the writer, so its pages are clean
+    /// and Windows can count them as available rather than leaving them dirty in memory.
+    /// </summary>
+    [Fact]
+    public void The_ring_is_written_ahead_to_disk()
+    {
+        using DelayLine line = Open(TimeSpan.FromSeconds(20));
+        byte[] frame = Pattern(line.FrameBytes, 0);
+
+        for (int i = 0; i < 200; i++) line.Write(frame, frame.Length, null, 0, false);
+
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (line.FlushedThrough < 200 - 12 && waited.ElapsedMilliseconds < 5000) Thread.Sleep(50);
+
+        Assert.InRange(line.FlushedThrough, 200 - 12, 200);
     }
 }

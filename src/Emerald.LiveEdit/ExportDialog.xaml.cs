@@ -25,11 +25,11 @@ public partial class ExportDialog : Window
     private readonly string _extension;
 
     public ExportDialog(string suggestedName, string extension, Timecode inAt, Timecode outAt,
-                        int rate, IReadOnlyList<RangePart> parts, string storeRoot)
+                        int rate, IReadOnlyList<RangePart> parts, Emerald.Video.StorePaths store)
     {
         InitializeComponent();
 
-        _folder = RangeExport.FolderFor(storeRoot);
+        _folder = store.Exports;
         _extension = extension;
 
         long frames = parts.Sum(p => p.Frames);

@@ -34,7 +34,7 @@ All of them are windows in **one process**. The reason is hardware: a DELTACAST 
 | EDL Generator | `EdlWindow` | `--edl` | Composes a message (video, audio beds, start time, in and out points), queues it, plays it out on the house clock. |
 | Ingest Controller | `IngestControllerWindow` | `--ingest` | Schedules recordings off an RX port, by timecode, with a SQLite-backed queue. Has a simulate mode. |
 | Live Edit | `LiveEditWindow` | shell button only | Timeline over the recordings. Marks, ingest placement, deleted scenes, audio levels, export, and its own delayed transmission ("Go Live"). |
-| Monitor | `MonitorWindow` | `--monitor` | Whole-plant status strip and activity log. Can serve a read-only web page to other machines. |
+| Monitor | `MonitorWindow` | `--monitor` | Whole-plant status strip, the machine's CPU, memory, graphics and disks, and the activity log by area and day. Can serve a read-only web page to other machines. |
 
 `readme.md` still calls Live Edit "layout only". That is out of date: see [the assessment](11_TECHNICAL_ASSESSMENT.md#stale-documentation).
 
@@ -74,11 +74,11 @@ See [the system architecture](03_SYSTEM_ARCHITECTURE.md) for diagrams.
 | Probing | ffprobe child process, plus a managed MOV/MP4 atom reader | `src/Emerald.Media/MediaProbe.cs`, `MediaCodec.cs` |
 | On-screen playback | WPF `MediaElement` (Media Foundation) | `src/Emerald.LiveEdit/LiveEditWindow.xaml:138` |
 | Speaker monitoring | `winmm.dll` `waveOut*` P/Invoke | `src/Emerald.Video/SpeakerOutput.cs` |
-| Database | SQLite through `Microsoft.EntityFrameworkCore.Sqlite` 8.0.11, ingest only | `src/Emerald.Ingest/Emerald.Ingest.csproj` |
-| Other persistence | JSON and JSONL files | `src/Emerald.Core/AppSettings.cs`, `ActivityLog.cs` |
+| Database | SQLite. `emerald.db` (log, recordings, resource samples) through `Microsoft.Data.Sqlite.Core` 8.0.11 and `SQLitePCLRaw.bundle_e_sqlite3` 2.1.6. `ingest.db` through `Microsoft.EntityFrameworkCore.Sqlite` 8.0.11. | `src/Emerald.Core/Emerald.Core.csproj`, `src/Emerald.Ingest/Emerald.Ingest.csproj` |
+| Other persistence | JSON files | `src/Emerald.Core/AppSettings.cs` |
 | Tests | xUnit 2.5.3 | `tests/*/*.csproj` |
 
-That SQLite package is the only NuGet package outside the test projects.
+Those three SQLite packages are the only NuGet packages outside the test projects.
 
 ## External dependencies and services
 
@@ -128,9 +128,11 @@ See [hardware integration](06_HARDWARE_INTEGRATION.md).
 | Range export | Implemented | Exports the recording as captured, without edits |
 | Bookmarks | Implemented | One note per frame per day, saved as JSON per day |
 | Undo and redo in Live Edit | Implemented | 50 levels. Refused for anything inside the no edit zone. Not saved to disk. |
-| Storage limit | Implemented | Deletes the oldest segments past the limit. Runs only from the capture deck while it records. |
+| Storage limit | Implemented | One limit for the high-res folder and one for the low-res folder. Deletes the oldest segments past each. Runs only from the capture deck while it records. |
+| Separate high-res and low-res folders | Implemented | Masters and proxies can go on different drives. Set on the capture deck or by the installer. |
 | Several TX ports | Implemented | Tidal lock and Go Live only |
-| Activity log and EDL log | Implemented | JSONL files. The retention sweep covers `emerald-*.jsonl` only, so `edl-*.jsonl` files are never removed. |
+| Activity log and EDL log | Implemented | One SQLite file, `emerald.db`, one table per area plus an errors table. Rows older than `logRetentionDays` (14) are deleted daily. |
+| Resource record | Implemented | CPU, memory, graphics and each disk, sampled while the Monitor is open or a recording runs. Saved to the database while recording only. |
 | On-air recording from the EDL | Implemented | Optional, through `SdiCapture` |
 | Remote monitoring page | Implemented | Read-only (GET and HEAD), no authentication, off by default. Runs only while the Monitor window is open. The full installer opens the firewall for TCP 8787 regardless, and a different port needs its own rule. |
 | Installer and update scripts | Implemented | Batch files, no MSI |

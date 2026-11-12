@@ -124,6 +124,19 @@ public static class RangeExport
     /// <summary>Where exported ranges go, beside the store rather than inside it.</summary>
     public static string FolderFor(string storeRoot) => Path.Combine(storeRoot, "ingest");
 
+    /// <summary>Where exported ranges go with the high-res and low-res folders chosen apart (see <see cref="StorePaths.Exports"/>).</summary>
+    public static string FolderFor(StorePaths store) => store.Exports;
+
+    public static ExportResult Write(string ffmpegPath, StorePaths store, string name,
+                                     string metadata, IReadOnlyList<RangePart> parts,
+                                     int frameRate, string extension,
+                                     Action<string>? progress = null,
+                                     CancellationToken cancel = default) =>
+        WriteInto(ffmpegPath, store.Exports, name, metadata, parts, frameRate, extension, progress, cancel);
+
+    public static IReadOnlyList<CapturedClip> List(StorePaths store, string? ffprobePath, int frameRate = 25) =>
+        ListIn(store.Exports, ffprobePath, frameRate);
+
     /// <summary>
     /// Writes the range as one file plus a sidecar carrying the metadata.
     ///
@@ -141,12 +154,18 @@ public static class RangeExport
                                      string metadata, IReadOnlyList<RangePart> parts,
                                      int frameRate, string extension,
                                      Action<string>? progress = null,
-                                     CancellationToken cancel = default)
+                                     CancellationToken cancel = default) =>
+        WriteInto(ffmpegPath, FolderFor(storeRoot), name, metadata, parts, frameRate, extension, progress, cancel);
+
+    private static ExportResult WriteInto(string ffmpegPath, string folder, string name,
+                                          string metadata, IReadOnlyList<RangePart> parts,
+                                          int frameRate, string extension,
+                                          Action<string>? progress,
+                                          CancellationToken cancel)
     {
         if (parts.Count == 0) return new ExportResult(false, "", "The range covers no media.");
         if (name.Length == 0) return new ExportResult(false, "", "The export has no name.");
 
-        string folder = FolderFor(storeRoot);
         string output = Path.Combine(folder, $"{name}.{extension}");
 
         try
@@ -204,6 +223,7 @@ public static class RangeExport
                 info.ArgumentList.Add(a);
 
             using Process? ffmpeg = Process.Start(info);
+            if (ffmpeg is not null) BackgroundPriority.Apply(ffmpeg);
 
             if (ffmpeg is null)
                 return new ExportResult(false, "", "ffmpeg could not be started.");
@@ -371,6 +391,7 @@ public static class RangeExport
                 info.ArgumentList.Add(a);
 
             using Process? ffmpeg = Process.Start(info);
+            if (ffmpeg is not null) BackgroundPriority.Apply(ffmpeg);
 
             if (ffmpeg is null) return;
 
@@ -395,9 +416,11 @@ public static class RangeExport
 
     /// <summary>Everything already exported, newest first, for the Ingest Media list.</summary>
     public static IReadOnlyList<CapturedClip> List(string storeRoot, string? ffprobePath,
-                                                   int frameRate = 25)
+                                                   int frameRate = 25) =>
+        ListIn(FolderFor(storeRoot), ffprobePath, frameRate);
+
+    private static IReadOnlyList<CapturedClip> ListIn(string folder, string? ffprobePath, int frameRate)
     {
-        string folder = FolderFor(storeRoot);
         var clips = new List<CapturedClip>();
 
         try

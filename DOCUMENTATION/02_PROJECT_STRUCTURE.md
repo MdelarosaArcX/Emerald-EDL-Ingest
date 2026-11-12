@@ -17,7 +17,8 @@ run-ingest.bat              ... the Ingest Controller (--ingest)
 run-monitor.bat             ... the Monitor (--monitor)
 publish.bat                 self-contained build into dist\Emerald
 publish-edl.bat             wrapper: publish.bat -edl into dist\Emerald-EDL
-installer\                  install.bat, update.bat, uninstall.bat, READ-ME-FIRST.txt
+installer\                  install.bat, update.bat, uninstall.bat, READ-ME-FIRST.txt,
+                            settings.ps1 (merges chosen folders into settings.json)
 installer\edl\              the same set for the EDL-only product
 media\                      default recording store; contents not in git
 tools\check-xaml-styles.sh  checks Style/TargetType matches, which the compiler does not
@@ -90,12 +91,15 @@ No `appsettings.json`, `.env` or `app.config` was found. The Emerald-specific en
 
 ## src/Emerald.Core
 
-The bottom layer. It has no project references and uses WPF only for `TimecodeMask`.
+The bottom layer. It has no project references and uses WPF only for `TimecodeMask`. Its only packages are `Microsoft.Data.Sqlite.Core` 8.0.11 and `SQLitePCLRaw.bundle_e_sqlite3` 2.1.6, for the log database.
 
 | File | Purpose and why it exists | Depended on by |
 |---|---|---|
 | `AppSettings.cs` | The one settings file for all modules. Load, save, migrate. | All windows, `RecordingProfile`, `RecordingSetup`, `MediaLibrary` |
-| `ActivityLog.cs` | The application's record: an in-memory ring plus JSONL on disk, written on a background thread so real-time threads never wait on a disk. | Almost everything |
+| `ActivityLog.cs` | The application's record: an in-memory ring plus the log database, written in batches on a background thread so real-time threads never wait on a disk. | Almost everything |
+| `LogDatabase.cs` | `emerald.db`: one SQLite file with a table per log area, an errors table, recording sessions and resource samples. `AreaOf` decides which table a line goes to. | `ActivityLog`, `ResourceSampler`, `MemoryMonitor`, `MonitorFeed`, `MonitorWindow`, App |
+| `ResourceSampler.cs` | CPU, RAM, GPU, each physical disk, and Emerald's and its ffmpegs' memory, once a second while watched or recording. Windows counters (PDH) and two kernel calls; no package. | App, `MonitorWindow`, `MonitorServer`, `MonitorFeed` |
+| `BackgroundPriority.cs` | Puts a helper process at below-normal CPU priority and very low disk priority, behind the recorder. | `Waveform`, `RangeExport` |
 | `MonitorServer.cs` | Hand-written HTTP/1.1 server on `TcpListener`. `HttpListener` would need elevation or a URL reservation for non-localhost. | `MonitorWindow` |
 | `MonitorFeed.cs` | Builds the JSON the server returns, separated so it can be tested without a socket. | `MonitorServer`, `MonitorWindow` |
 | `MonitorPage.cs` | The whole remote web page as one string constant. | `MonitorServer` |
@@ -110,7 +114,7 @@ The bottom layer. It has no project references and uses WPF only for `TimecodeMa
 | `LiveAir.cs` | Live Edit's transmission state, plus pure cue-firing rules (`LiveCues`). Separate from `TidalLock` by design. | Shell, Live Edit, `LiveAirTransmitter` |
 | `LiveEdl.cs` | The EDL handshake types and `EdlDiff.EarliestChange`. | `LiveAir`, `EdlLedger`, Live Edit |
 | `EdlLedger.cs` | Sender side of the handshake: versions, retries, per-edit conform state. No clock or UI. | `LiveEditWindow.Live.cs` |
-| `EdlLogger.cs` | The EDL log: memory, activity log and `edl-yyyyMMdd.jsonl`. | `EdlLedger`, `LiveEditWindow.Live.cs` |
+| `EdlLogger.cs` | The EDL log: memory, and the activity log, which stores each entry whole in the `log_edl` table. | `EdlLedger`, `LiveEditWindow.Live.cs` |
 | `EdlSources.cs` | Resolves a frame range to capture files. | `LiveEditWindow.Live.cs` |
 | `IngestPlacement.cs` | Placement modes and pure planning rules. | `IngestDropDialog`, Live Edit |
 | `IngestTimeline.cs` | Converts ruler frames to what plays, allowing for inserts and cuts. | Live Edit |
@@ -120,7 +124,8 @@ The bottom layer. It has no project references and uses WPF only for `TimecodeMa
 | `RecordingSequence.cs` | Folder and file naming, midnight frame count. | `SdiCapture`, `MediaLibrary`, `PruneLedger`, `SegmentWatch`, `StorageWarden`, Shell, EDL |
 | `RecordingPicture.cs` | Hands the newest preview frame across assemblies; also exposes the ready ring. | Shell, Live Edit |
 | `IDelayLine.cs` | Read-only view of the ring. | `TidalLock`, `LiveAir`, `RecordingPicture`, `HeldPicture`, `LiveEditWindow.Held`. Implemented by `DelayLine`. |
-| `TransmissionTally.cs` | Folds log lines into "what aired, per message, per track". | `MonitorFeed`, `MonitorWindow` |
+| `TransmissionTally.cs` | Folds log lines into "what aired, per message, per track", Live Edit go-lives included. | `MonitorFeed`, `MonitorWindow` |
+| `PlantStatus.cs` | The Monitors' strip, from `PipelineState`, `TidalLock` and `LiveAir`: whichever transmitter and EDL is in use. | `MonitorWindow`, `MonitorFeed` |
 | `PlayoutDrift.cs` | Measures frames lost against the wall clock. It measures only and does not correct. | `PlayoutService` |
 | `CaptureSync.cs` | The lip-sync rule for pipes with no timestamps: write audio only up to the video count. | `SdiCapture` |
 | `Settled.cs` | Debouncer with injected time, added because a flapping reading flooded the log. | Shell |
@@ -149,6 +154,7 @@ For the engine threads the third column lists what they call. For the other file
 | `SdiCapture.cs` | The recording engine: RX slot loop, encoder pipes, midnight rollover. Defines `CaptureFormat`, `CapturedFrame`, `CaptureResult`. | SDK, ffmpeg, `RxLease`, `DelayLine` via its `Frame` event |
 | `RecordingProfile.cs` | Output definitions and the ffmpeg encoder argument builder. | `SdiCapture` |
 | `RecordingSetup.cs` | Validates and builds `CaptureRequest`, returning a sentence rather than throwing. | Shell, EDL, `IngestRecorder` |
+| `StorePaths.cs` | Where the masters (`High`) and proxies (`Low`) go, each anywhere. `Under(root)` is the old one-folder layout; `Exports` is where Live Edit's exports go. | `SdiCapture`, `RecordingProfile`, `RecordingSetup`, Media, Shell, Live Edit, App |
 | `DelayLine.cs` | The ring: memory-mapped file, writer thread, lock-free reads. | `SdiCapture`, transmitters, `HeldPicture` |
 | `DelayFormats.cs` | Which formats the delay can carry (progressive 1080 only). | Shell, transmitters |
 | `DelayPacer.cs` | Pure decision for each output frame: Fill, Advance, Repeat, Skip, Resync, Finish, Fail. | Transmitters |
@@ -175,9 +181,10 @@ For the engine threads the third column lists what they call. For the other file
 | `MediaScanner.cs` | Extension list; turns a dropped path into a selection. | EDL, Live Edit, `MediaLibrary`, `RangeExport`, `StorageWarden` |
 | `RangeExport.cs` | Cuts a marked range from the masters with ffmpeg stream copy (proxies if a master is missing); `RangePlan.FromMasters` plans the cut on the masters' own offsets. Cancellable, then writes a JSON sidecar and an encoded H.264 preview, which is the slow part. Output goes to `<store>\ingest`. Also lists that folder and finds previews for Live Edit's Ingest tab. | Live Edit, `ExportDialog` |
 | `SegmentWatch.cs` | Polls for finished segments. | Shell |
-| `StorageWarden.cs` | Deletes the oldest segments past the size limit. | Shell |
+| `StorageWarden.cs` | Deletes the oldest segments past the high-res and low-res limits. | Shell |
+| `MediaLengths.cs` | Each finished file's picture length, read once for the whole app. | `StoreIndex`, `StorageWarden` |
 | `PruneLedger.cs` | Records what was deleted so survivors keep their clock position. | `StorageWarden`, `MediaLibrary` |
-| `Waveform.cs` | Peak data from ffmpeg, cached in memory. | Live Edit |
+| `Waveform.cs` | Peak data from ffmpeg, cached in memory and on disk in `<data folder>\peaks`. | Live Edit |
 
 ## src/Emerald.EDL
 
@@ -196,7 +203,8 @@ For the engine threads the third column lists what they call. For the other file
 | `Models/IngestRecording.cs` | What a job actually produced. |
 | `Models/IngestRequest.cs` | Raw form values and the validation result. |
 | `Models/IngestStatus.cs` | Status enum and legal transitions. |
-| `Services/IngestControllerService.cs` | The single façade for the UI: validation, recovery. |
+| `Services/IngestControllerService.cs` | The single façade for the UI: validation, recovery, and the Monitors' INGEST card. |
+| `Services/IngestStage.cs` | The INGEST card from the queue. |
 | `Services/IngestSchedulerService.cs` | Queue, 20 ms loop, roll decision, finalisation. |
 | `Services/IngestRecorder.cs` | `SdiIngestRecorder` over `SdiCapture`, and `MockIngestRecorder`. |
 | `Services/IngestStore.cs` | `SqliteIngestStore` and the EF `IngestDbContext`. |
@@ -235,7 +243,7 @@ For the engine threads the third column lists what they call. For the other file
 | `App.xaml` | Shared palette and about 40 styles used by every window. They are one reason `publish.bat -edl` ships the same binaries under a separate product rather than a smaller build: a split would need a second copy of this file. |
 | `ShellWindow.xaml(.cs)` | Capture deck, 2,731 lines of C#. Board selection, preview, record, three ring lifecycles, segment logging, storage limit, module opening. |
 | `PlaybackWindow.xaml(.cs)` | Tidal lock transmitter and a separate RX monitor. |
-| `MonitorWindow.xaml(.cs)` | Status strip, log, transmitted view, remote toggle. |
+| `MonitorWindow.xaml(.cs)` | Status strip, resource tiles, log by area and day, transmitted view, remote toggle. |
 | `RxPreview.cs` | Direct SDK preview of an RX port. |
 | `AudioMonitor.cs` | Meters and speaker routing. |
 | `AudioPairRow.cs`, `CaptureAudioRow.cs`, `TxPortRow.cs` | Row view models. |
@@ -246,12 +254,12 @@ For the engine threads the third column lists what they call. For the other file
 
 | Project | Covers | Hardware needed |
 |---|---|---|
-| `Emerald.Core.Tests` | Nearly all pure rules in Core: timecode, tidal lock, monitor server, ingest timeline, placement and tracks, EDL editing, live cues, audio edits, scene cut, activity log, bookmarks, drop marks, frame pick, capture sync, pipeline state, playout drift, recording picture and sequence, SDI ports, settled, timeline zoom, transmission tally | None |
+| `Emerald.Core.Tests` | Nearly all pure rules in Core: timecode, tidal lock, monitor server, ingest timeline, placement and tracks, EDL editing, live cues, audio edits, scene cut, activity log, log database and resource sampler (including the area routing, the remote `/api/history` and `/api/resources` feeds, and `BackgroundPriority`), bookmarks, drop marks, frame pick, capture sync, pipeline state, playout drift, recording picture and sequence, SDI ports, settled, timeline zoom, transmission tally | None |
 | `Emerald.Edl.Tests` | Queue countdown, track levels, embedded audio labels | None |
 | `Emerald.Ingest.Tests` | Status rules, validation, store, recovery, queue and scheduler decisions driven by hand, clip names, ingest audio, recording arguments, plus Core's `TimecodeCalculationService` and `TimecodeMask` | None |
-| `Emerald.Video.Tests` | Encoder, audio and segment arguments, delay ring and formats, pacer, frame read-ahead, segment watch, storage warden, prune ledger, range planning, export and the export listing, picture duration, meters, speaker latency, UYVY preview, SDK stream-type table. Also covers Emerald.Media and part of Deltacast, which have no test project of their own. `MediaLibrary.List` has no direct test. | None. Tests that decode or export use ffmpeg from wherever `Ffmpeg.Locate` finds it, and pass without checking anything when there is none, so a green run with no ffmpeg proves less. Ring tests need free disk space, and fail on the guard when the temp drive is full. |
+| `Emerald.Video.Tests` | Encoder, audio and segment arguments, delay ring and formats, pacer, frame read-ahead, segment watch, storage warden, prune ledger, range planning, export and the export listing, separate high-res and low-res folders (`SplitStoreTests`: layout, per-folder limits, `MediaLengths`, the waveform disk cache), picture duration, meters, speaker latency, UYVY preview, SDK stream-type table. Also covers Emerald.Media and part of Deltacast, which have no test project of their own. `MediaLibrary.List` has no direct test. | None. Tests that decode or export use ffmpeg from wherever `Ffmpeg.Locate` finds it, and pass without checking anything when there is none, so a green run with no ffmpeg proves less. Ring tests need free disk space, and fail on the guard when the temp drive is full. |
 
-Not covered by tests: anything inside a window class; the play loop in `PlayoutService`; the ingest scheduler loop; the real-time threads in `SdiCapture`, `DelayTransmitter` and `LiveAirTransmitter`; everything that opens a card (`SdiOutput`, `RxPreview`, `BoardService`), plus `RxLease`; `AudioSource`, `HeldPicture`, `Waveform` and `MediaLibrary.List`. Only the pure rules those engines delegate to are tested.
+Not covered by tests: anything inside a window class; the play loop in `PlayoutService`; the ingest scheduler loop; the real-time threads in `SdiCapture`, `DelayTransmitter` and `LiveAirTransmitter`; everything that opens a card (`SdiOutput`, `RxPreview`, `BoardService`), plus `RxLease`; `AudioSource`, `HeldPicture` and `MediaLibrary.List`. `Waveform` is tested only for its disk cache. Only the pure rules those engines delegate to are tested.
 
 There are no test projects for Media, Deltacast or Live Edit. Live Edit's logic is tested only where it was moved into Core.
 
@@ -276,7 +284,7 @@ The project `Emerald.EDL` has the root namespace `Emerald.Edl`, and its test pro
 |---|---|
 | API routes | `src/Emerald.Core/MonitorServer.cs`, `MonitorFeed.cs` |
 | Services and background processes | [System architecture](03_SYSTEM_ARCHITECTURE.md#threads-and-background-work) |
-| Database models | `src/Emerald.Ingest/Models`, `Services/IngestStore.cs` |
-| Other storage | `AppSettings`, `ActivityLog`, `EdlLogger`, `Bookmarks`, `PruneLedger`, `DelayLine`, `RangeExport` sidecars |
+| Database models | `src/Emerald.Ingest/Models`, `Services/IngestStore.cs`; the log database in `src/Emerald.Core/LogDatabase.cs` |
+| Other storage | `AppSettings`, `ActivityLog`, `EdlLogger`, `Bookmarks`, `PruneLedger`, `DelayLine`, `RangeExport` sidecars, `Waveform` peaks cache |
 | Hardware communication | `src/Emerald.Deltacast/*`, `SdiCapture`, `RxPreview`, `SdiAudioReader` |
 | Reusable UI | `src/Emerald.App/App.xaml` styles, `TimecodeMask` |

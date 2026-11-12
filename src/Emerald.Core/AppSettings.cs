@@ -44,8 +44,18 @@ public sealed class AppSettings
     /// <summary>Optional override; when empty, ffmpeg is looked up next to the app, on PATH, then C:\ffmpeg\bin.</summary>
     [JsonPropertyName("ffmpegPath")] public string FfmpegPath { get; set; } = "";
 
-    /// <summary>Folder RX recordings are written to, in 2-minute files.</summary>
+    /// <summary>
+    /// The store recordings went to before high-res and low-res had folders of their own: the
+    /// masters in its high\ folder and the proxies in its low\ folder. Still read, so a machine
+    /// set up before the change records where it always did; empty means the default store.
+    /// </summary>
     [JsonPropertyName("captureFolder")] public string CaptureFolder { get; set; } = "";
+
+    /// <summary>Where the DNxHD masters go. Empty means the high\ folder of <see cref="CaptureFolder"/>.</summary>
+    [JsonPropertyName("highResFolder")] public string HighResFolder { get; set; } = "";
+
+    /// <summary>Where the H.264 proxies go. Empty means the low\ folder of <see cref="CaptureFolder"/>.</summary>
+    [JsonPropertyName("lowResFolder")] public string LowResFolder { get; set; } = "";
 
     /// <summary>Rate the recorder falls back to when the receiver reports no standard.</summary>
     [JsonPropertyName("captureFrameRate")] public int CaptureFrameRate { get; set; } = 25;
@@ -67,6 +77,17 @@ public sealed class AppSettings
     /// deleting an operator's recordings is not something to start doing on their behalf.
     /// </summary>
     [JsonPropertyName("recordingStorageLimitGb")] public int RecordingStorageLimitGb { get; set; }
+
+    /// <summary>
+    /// The most the high-res folder may hold, in gigabytes; zero is no limit. Past it, the oldest
+    /// master goes, with the proxies it holds. Unset on a machine set up before high and low had
+    /// limits of their own, and then taken from <see cref="RecordingStorageLimitGb"/>, since the
+    /// masters are nearly all of the bytes.
+    /// </summary>
+    [JsonPropertyName("highResLimitGb")] public int? HighResLimitGb { get; set; }
+
+    /// <summary>The most the low-res folder may hold, in gigabytes; zero is no limit. Past it, the oldest proxies go.</summary>
+    [JsonPropertyName("lowResLimitGb")] public int? LowResLimitGb { get; set; }
 
     // How recordings are encoded. Read through RecordingProfile, which is what both the
     // capture deck and the EDL record with, so a value here is never handed to ffmpeg
@@ -159,6 +180,15 @@ public sealed class AppSettings
     [JsonPropertyName("keepDelayReady")] public bool KeepDelayReady { get; set; } = true;
 
     /// <summary>
+    /// Set once <see cref="Migrate"/> has turned <see cref="KeepDelayReady"/> back on. Delay ready
+    /// used to be the largest use of memory in the application, so machines had it off; since the
+    /// ring is written ahead to disk it costs a few hundred megabytes, and it is what lets tidal
+    /// lock and Go Live go to air the moment they are armed. Turned on once; an operator who
+    /// turns it off again afterwards is not overruled.
+    /// </summary>
+    [JsonPropertyName("delayReadyRevisited")] public bool DelayReadyRevisited { get; set; }
+
+    /// <summary>
     /// Draws every window in software instead of on the graphics card.
     ///
     /// For a machine whose graphics driver has got into a state where WPF's hardware path
@@ -234,24 +264,60 @@ public sealed class AppSettings
     [JsonPropertyName("ingestMockMode")] public bool IngestMockMode { get; set; }
 
     /// <summary>
-    /// Where the activity record is written. Empty means %APPDATA%\Emerald\logs, beside
-    /// settings.json and the ingest database.
+    /// Where earlier builds wrote the activity record as files. The record is now in the
+    /// database (<see cref="DataFolder"/>); old files here are deleted by the retention.
     /// </summary>
     [JsonPropertyName("logFolder")] public string LogFolder { get; set; } = "";
 
     /// <summary>
-    /// How many days of the record to keep. Zero keeps today only; negative keeps everything
-    /// and leaves the pruning to whoever wants it done.
+    /// How many days of the record (log lines and resource samples) to keep in the database.
+    /// Zero keeps today only; negative keeps everything.
     /// </summary>
     [JsonPropertyName("logRetentionDays")] public int LogRetentionDays { get; set; } = 14;
 
     /// <summary>
-    /// For a developer: writes what the application is using to <c>memory-yyyyMMdd.jsonl</c> in
-    /// the log folder every ten seconds. Off unless asked for here or with EMERALD_MEMORY_LOG=1.
+    /// For a developer: writes what the application is using to the database's
+    /// <c>resource_process</c> table every ten seconds. Off unless asked for here or with EMERALD_MEMORY_LOG=1.
     /// </summary>
     [JsonPropertyName("memoryDiagnostics")] public bool MemoryDiagnostics { get; set; }
 
-    /// <summary>The default home for the record, alongside everything else Emerald remembers.</summary>
+    /// <summary>
+    /// Where the databases go: <c>emerald.db</c> (the log, recordings and resource samples) and
+    /// <c>ingest.db</c>. Empty means %APPDATA%\Emerald, beside settings.json. The installer asks.
+    /// </summary>
+    [JsonPropertyName("dataFolder")] public string DataFolder { get; set; } = "";
+
+    public static string DefaultDataFolder { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Emerald");
+
+    public string DataFolderOrDefault =>
+        string.IsNullOrWhiteSpace(DataFolder) ? DefaultDataFolder : DataFolder.Trim();
+
+    /// <summary>
+    /// The ingest database in the data folder. The first time a data folder other than the
+    /// default is used, an ingest.db already in the default folder is copied across, so the
+    /// schedule is not lost by moving the data.
+    /// </summary>
+    public string IngestDatabasePath()
+    {
+        string path = Path.Combine(DataFolderOrDefault, "ingest.db");
+        string old = Path.Combine(DefaultDataFolder, "ingest.db");
+
+        try
+        {
+            if (!File.Exists(path) && File.Exists(old) &&
+                !string.Equals(Path.GetFullPath(path), Path.GetFullPath(old), StringComparison.OrdinalIgnoreCase))
+            {
+                Directory.CreateDirectory(DataFolderOrDefault);
+                File.Copy(old, path);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+
+        return path;
+    }
+
+    /// <summary>Where earlier builds wrote the record as files. Swept by retention; nothing new goes there.</summary>
     public static string DefaultLogFolder { get; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Emerald", "logs");
 
@@ -307,17 +373,28 @@ public sealed class AppSettings
             settings.RecordingSegmentSeconds == FormerDefaultSegmentSeconds)
             settings.RecordingSegmentSeconds = DefaultSegmentSeconds;
 
+        // One limit for the whole store becomes the high-res limit: the masters are nearly all
+        // of the bytes, so it keeps the store about the size it was.
+        settings.HighResLimitGb ??= Math.Max(0, settings.RecordingStorageLimitGb);
+        settings.LowResLimitGb ??= 0;
+
+        if (!settings.DelayReadyRevisited)
+        {
+            settings.KeepDelayReady = true;
+            settings.DelayReadyRevisited = true;
+        }
+
         return settings;
     }
 
     /// <summary>
-    /// The capture deck's output path as last saved, read fresh from the file - "" for the
-    /// default store, null when the file cannot be read just now.
+    /// The store folders as last saved, read fresh from the file - "" for each one not set, null
+    /// when the file cannot be read just now.
     ///
     /// For a window that loaded its settings earlier and must still look where the recording
-    /// actually goes: the deck saves the path the moment it is set or a recording starts.
+    /// actually goes: the deck saves the folders the moment they are set or a recording starts.
     /// </summary>
-    public static string? SavedCaptureFolder()
+    public static (string Capture, string High, string Low)? SavedStoreFolders()
     {
         try
         {
@@ -325,9 +402,12 @@ public sealed class AppSettings
 
             using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(FilePath));
 
-            return doc.RootElement.TryGetProperty("captureFolder", out JsonElement folder)
-                ? folder.GetString() ?? ""
-                : "";
+            string Get(string name) =>
+                doc.RootElement.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
+                    ? value.GetString() ?? ""
+                    : "";
+
+            return (Get("captureFolder"), Get("highResFolder"), Get("lowResFolder"));
         }
         catch
         {
@@ -336,19 +416,20 @@ public sealed class AppSettings
     }
 
     /// <summary>
-    /// Writes the capture output path into the saved settings and nothing else, so a window
-    /// holding an older copy of the rest does not put it back over what another window saved.
+    /// Writes the high-res and low-res folders into the saved settings and nothing else, so a
+    /// window holding an older copy of the rest does not put it back over what another saved.
     /// </summary>
-    public static void SaveCaptureFolder(string folder)
+    public static void SaveStoreFolders(string high, string low)
     {
         // A file there but unreadable just now would load as every setting at its default, and
         // saving that would wipe the rest. The deck saves everything when it closes anyway.
-        if (File.Exists(FilePath) && SavedCaptureFolder() is null) return;
+        if (File.Exists(FilePath) && SavedStoreFolders() is null) return;
 
         AppSettings saved = Load();
-        if (saved.CaptureFolder == folder) return;
+        if (saved.HighResFolder == high && saved.LowResFolder == low) return;
 
-        saved.CaptureFolder = folder;
+        saved.HighResFolder = high;
+        saved.LowResFolder = low;
         saved.Save();
     }
 

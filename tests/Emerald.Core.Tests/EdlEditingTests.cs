@@ -612,9 +612,13 @@ public sealed class EdlEditingTests
         string folder = Path.Combine(Path.GetTempPath(), "emerald-edl-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(folder);
 
+        var database = new LogDatabase(LogDatabase.PathIn(folder));
+        var activity = new ActivityLog();
+        activity.StartWriting(database, retentionDays: 14);
+
         try
         {
-            var log = new EdlLogger(folder: () => folder) { LockState = () => "live edit: onair" };
+            var log = new EdlLogger(activity) { LockState = () => "live edit: onair" };
             var ledger = new EdlLedger(log);
             var playback = new FakePlayback();
 
@@ -660,9 +664,10 @@ public sealed class EdlEditingTests
             Assert.Equal(new EdlFrameRun(1000, 1999), Assert.Single(created.SelectedFrames));
             Assert.Equal(2, created.Sources.Count);
 
-            // And the same lines, whole, in the day's EDL file.
+            // And the same entries, whole, in the database's EDL table.
             log.Flush(TimeSpan.FromSeconds(5));
-            string[] lines = File.ReadAllLines(Path.Combine(folder, $"edl-{created.Timestamp:yyyyMMdd}.jsonl"));
+            string[] lines = database.ReadDay(created.Timestamp.LocalDateTime.Date, LogArea.Edl)
+                                     .Select(l => l.Detail ?? "").ToArray();
 
             Assert.Equal(log.Entries.Count, lines.Length);
             Assert.Contains(lines, l => l.Contains("\"action\":\"editCreated\"") && l.Contains("\"sourceFiles\":[\"a.mp4\",\"b.mp4\"]"));
@@ -670,6 +675,8 @@ public sealed class EdlEditingTests
         }
         finally
         {
+            activity.Dispose();
+            database.Dispose();
             try { Directory.Delete(folder, true); } catch { }
         }
     }

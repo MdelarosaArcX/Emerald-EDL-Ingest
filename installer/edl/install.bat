@@ -92,8 +92,12 @@ rem inside Program Files - the wrong place, and not writable by a standard user.
 rem So it is settled here and written into the settings.
 
 rem Already configured: an update must not re-ask, and must not move anything.
-if exist "%SETTINGS%" (
-    for /f "delims=" %%F in ('powershell -NoProfile -Command "try { (Get-Content -Raw ''%SETTINGS%'' ^| ConvertFrom-Json).captureFolder } catch { '''' }"') do set "MEDIA=%%F"
+rem Read through the settings helper: the one-liner this used quoted the path wrongly
+rem and came back with a stray quote, which would then have been saved as the folder.
+if exist "%SETTINGS%" if exist "%HERE%settings.ps1" (
+    for /f "usebackq tokens=1,* delims==" %%K in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%settings.ps1" -Settings "%SETTINGS%" -Read`) do (
+        if /i "%%K"=="captureFolder" if not "%%L"=="" set "MEDIA=%%L"
+    )
 )
 
 if defined MEDIA goto :havemedia
@@ -119,9 +123,35 @@ if not "!ANSWER!"=="" set "MEDIA=!ANSWER!"
 
 :havemedia
 
+rem Where the database goes: the log of everything the EDL does. Asked once; an
+rem update keeps whatever was chosen.
+set "SETTINGSPS=%HERE%settings.ps1"
+set "DATA="
+if exist "%SETTINGS%" if exist "%SETTINGSPS%" (
+    for /f "usebackq tokens=1,* delims==" %%K in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%SETTINGSPS%" -Settings "%SETTINGS%" -Read`) do (
+        if /i "%%K"=="dataFolder" set "DATA=%%L"
+    )
+)
+
+if not defined DATA (
+    set "DATA=%APPDATA%\Emerald"
+    if "%INTERACTIVE%"=="1" (
+        echo.
+        echo The drives on this machine:
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%SETTINGSPS%" -Drives
+        echo.
+        echo The database holds the log of everything the EDL does. It is trimmed to
+        echo the last 14 days.
+        set "ANSWER="
+        set /p "ANSWER=Database folder? [!DATA!] "
+        if not "!ANSWER!"=="" set "DATA=!ANSWER!"
+    )
+)
+
 echo.
 echo   Program        %TARGET%
 echo   Media          %MEDIA%
+echo   Database       !DATA!
 echo   Settings       %SETTINGS%
 echo.
 
@@ -133,7 +163,7 @@ if not exist "%TARGET%" mkdir "%TARGET%" 2>nul
 rem /e all subdirectories, /purge remove what is no longer shipped, /njh /njs /ndl
 rem /nc /ns /nfl quiet. Robocopy returns 0-7 for success; 8 and above is a real
 rem failure.
-robocopy "%HERE%." "%TARGET%" /e /purge /xf install.bat uninstall.bat update.bat READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
+robocopy "%HERE%." "%TARGET%" /e /purge /xf install.bat uninstall.bat update.bat settings.ps1 READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
 if errorlevel 8 (
     echo [ERROR] Copying to %TARGET% failed.
     goto :fail
@@ -146,24 +176,24 @@ if not exist "%MEDIA%" (
     echo        reason, and is not a problem.
 )
 
+if not exist "!DATA!" mkdir "!DATA!" 2>nul
+
 rem ---------------------------------------------------------------- the settings
 rem
-rem Written only if there is no settings file yet, so installing the EDL onto a
-rem machine that already runs a full Emerald never overwrites what the operator
-rem has set up there. Just the folder: everything else is better left to Emerald's
-rem own defaults, and the board and port are chosen in the EDL itself.
+rem Merged, never overwritten: installing the EDL onto a machine that already runs
+rem a full Emerald keeps every folder the operator has set up there, and touches no
+rem other setting. The board and port are chosen in the EDL itself.
 
-if exist "%SETTINGS%" (
-    echo Settings already exist - left alone.
-) else (
-    if not exist "%APPDATA%\Emerald" mkdir "%APPDATA%\Emerald" 2>nul
-    powershell -NoProfile -Command "$p='%MEDIA%'.Replace('\','\\'); Set-Content -LiteralPath '%SETTINGS%' -Encoding utf8 -Value ('{' + [char]10 + '  \"captureFolder\": \"' + $p + '\"' + [char]10 + '}')"
+if exist "%SETTINGSPS%" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SETTINGSPS%" -Settings "%SETTINGS%" -Capture "%MEDIA%" -Data "!DATA!"
     if errorlevel 1 (
         echo [WARN] Could not write the settings file. Set the media folder in the
         echo        EDL after installing.
     ) else (
-        echo Settings written, media set to %MEDIA%.
+        echo Settings written.
     )
+) else (
+    echo [WARN] settings.ps1 is not beside install.bat, so the folders were not saved.
 )
 
 rem --------------------------------------------------------------- the shortcuts

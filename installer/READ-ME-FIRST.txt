@@ -39,15 +39,27 @@ WHAT EMERALD CANNOT BRING WITH IT
 WHERE THINGS GO
 
   Program        C:\Program Files\Emerald
-  Recordings     wherever you chose during the install
+  High-res       the DNxHD masters - wherever you chose during the install
+  Low-res        the proxies Live Edit plays - wherever you chose
+  Database       emerald.db (the log of everything, and the CPU, memory,
+                 graphics and disk figures while recording) and ingest.db -
+                 wherever you chose; %APPDATA%\Emerald unless you said
   Settings       %APPDATA%\Emerald\settings.json
-  Logs           %APPDATA%\Emerald\logs        (kept 14 days)
+
+  The log is kept 14 days, in the database. The Monitor shows it, by area
+  (errors, capture, playback, Live Edit, EDL, on air, ingest) and by day.
+
+  Putting the high-res and low-res folders on different drives keeps the
+  proxies' reads off the disk the masters are being written to. Both can be
+  changed later on the capture deck.
 
   Recordings are deliberately NOT put under Program Files. A standard user
   cannot write there, and it is the wrong home for terabytes of video.
 
-  Reinstalling over a working machine does not touch the settings file, so
-  the boards, ports and store you have set up survive an upgrade.
+  Reinstalling over a working machine never overwrites a folder already
+  chosen, and touches nothing else in the settings file, so the boards, ports
+  and store you have set up survive an upgrade. It asks only for what is not
+  set yet - on a machine installed before, that is the database folder.
 
 
 REMOTE MONITORING

@@ -66,6 +66,7 @@ public sealed class MonitorServer : IDisposable
     private readonly ActivityLog _log;
     private readonly PipelineState _state;
     private readonly TidalLock _tidal;
+    private readonly LiveAir _live;
     private readonly Func<Timecode?> _clock;
     private readonly string _name;
 
@@ -82,11 +83,12 @@ public sealed class MonitorServer : IDisposable
         : Array.Empty<string>();
 
     public MonitorServer(ActivityLog log, PipelineState state, TidalLock tidal,
-                         Func<Timecode?> clock, string name)
+                         Func<Timecode?> clock, string name, LiveAir? live = null)
     {
         _log = log;
         _state = state;
         _tidal = tidal;
+        _live = live ?? LiveAir.Shared;
         _clock = clock;
         _name = name;
     }
@@ -98,6 +100,8 @@ public sealed class MonitorServer : IDisposable
     /// on the machine — and that is worth a sentence rather than an exception, because the
     /// operator is the one who has to pick a different number.
     /// </summary>
+    private IDisposable? _sampling;
+
     public bool TryStart(int port, out string? problem)
     {
         problem = null;
@@ -120,6 +124,9 @@ public sealed class MonitorServer : IDisposable
             _cts = new CancellationTokenSource();
 
             _ = Task.Run(() => AcceptLoop(listener, _cts.Token));
+
+            // The machine's figures are sampled only while something is watching; this is.
+            _sampling ??= ResourceSampler.Shared.Watch();
 
             ActivityLog.Shared.Ok(LogSource.App,
                 $"Remote monitoring is on at {string.Join(", ", Addresses)} - read-only, " +
@@ -151,6 +158,9 @@ public sealed class MonitorServer : IDisposable
 
         _cts?.Dispose();
         _cts = null;
+
+        _sampling?.Dispose();
+        _sampling = null;
 
         ActivityLog.Shared.Warn(LogSource.App, "Remote monitoring is off.",
                                 @event: "monitor.api.stopped");
@@ -354,12 +364,30 @@ public sealed class MonitorServer : IDisposable
                 return;
 
             case "/api/state":
-                await Json(stream, MonitorFeed.State(_log, _state, _tidal, _clock), ct);
+                await Json(stream, MonitorFeed.State(_log, _state, _tidal, _clock, _live), ct);
                 return;
 
             case "/api/log":
                 await Json(stream, MonitorFeed.Log(_log, request.Number("since", 0),
-                                                   (int)request.Number("limit", 500)), ct);
+                                                   (int)request.Number("limit", 500),
+                                                   MonitorFeed.ParseArea(request.Value("area"))), ct);
+                return;
+
+            // A day read back from the database: ?day=yyyy-MM-dd&area=capture&limit=2000.
+            case "/api/history":
+            {
+                DateTime day = DateTime.TryParseExact(request.Value("day"), "yyyy-MM-dd", null,
+                                                      System.Globalization.DateTimeStyles.None, out DateTime d)
+                    ? d
+                    : DateTime.Today;
+
+                await Json(stream, MonitorFeed.History(_log, day, MonitorFeed.ParseArea(request.Value("area")),
+                                                       (int)request.Number("limit", 2000)), ct);
+                return;
+            }
+
+            case "/api/resources":
+                await Json(stream, MonitorFeed.Resources(ResourceSampler.Shared), ct);
                 return;
 
             case "/api/transmitted":

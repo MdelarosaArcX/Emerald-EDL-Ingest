@@ -40,11 +40,18 @@ if not errorlevel 1 (
     goto :fail
 )
 
-rem What the store is set to, so it can be named rather than guessed at.
+rem What the folders are set to, so they can be named rather than guessed at.
 set "MEDIA="
+set "HIGH="
+set "LOW="
+set "DATA="
 if exist "%APPDATA%\Emerald\settings.json" (
     for /f "delims=" %%F in ('powershell -NoProfile -Command "try { (Get-Content -Raw '%APPDATA%\Emerald\settings.json' | ConvertFrom-Json).captureFolder } catch { '' }"') do set "MEDIA=%%F"
+    for /f "delims=" %%F in ('powershell -NoProfile -Command "try { (Get-Content -Raw '%APPDATA%\Emerald\settings.json' | ConvertFrom-Json).highResFolder } catch { '' }"') do set "HIGH=%%F"
+    for /f "delims=" %%F in ('powershell -NoProfile -Command "try { (Get-Content -Raw '%APPDATA%\Emerald\settings.json' | ConvertFrom-Json).lowResFolder } catch { '' }"') do set "LOW=%%F"
+    for /f "delims=" %%F in ('powershell -NoProfile -Command "try { (Get-Content -Raw '%APPDATA%\Emerald\settings.json' | ConvertFrom-Json).dataFolder } catch { '' }"') do set "DATA=%%F"
 )
+if not defined DATA set "DATA=%APPDATA%\Emerald"
 
 echo Removing the program from %TARGET%
 echo.
@@ -69,18 +76,37 @@ if "%QUIET%"=="1" goto :keep
 
 echo Your recordings and settings have been left alone:
 echo.
-if defined MEDIA (echo   Recordings   !MEDIA!) else (echo   Recordings   wherever the capture deck was pointed)
+if defined HIGH (echo   High-res     !HIGH!) else if defined MEDIA (echo   Recordings   !MEDIA!) else (echo   Recordings   wherever the capture deck was pointed)
+if defined LOW echo   Low-res      !LOW!
 echo   Settings     %APPDATA%\Emerald
-echo   Logs         %APPDATA%\Emerald\logs
+echo   Database     !DATA!
 echo.
 
+rem The database first, and on its own: it can be beside the settings, and it is the
+rem record of what went to air. Answering no to it keeps it whatever is said next.
+if exist "!DATA!\emerald.db" (
+    set "ANSWER="
+    set /p "ANSWER=Delete the database in !DATA! - the log and resource history? [n] "
+    if /i "!ANSWER!"=="y" (
+        del /f /q "!DATA!\emerald.db" "!DATA!\emerald.db-wal" "!DATA!\emerald.db-shm" "!DATA!\ingest.db" 2>nul
+        if exist "!DATA!\peaks" rmdir /s /q "!DATA!\peaks" 2>nul
+        echo   [ok]   Database removed.
+    ) else (
+        echo   Database kept.
+    )
+)
+
+rem The settings and what lives with them - never the database files, which were
+rem asked about above.
 set "ANSWER="
-set /p "ANSWER=Delete the settings and logs as well? (recordings are never touched) [n] "
+set /p "ANSWER=Delete the settings as well? (recordings are never touched) [n] "
 if /i "!ANSWER!"=="y" (
-    rmdir /s /q "%APPDATA%\Emerald" 2>nul
-    echo   [ok]   Settings and logs removed.
+    del /f /q "%APPDATA%\Emerald\settings.json" "%APPDATA%\Emerald\settings.json.tmp" 2>nul
+    if exist "%APPDATA%\Emerald\logs" rmdir /s /q "%APPDATA%\Emerald\logs" 2>nul
+    if exist "%APPDATA%\Emerald\bookmarks" rmdir /s /q "%APPDATA%\Emerald\bookmarks" 2>nul
+    echo   [ok]   Settings removed.
 ) else (
-    echo   Settings and logs kept.
+    echo   Settings kept.
 )
 
 :keep

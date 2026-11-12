@@ -200,11 +200,11 @@ public static class MemoryMonitor
     public static string TakeJson() => JsonSerializer.Serialize(Take(), Compact);
 
     /// <summary>
-    /// Writes a snapshot to <c>memory-yyyyMMdd.jsonl</c> in <paramref name="folder"/> every
-    /// <paramref name="every"/>, until <see cref="Stop"/>. One line each: a day at ten seconds
+    /// Writes a snapshot to the database's <c>resource_process</c> table every
+    /// <paramref name="every"/>, until <see cref="Stop"/>. One row each: a day at ten seconds
     /// is a few megabytes.
     /// </summary>
-    public static void Start(string folder, TimeSpan every)
+    public static void Start(LogDatabase database, TimeSpan every)
     {
         lock (Gate)
         {
@@ -213,7 +213,7 @@ public static class MemoryMonitor
             var stop = new CancellationTokenSource();
             _stop = stop;
 
-            _writer = new Thread(() => WriteLoop(folder, every, stop.Token))
+            _writer = new Thread(() => WriteLoop(database, every, stop.Token))
             {
                 IsBackground = true,
                 Name = "memory monitor",
@@ -238,18 +238,15 @@ public static class MemoryMonitor
         writer?.Join(TimeSpan.FromSeconds(2));
     }
 
-    private static void WriteLoop(string folder, TimeSpan every, CancellationToken stop)
+    private static void WriteLoop(LogDatabase database, TimeSpan every, CancellationToken stop)
     {
         while (!stop.IsCancellationRequested)
         {
             try
             {
-                Directory.CreateDirectory(folder);
-
-                File.AppendAllText(Path.Combine(folder, $"memory-{DateTime.Now:yyyyMMdd}.jsonl"),
-                                   TakeJson() + Environment.NewLine);
+                database.WriteProcessSnapshot(DateTimeOffset.Now, TakeJson());
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            catch (Exception ex) when (ex is IOException or Microsoft.Data.Sqlite.SqliteException)
             {
                 // A record that cannot be written is not worth anything else's time.
             }
@@ -266,6 +263,13 @@ public static class MemoryMonitor
     /// The ffmpeg and ffprobe processes this one started. By parent rather than by name alone:
     /// another program's ffmpeg on the same machine is not this application's memory.
     /// </summary>
+    /// <summary>The ffmpeg and ffprobe processes this one started, with their memory.</summary>
+    public static IReadOnlyList<ChildProcessMemory> Children()
+    {
+        using Process me = Process.GetCurrentProcess();
+        return Children(me.Id);
+    }
+
     private static IReadOnlyList<ChildProcessMemory> Children(int parent)
     {
         var found = new List<ChildProcessMemory>();

@@ -41,7 +41,7 @@ public sealed record CompletedSegment(
 /// </summary>
 public sealed class SegmentWatch
 {
-    private readonly string _root;
+    private readonly StorePaths _paths;
     private readonly string _prefix;
     private readonly DateTime _sinceUtc;
 
@@ -59,8 +59,14 @@ public sealed class SegmentWatch
     /// The per-recording folder to watch, or null for the flat store an older recording wrote to.
     /// </param>
     public SegmentWatch(string root, string namePrefix, DateTime sinceUtc, string? recordingFolder = null)
+        : this(StorePaths.Under(root), namePrefix, sinceUtc, recordingFolder)
     {
-        _root = root;
+    }
+
+    /// <param name="paths">The masters' folder and the proxies' folder, which may be on different drives.</param>
+    public SegmentWatch(StorePaths paths, string namePrefix, DateTime sinceUtc, string? recordingFolder = null)
+    {
+        _paths = paths;
         _prefix = namePrefix;
         _sinceUtc = sinceUtc;
         _recordingFolder = recordingFolder;
@@ -108,7 +114,7 @@ public sealed class SegmentWatch
     /// <summary>This recording's files of one output not yet announced, in name order.</summary>
     private List<string> Candidates(RecordingOutput output)
     {
-        string folder = RecordingProfile.FolderFor(output, _root);
+        string folder = _paths.For(output);
 
         // Inside this recording's own folder when there is one, so a second recorder writing
         // at the same time into its own folder is never mistaken for this one's segments.

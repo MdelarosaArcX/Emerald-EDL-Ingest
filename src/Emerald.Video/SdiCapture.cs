@@ -224,7 +224,7 @@ public sealed class SdiCapture : IDisposable
 
         try
         {
-            Directory.CreateDirectory(folder);
+            if (request.Store is null) Directory.CreateDirectory(folder);
 
             // Both halves of the per-recording folder, before the encoder is started: the
             // segment muxer does not create directories and fails on the first segment if the
@@ -233,7 +233,7 @@ public sealed class SdiCapture : IDisposable
             {
                 foreach (RecordingOutput output in RecordingProfile.Outputs)
                     Directory.CreateDirectory(
-                        Path.Combine(RecordingProfile.FolderFor(output, folder), naming.Folder));
+                        Path.Combine(request.Paths.For(output), naming.Folder));
             }
 
             // Claim the receiver before touching it. A live preview on the same input holds
@@ -679,7 +679,7 @@ public sealed class SdiCapture : IDisposable
 
                     // Off this thread: asking a drive a question is not something to do on the
                     // receiver's clock.
-                    string store = request.Folder;
+                    StorePaths store = request.Paths;
                     _ = Task.Run(() => CheckDisk(store, encoderWatch));
                 }
             }
@@ -729,13 +729,13 @@ public sealed class SdiCapture : IDisposable
                 if (upcoming.IsCompletedSuccessfully && upcoming.Result is { } unused)
                 {
                     unused.Finish();
-                    unused.RemoveIfEmpty(request.Folder);
+                    unused.RemoveIfEmpty(request.Paths);
                 }
                 else if (!upcoming.IsCompleted)
                 {
                     // Still opening after five seconds. Closed whenever it does open, or its
                     // ffmpeg would sit waiting on its input until the application went.
-                    string store = request.Folder;
+                    StorePaths store = request.Paths;
 
                     _ = upcoming.ContinueWith(t =>
                     {
@@ -833,21 +833,27 @@ public sealed class SdiCapture : IDisposable
     /// Warns while there is still time to act. A full disk is the one thing that has ended a
     /// recording on this plant: ffmpeg stays alive with its output dead, and takes no more frames.
     /// </summary>
-    private void CheckDisk(string folder, EncoderWatch watch)
+    private void CheckDisk(StorePaths store, EncoderWatch watch)
     {
-        long free;
+        // Both drives when the masters and the proxies are on different ones: whichever has
+        // less room left is the one that will stop the recording.
+        long free = long.MaxValue;
+        string folder = store.High;
 
-        try
+        foreach (string candidate in store.All)
         {
-            string? root = Path.GetPathRoot(Path.GetFullPath(folder));
-            if (string.IsNullOrEmpty(root)) return;
+            try
+            {
+                string? root = Path.GetPathRoot(Path.GetFullPath(candidate));
+                if (string.IsNullOrEmpty(root)) continue;
 
-            free = new DriveInfo(root).AvailableFreeSpace;
+                long left = new DriveInfo(root).AvailableFreeSpace;
+                if (left < free) { free = left; folder = candidate; }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-        {
-            return;
-        }
+
+        if (free == long.MaxValue) return;
 
         if (!watch.NoteDiskSpace(free)) return;
 
@@ -869,7 +875,7 @@ public sealed class SdiCapture : IDisposable
             // The segment muxer does not create directories - see the same step in Run.
             foreach (RecordingOutput output in RecordingProfile.Outputs)
                 Directory.CreateDirectory(
-                    Path.Combine(RecordingProfile.FolderFor(output, request.Folder), request.Names!.Value.Folder));
+                    Path.Combine(request.Paths.For(output), request.Names!.Value.Folder));
 
             return Encoder.Open(this, request, format, pairs, ct);
         }
@@ -1071,13 +1077,13 @@ public sealed class SdiCapture : IDisposable
         }
 
         /// <summary>Takes away this encoder's folders if it never wrote anything into them.</summary>
-        public void RemoveIfEmpty(string store)
+        public void RemoveIfEmpty(StorePaths store)
         {
             if (Names is not { } names) return;
 
             foreach (RecordingOutput output in RecordingProfile.Outputs)
             {
-                string dir = Path.Combine(RecordingProfile.FolderFor(output, store), names.Folder);
+                string dir = Path.Combine(store.For(output), names.Folder);
 
                 try
                 {
@@ -1127,7 +1133,7 @@ public sealed class SdiCapture : IDisposable
         foreach (string a in request.Profile.EncoderArguments(
                      format, pipeName, request.Folder, request.NamePrefix, SampleRate,
                      request.SingleFile, request.StartTimecode, request.ExtraAudio, audioPairs,
-                     request.SingleFile ? null : request.Names))
+                     request.SingleFile ? null : request.Names, request.Paths))
             info.ArgumentList.Add(a);
 
         Process ff = Process.Start(info) ?? throw new InvalidOperationException("Could not start ffmpeg for capture.");

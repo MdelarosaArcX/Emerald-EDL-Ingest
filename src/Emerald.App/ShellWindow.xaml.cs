@@ -191,7 +191,8 @@ public partial class ShellWindow : Window
         AudioBitrateCombo.ItemsSource = RecordingProfile.AudioBitrates;
         SampleRateCombo.ItemsSource = RecordingProfile.SampleRates;
         SegmentCombo.ItemsSource = RecordingProfile.SegmentLengths;
-        StorageLimitCombo.ItemsSource = StorageLimits;
+        HighLimitCombo.ItemsSource = StorageLimits;
+        LowLimitCombo.ItemsSource = StorageLimits;
 
         _clock.Tick += OnClockTick;
         _tick.Tick += OnTick;
@@ -206,19 +207,28 @@ public partial class ShellWindow : Window
 
     private async void ShellWindow_Loaded(object sender, RoutedEventArgs e)
     {
-        OutputPathBox.Text = MediaLibrary.FolderFor(_settings);
+        StorePaths paths = MediaLibrary.PathsFor(_settings);
+        HighResBox.Text = paths.High;
+        LowResBox.Text = paths.Low;
         RecordTitleBox.Text = RecordingSequence.PrefixOr(_settings.RecordingTitle);
         RecordDescriptionBox.Text = _settings.RecordingDescription;
         SetDurationBox.Text = _settings.RecordingDuration;
 
-        StorageLimitCombo.SelectedItem =
-            StorageLimits.FirstOrDefault(o => o.Value == _settings.RecordingStorageLimitGb) ?? StorageLimits[0];
+        HighLimitCombo.SelectedItem =
+            StorageLimits.FirstOrDefault(o => o.Value == (_settings.HighResLimitGb ?? 0)) ?? StorageLimits[0];
+        LowLimitCombo.SelectedItem =
+            StorageLimits.FirstOrDefault(o => o.Value == (_settings.LowResLimitGb ?? 0)) ?? StorageLimits[0];
 
         LoadProfile();
         UpdateBreadcrumbs();
         UpdateRecordUi();
         RenumberCaptureAudio();
         ShowStorage();
+
+        // The controls hold what was saved; from here on a change is the operator's. Nothing
+        // used to clear this, so every handler that waits for it - the folders, the storage
+        // limits, Delay ready - never acted on a change until Record was pressed.
+        _loading = false;
 
         TimecodeLink.Connect(_settings);
         TimecodeLink.UrlChanged += OnTimecodeUrlChanged;
@@ -575,27 +585,60 @@ public partial class ShellWindow : Window
 
     // ------------------------------------------------------------------ the store
 
-    private string StoreFolder
-    {
-        get
-        {
-            string typed = OutputPathBox.Text.Trim();
-            return typed.Length == 0 ? MediaLibrary.DefaultFolder : typed;
-        }
-    }
+    /// <summary>The high-res and low-res folders as typed, each one left empty being its folder in the default store.</summary>
+    private StorePaths Store =>
+        MediaLibrary.PathsFor(_settings.CaptureFolder, HighResBox.Text, LowResBox.Text);
 
-    private void OutputPath_LostFocus(object sender, RoutedEventArgs e)
+    /// <summary>The store as one folder, for the places that show or open one: the proxies' folder's store.</summary>
+    private string StoreFolder => Store.Root ?? Store.Low;
+
+    private void StorePath_LostFocus(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
 
-        OutputPathBox.Text = StoreFolder;
-        _settings.CaptureFolder = OutputPathBox.Text.Trim();
+        ApplyStorePaths();
+    }
 
-        // Saved straight away: Live Edit reads its capture media from this path, and should not
-        // wait for this deck to close to find out where the recording is going.
-        AppSettings.SaveCaptureFolder(_settings.CaptureFolder);
+    private void ApplyStorePaths()
+    {
+        StorePaths store = Store;
+        HighResBox.Text = store.High;
+        LowResBox.Text = store.Low;
+
+        if (_settings.HighResFolder == store.High && _settings.LowResFolder == store.Low) return;
+
+        _settings.HighResFolder = store.High;
+        _settings.LowResFolder = store.Low;
+
+        // Saved straight away: Live Edit reads its capture media from these folders, and should
+        // not wait for this deck to close to find out where the recording is going.
+        AppSettings.SaveStoreFolders(store.High, store.Low);
+
+        ActivityLog.Shared.Info(LogSource.Capture,
+            $"Masters go to {store.High}, proxies to {store.Low}" +
+            (store.Split ? " - on different drives." : "."),
+            @event: "capture.folders");
 
         RefreshClips();
+        ShowStorage();
+    }
+
+    private void BrowseStorePath_Click(object sender, RoutedEventArgs e)
+    {
+        TextBox box = ReferenceEquals(sender, HighResBrowse) ? HighResBox : LowResBox;
+
+        var dialog = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = ReferenceEquals(box, HighResBox)
+                ? "Folder for the high-res masters"
+                : "Folder for the low-res proxies",
+        };
+
+        if (Directory.Exists(box.Text.Trim())) dialog.InitialDirectory = box.Text.Trim();
+        if (dialog.ShowDialog(this) != true) return;
+
+        box.Text = dialog.FolderName;
+        ApplyStorePaths();
     }
 
     /// <summary>Read on the capture thread, which cannot ask the window itself.</summary>
@@ -609,7 +652,7 @@ public partial class ShellWindow : Window
         // while a recording is going. The window that lists the store is Live Edit.
         if (StageMedia.Visibility != Visibility.Visible) return;
 
-        string folder = StoreFolder;
+        StorePaths store = Store;
         int rate = SelectedRate();
         string? ffmpeg = Ffmpeg.Locate(_settings.FfmpegPath);
         string? selected = (ClipStrip.SelectedItem as ClipItem)?.Path;
@@ -621,7 +664,7 @@ public partial class ShellWindow : Window
         // through a UI event.
         Task.Run(() =>
         {
-            IReadOnlyList<CapturedClip> clips = MediaLibrary.List(folder, MediaProbe.LocateFfprobe(ffmpeg), rate);
+            IReadOnlyList<CapturedClip> clips = MediaLibrary.List(store, MediaProbe.LocateFfprobe(ffmpeg), rate);
 
             var items = clips.Select(c => new ClipItem
             {
@@ -1010,29 +1053,38 @@ public partial class ShellWindow : Window
             return;
         }
 
-        string folder = StoreFolder;
-        OutputPathBox.Text = folder;
+        StorePaths store = Store;
+        HighResBox.Text = store.High;
+        LowResBox.Text = store.Low;
 
-        try
+        foreach (string each in store.All)
         {
-            Directory.CreateDirectory(folder);
+            try
+            {
+                Directory.CreateDirectory(each);
+            }
+            catch (Exception ex)
+            {
+                SetStatus($"cannot write to {each}: {ex.Message}", true);
+                return;
+            }
         }
-        catch (Exception ex)
-        {
-            SetStatus($"cannot write to {folder}: {ex.Message}", true);
-            return;
-        }
+
+        string folder = store.Root ?? store.High;
 
         // Written through before the request is assembled, because the request is built from
         // the settings - the same way the EDL builds its own.
         CurrentProfile().ApplyTo(_settings);
         _settings.CaptureFrameRate = SelectedRate();
-        _settings.CaptureFolder = folder;
-        _settings.RecordingStorageLimitGb = StorageLimitGb;
+        _settings.HighResFolder = store.High;
+        _settings.LowResFolder = store.Low;
+        _settings.HighResLimitGb = HighLimitGb;
+        _settings.LowResLimitGb = LowLimitGb;
+        _settings.RecordingStorageLimitGb = HighLimitGb;
 
-        // The folder this recording goes into, saved before it starts, so Live Edit shows these
-        // segments rather than whatever folder it was last told about.
-        AppSettings.SaveCaptureFolder(folder);
+        // The folders this recording goes into, saved before it starts, so Live Edit shows these
+        // segments rather than whatever folders it was last told about.
+        AppSettings.SaveStoreFolders(store.High, store.Low);
 
         IReadOnlyList<CaptureAudioTrack> addedAudio = CurrentCaptureAudio();
 
@@ -1045,7 +1097,7 @@ public partial class ShellWindow : Window
 
         if (!RecordingSetup.TryBuild(_settings, board.Index, port.Index, folder, SelectedRate(),
                                      RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem,
-                                     extraAudio: addedAudio))
+                                     extraAudio: addedAudio, store: store))
         {
             SetStatus(problem!, true);
 
@@ -1078,14 +1130,14 @@ public partial class ShellWindow : Window
             $"{_settings.RecordingSegmentSeconds} s.",
             @event: "capture.folder",
             correlation: _capture.SessionId,
-            file: Path.Combine(RecordingProfile.FolderFor(RecordingProfile.LowRes, folder), naming.Folder),
-            detail: $"folder {naming.Folder}\nfirst number {naming.Start}");
+            file: Path.Combine(store.Low, naming.Folder),
+            detail: $"folder {naming.Folder}\nfirst number {naming.Start}\nhigh {store.High}\nlow {store.Low}");
 
         // After Start, because that is where the session is minted, and the whole point of the
         // line is to name the recording everything after it will refer to.
         ActivityLog.Shared.Ok(LogSource.Capture,
             $"Recording {request!.NamePrefix} from board {board.Index} {port.Name} at " +
-            $"{SelectedRate()} fps into {folder}." +
+            $"{SelectedRate()} fps, masters into {store.High}, proxies into {store.Low}." +
             (_captureAudio.Count > 0 ? $" {_captureAudio.Count} added audio track(s)." : ""),
             @event: "capture.started",
             correlation: _capture.SessionId,
@@ -1093,9 +1145,9 @@ public partial class ShellWindow : Window
 
         // From here the store is watched for each segment as it is finished, and every one
         // is written down with its length and its size under this session.
-        _segments = new SegmentWatch(folder, request.NamePrefix, _recordStartedUtc, naming.Folder);
+        _segments = new SegmentWatch(store, request.NamePrefix, _recordStartedUtc, naming.Folder);
         _previousSegments = null;
-        _segmentRoot = folder;
+        _segmentRoot = store;
         _segmentPrefix = request.NamePrefix;
         _segmentSession = _capture.SessionId;
         _segmentRate = SelectedRate();
@@ -1540,6 +1592,10 @@ public partial class ShellWindow : Window
         // The receiver cannot be moved out from under a running recording, and neither can the
         // segment length: the encoder is told it once, when it starts.
         BoardBox.IsEnabled = PortBox.IsEnabled = SegmentCombo.IsEnabled = !live;
+
+        // Nor can the folders: the recorder, the segment watch and the storage limit are all
+        // told them once. Moving them mid-recording left the limit policing an empty folder.
+        HighResBox.IsEnabled = LowResBox.IsEnabled = HighResBrowse.IsEnabled = LowResBrowse.IsEnabled = !live;
     }
 
     private void OnCaptureMessage(string text, bool problem) =>
@@ -1751,7 +1807,8 @@ public partial class ShellWindow : Window
 
         try
         {
-            string folder = StoreFolder;
+            // Where snapshots always went: the store, or the high-res folder when the two are apart.
+            string folder = Store.Root ?? Store.High;
             Directory.CreateDirectory(folder);
 
             string path = Path.Combine(folder, $"snapshot_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.png");
@@ -1853,10 +1910,8 @@ public partial class ShellWindow : Window
         new RecordingOption<int>(2000, "2 TB"),
     };
 
-    private int StorageLimitGb =>
-        (StorageLimitCombo.SelectedItem as RecordingOption<int>)?.Value ?? 0;
-
-    private long StorageLimitBytes => StorageLimitGb * (1L << 30);
+    private int HighLimitGb => (HighLimitCombo.SelectedItem as RecordingOption<int>)?.Value ?? 0;
+    private int LowLimitGb => (LowLimitCombo.SelectedItem as RecordingOption<int>)?.Value ?? 0;
 
     /// <summary>The slow tick is twice a second; a sweep every ten seconds is often enough.</summary>
     private const int StorageTicksApart = 20;
@@ -1866,12 +1921,14 @@ public partial class ShellWindow : Window
     private static readonly IReadOnlyList<RecordingOption<bool>> DelayReadyChoices = new[]
     {
         new RecordingOption<bool>(true, "On (instant air)"),
-        new RecordingOption<bool>(false, "Off (saves RAM)"),
+        new RecordingOption<bool>(false, "Off (no ring on disk)"),
     };
 
     /// <summary>
-    /// Whether a recording keeps a delay ring filling before anything is armed. The largest use of
-    /// memory in the application, and for a recording that never goes to air, no use at all.
+    /// Whether a recording keeps a delay ring filling before anything is armed. On by default: it is
+    /// what puts tidal lock and Go Live to air at once. It costs a ring file on the delay folder's
+    /// drive and that drive's write speed (about 104 MB/s at 1080p25), and since the ring is written
+    /// ahead to disk, only a few seconds of it in memory.
     /// </summary>
     private void DelayReady_Changed(object sender, SelectionChangedEventArgs e)
     {
@@ -1891,14 +1948,15 @@ public partial class ShellWindow : Window
     {
         if (_loading) return;
 
-        _settings.RecordingStorageLimitGb = StorageLimitGb;
+        _settings.HighResLimitGb = HighLimitGb;
+        _settings.LowResLimitGb = LowLimitGb;
+        _settings.RecordingStorageLimitGb = HighLimitGb;
         ShowStorage();
 
         ActivityLog.Shared.Info(LogSource.Media,
-            StorageLimitGb == 0
-                ? "Storage limit removed - recordings are kept until the disk fills."
-                : $"Storage limit set to {StorageLimitGb} GB - the oldest recordings will be " +
-                  "deleted to make room for the newest.",
+            $"Storage limits: high-res {(HighLimitGb == 0 ? "none" : $"{HighLimitGb} GB")}, " +
+            $"low-res {(LowLimitGb == 0 ? "none" : $"{LowLimitGb} GB")}. Past a limit the oldest " +
+            "recordings in that folder are deleted to make room for the newest.",
             @event: "media.limit");
 
         // Applied straight away rather than at the next recording: a limit lowered below what
@@ -1906,19 +1964,37 @@ public partial class ShellWindow : Window
         EnforceStorageLimit();
     }
 
-    /// <summary>Shows what the store is using against the limit, whether recording or not.</summary>
+    private bool _measuring;
+
+    /// <summary>
+    /// Shows what each folder is using against its limit, whether recording or not. Measured
+    /// off the UI thread: it lists every file in both folders.
+    /// </summary>
     private void ShowStorage()
     {
-        if (StorageNote is null) return;
+        if (StorageNote is null || _measuring) return;
 
-        long used = StorageWarden.Size(StoreFolder);
+        _measuring = true;
+        StorePaths store = Store;
 
-        StorageNote.Text = StorageLimitGb == 0
-            ? $"{StorageSweep.Size(used)} in the store"
-            : $"{StorageSweep.Size(used)} of {StorageLimitGb} GB";
+        Task.Run(() => StorageWarden.Size(store)).ContinueWith(t =>
+        {
+            _measuring = false;
+            if (t.IsCompletedSuccessfully) ShowStorage(t.Result.High, t.Result.Low);
+        }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
 
-        StorageNote.Foreground = (Brush)FindResource(
-            StorageLimitGb > 0 && used > StorageLimitBytes ? "Warn" : "IpDim");
+    private void ShowStorage(long high, long low)
+    {
+        static string Of(long used, int limitGb) =>
+            limitGb == 0 ? StorageSweep.Size(used) : $"{StorageSweep.Size(used)} of {limitGb} GB";
+
+        StorageNote.Text = $"high {Of(high, HighLimitGb)}  ·  low {Of(low, LowLimitGb)}";
+
+        bool over = (HighLimitGb > 0 && high > HighLimitGb * (1L << 30)) ||
+                    (LowLimitGb > 0 && low > LowLimitGb * (1L << 30));
+
+        StorageNote.Foreground = (Brush)FindResource(over ? "Warn" : "IpDim");
     }
 
     /// <summary>
@@ -1931,12 +2007,12 @@ public partial class ShellWindow : Window
     /// </summary>
     private void EnforceStorageLimit()
     {
-        long limit = StorageLimitBytes;
-        if (limit <= 0) return;
+        long high = HighLimitGb * (1L << 30), low = LowLimitGb * (1L << 30);
+        if (high <= 0 && low <= 0) return;
 
-        string folder = StoreFolder;
+        StorePaths store = _recording && _segmentRoot is { } recording ? recording : Store;
 
-        Task.Run(() => StorageWarden.Enforce(folder, limit, DateTime.UtcNow))
+        Task.Run(() => StorageWarden.Enforce(store, high, low, DateTime.UtcNow))
             .ContinueWith(t =>
             {
                 // A sweep that threw means the limit is not being enforced and the store keeps
@@ -1947,18 +2023,26 @@ public partial class ShellWindow : Window
                     ActivityLog.Shared.Error(LogSource.Media,
                         $"The storage limit could not be enforced: " +
                         $"{t.Exception?.GetBaseException().Message}",
-                        @event: "media.limitfailed", file: folder);
+                        @event: "media.limitfailed", file: store.High);
                     return;
                 }
 
-                if (!t.Result.DidAnything) return;
+                (StorageSweep highSweep, StorageSweep lowSweep) = t.Result;
 
-                StorageSweep sweep = t.Result;
+                if (highSweep.DidAnything)
+                    ActivityLog.Shared.Warn(LogSource.Media,
+                        $"High-res storage limit reached - {highSweep}.", @event: "media.pruned", file: store.High);
 
-                ActivityLog.Shared.Warn(LogSource.Media,
-                    $"Storage limit reached - {sweep}.", @event: "media.pruned", file: folder);
+                if (lowSweep.DidAnything)
+                    ActivityLog.Shared.Warn(LogSource.Media,
+                        $"Low-res storage limit reached - {lowSweep}.", @event: "media.pruned", file: store.Low);
 
-                Dispatcher.BeginInvoke(() => { ShowStorage(); RefreshClips(); });
+                // The sweep measured both folders; shown from that rather than measured again.
+                Dispatcher.BeginInvoke(() =>
+                {
+                    ShowStorage(highSweep.AfterBytes, lowSweep.AfterBytes);
+                    if (highSweep.DidAnything || lowSweep.DidAnything) RefreshClips();
+                });
             }, TaskScheduler.Default);
     }
 
@@ -1976,7 +2060,7 @@ public partial class ShellWindow : Window
     private SegmentWatch? _previousSegments;
 
     /// <summary>The store and file prefix the recording's watch was made with, for the new day's.</summary>
-    private string? _segmentRoot;
+    private StorePaths? _segmentRoot;
     private string? _segmentPrefix;
 
     /// <summary>
@@ -1998,7 +2082,7 @@ public partial class ShellWindow : Window
                 $"{names.FirstFile(RecordingProfile.LowRes.Extension)}. Nothing stopped.",
                 @event: "capture.newday",
                 correlation: _capture.SessionId,
-                file: Path.Combine(RecordingProfile.FolderFor(RecordingProfile.LowRes, folder), names.Folder),
+                file: Path.Combine(folder.Low, names.Folder),
                 detail: $"folder {names.Folder}\nfirst number {names.Start}");
         });
     }
@@ -2426,8 +2510,9 @@ public partial class ShellWindow : Window
         if (_recording && ++_storageTicks >= StorageTicksApart)
         {
             _storageTicks = 0;
-            EnforceStorageLimit();
-            ShowStorage();
+            // The sweep shows what it measured; with no limit set, the folders are measured
+            // here instead - once, off the UI thread.
+            if (HighLimitGb > 0 || LowLimitGb > 0) EnforceStorageLimit(); else ShowStorage();
             AnnounceSegments();
         }
 
@@ -2658,7 +2743,8 @@ public partial class ShellWindow : Window
     {
         CurrentProfile().ApplyTo(_settings);
 
-        _settings.CaptureFolder = OutputPathBox.Text.Trim();
+        _settings.HighResFolder = Store.High;
+        _settings.LowResFolder = Store.Low;
         _settings.CaptureFrameRate = SelectedRate();
         _settings.RecordingTitle = RecordTitleBox.Text.Trim();
         _settings.RecordingDescription = RecordDescriptionBox.Text.Trim();
