@@ -568,4 +568,113 @@ public sealed class DelayLineTests : IDisposable
 
         Assert.InRange(line.FlushedThrough, 200 - 12, 200);
     }
+
+    // ------------------------------------------------------------------ disk given back
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern uint GetCompressedFileSizeW(string path, out uint high);
+
+    /// <summary>What the file actually takes on disk, which for a sparse file is less than its length.</summary>
+    private static long Allocated(string path)
+    {
+        uint low = GetCompressedFileSizeW(path, out uint high);
+        return ((long)high << 32) | low;
+    }
+
+    private static void WaitFor(Func<bool> condition)
+    {
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition() && waited.ElapsedMilliseconds < 5000) Thread.Sleep(25);
+    }
+
+    /// <summary>
+    /// A line made with headroom for inserts takes disk for its delay, not its whole length:
+    /// frames more than the delay and a margin behind the writer are given back, and a read
+    /// of one is turned away as if the ring had come round.
+    /// </summary>
+    [Fact]
+    public void A_line_gives_back_the_disk_it_is_not_keeping()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(28));
+        DelayFrameBuffer buffer = line.NewBuffer();
+        Assert.True(line.IsSparse);
+
+        for (int i = 0; i < 600; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false);
+        }
+
+        // Keeps the 2 s delay (50) and a 2 s margin (50) behind the writer at 600.
+        WaitFor(() => line.ReleasedThrough >= 500);
+        Assert.Equal(500, line.ReleasedThrough);
+        Assert.Equal(500, line.OldestHeld);
+
+        Assert.Equal(DelayReadResult.Lapped, line.TryRead(499, buffer));
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(500, buffer));
+        Assert.Equal(Pattern(line.FrameBytes, 500), buffer.Video);
+        Assert.Equal(-1, line.RecordingFrameAt(10));
+
+        long length = new FileInfo(line.Path).Length;
+        Assert.InRange(Allocated(line.Path), 0, length / 3);
+    }
+
+    /// <summary>
+    /// A transmitter's hold keeps its frames on disk however far behind it is, and whether or
+    /// not it is reading - it may be playing an insert and coming back. Let go, they are given back.
+    /// </summary>
+    [Fact]
+    public void A_hold_keeps_its_frames_until_it_is_let_go()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(28));
+        DelayFrameBuffer buffer = line.NewBuffer();
+        byte[] frame = Pattern(line.FrameBytes, 0);
+
+        using (DelayHold hold = line.Hold(100))
+        {
+            for (int i = 0; i < 600; i++) line.Write(frame, frame.Length, null, 0, false);
+
+            // Two seconds short of the hold, and no further however long it waits.
+            WaitFor(() => line.ReleasedThrough >= 50);
+            Thread.Sleep(600);
+            Assert.Equal(50, line.ReleasedThrough);
+            Assert.Equal(DelayReadResult.Ok, line.TryRead(100, buffer));
+
+            hold.Move(300);
+            WaitFor(() => line.ReleasedThrough >= 250);
+            Assert.Equal(250, line.ReleasedThrough);
+        }
+
+        WaitFor(() => line.ReleasedThrough >= 500);
+        Assert.Equal(500, line.ReleasedThrough);
+    }
+
+    /// <summary>
+    /// A ready line is as long as the longest delay with all its inserts, and keeps its whole
+    /// length unless told otherwise; told how much a transmitter could start from, it keeps that.
+    /// </summary>
+    [Fact]
+    public void A_ready_line_keeps_what_it_is_told_to()
+    {
+        using DelayLine line = Open(TimeSpan.FromSeconds(30));
+        byte[] frame = Pattern(line.FrameBytes, 0);
+
+        for (int i = 0; i < 600; i++) line.Write(frame, frame.Length, null, 0, false);
+
+        WaitFor(() => line.FlushedThrough >= 588);
+        Thread.Sleep(600);
+        Assert.Equal(0, line.ReleasedThrough);
+
+        long keep = 100;
+        line.KeepBehind(() => keep);
+        WaitFor(() => line.ReleasedThrough >= 450);
+        Assert.Equal(450, line.ReleasedThrough);
+
+        // Asked for more later: what was given back stays given back, and nothing more goes.
+        keep = 300;
+        for (int i = 0; i < 50; i++) line.Write(frame, frame.Length, null, 0, false);
+        Thread.Sleep(600);
+        Assert.Equal(450, line.ReleasedThrough);
+        Assert.Equal(450, line.OldestHeld);
+    }
 }

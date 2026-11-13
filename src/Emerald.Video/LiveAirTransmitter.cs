@@ -33,6 +33,9 @@ public sealed class LiveAirTransmitter : IDisposable
     private readonly uint _boardIndex;
     private readonly int[] _txChannels;
     private readonly DelayLine _line;
+
+    // Keeps the frames this will read on disk while it is not reading them (an insert, a stall).
+    private readonly DelayHold _hold;
     private readonly VideoFormat _format;
     private readonly string _ffmpegPath;
     private readonly Func<IReadOnlyList<LiveCue>> _cues;
@@ -84,6 +87,7 @@ public sealed class LiveAirTransmitter : IDisposable
         _target = (long)Math.Ceiling(Math.Max(0, delay.TotalSeconds) * _format.FrameRate);
 
         _line.AddRef();
+        _hold = _line.Hold(Math.Max(0, _line.FramesWritten - _target));
     }
 
     private string Ports =>
@@ -186,6 +190,7 @@ public sealed class LiveAirTransmitter : IDisposable
             {
                 long written = _line.FramesWritten;
                 long target = Interlocked.Read(ref _target);
+                _hold.Move(readSeq);
 
                 // The newest EDL, read every pass - while filling and holding as well as on air -
                 // because reading it is what tells Live Edit this transmitter has its version.
@@ -487,6 +492,7 @@ public sealed class LiveAirTransmitter : IDisposable
 
             output?.Dispose();
             SdiPorts.Shared.ReleaseAll(PortOwner);
+            _hold.Dispose();
             _line.Release();
         }
     }

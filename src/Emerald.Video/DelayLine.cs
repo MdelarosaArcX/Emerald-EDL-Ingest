@@ -118,6 +118,15 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private const int FlushEveryMs = 250;
     private const int FlushChunkFrames = 25;
 
+    // Disk given back at a time behind what is kept (ReleaseBehind), and how far clear of the
+    // writer's next slots that stays: the writer must never be writing a slot as it is zeroed.
+    private const int ReleaseChunkFrames = 250;
+    private const int WrapMarginSeconds = 5;
+
+    // FSCTL_SET_SPARSE and FSCTL_SET_ZERO_DATA.
+    private const uint SetSparseCode = 0x000900C4;
+    private const uint SetZeroDataCode = 0x000980C8;
+
     // A reader that has not been heard from for this long no longer holds its pages. Long enough
     // to ride out a stalled transmitter, short enough that a scrub does not hold them for good.
     private const long ReaderLapseMs = 2000;
@@ -176,6 +185,11 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private long _trimmedThrough;
     private long _readerTrimmedThrough;
     private long _flushedThrough;
+    private long _releasedThrough;
+    private readonly bool _sparse;
+    private Func<long>? _keep;
+    private readonly object _holdsLock = new();
+    private readonly List<DelayHold> _holds = new();
     private readonly ManualResetEventSlim _stopFlushing = new(false);
     private readonly Thread _flusher;
     private readonly IDisposable _dirtyGauge;
@@ -212,6 +226,60 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// </summary>
     public long FlushedThrough => Volatile.Read(ref _flushedThrough);
 
+    /// <summary>
+    /// Frames before this one have had their disk space given back. Nothing reads them: a read
+    /// of one is <see cref="DelayReadResult.Lapped"/>, as if the ring had come round.
+    /// </summary>
+    public long ReleasedThrough => Volatile.Read(ref _releasedThrough);
+
+    /// <summary>
+    /// The ring file is sparse, so it takes disk only for the frames it is holding, not for its
+    /// whole length. False on a volume that cannot do that; such a ring takes its full size.
+    /// </summary>
+    public bool IsSparse => _sparse;
+
+    /// <summary>
+    /// The oldest frame that can still be read: the ring's far end, or the last frame given back
+    /// to the disk, whichever is newer.
+    /// </summary>
+    public long OldestHeld
+    {
+        get
+        {
+            long written = Volatile.Read(ref _written);
+            return Math.Max(Math.Max(0, written - SlotCount), Volatile.Read(ref _releasedThrough));
+        }
+    }
+
+    /// <summary>
+    /// How far behind the writer the line keeps frames on disk when no transmitter is holding
+    /// any further back, asked afresh every quarter second. <see cref="TargetFrames"/> until set.
+    ///
+    /// A line kept ready is made big enough for any delay and the inserts that can grow it, but
+    /// until something is armed only the longest delay a transmitter could start with is worth
+    /// keeping. The rest of its length is given back to the disk, and taken again only while
+    /// a transmitter is actually that far behind.
+    /// </summary>
+    public void KeepBehind(Func<long> frames) => Volatile.Write(ref _keep, frames);
+
+    /// <summary>
+    /// A claim on the frames from <paramref name="sequence"/> on, for a transmitter: nothing at
+    /// or after it is given back to the disk until the claim is moved on or disposed. Unlike a
+    /// read, it holds while the transmitter is playing something else - an insert - and will
+    /// come back to the ring where it left off.
+    /// </summary>
+    public DelayHold Hold(long sequence)
+    {
+        var hold = new DelayHold(this, sequence);
+        lock (_holdsLock) _holds.Add(hold);
+        return hold;
+    }
+
+    internal void Unhold(DelayHold hold)
+    {
+        lock (_holdsLock) _holds.Remove(hold);
+    }
+
     /// <summary>Set when a write failed. The line seals itself rather than failing the recording.</summary>
     public string? Fault { get; private set; }
 
@@ -230,9 +298,10 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
     private unsafe DelayLine(string path, FileStream file, MemoryMappedFile mmf,
                              MemoryMappedViewAccessor view, CaptureFormat format,
-                             long slotCount, long stride, long targetFrames)
+                             long slotCount, long stride, long targetFrames, bool sparse)
     {
         Path = path;
+        _sparse = sparse;
         _file = file;
         _mmf = mmf;
         _view = view;
@@ -363,19 +432,26 @@ public sealed class DelayLine : IDelayLine, IDisposable
         {
             file = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read,
                                   4096, FileOptions.RandomAccess);
+            // Sparse, so the ring takes disk for the frames it holds and not for its whole length:
+            // a ready line is sized for the longest delay plus every insert, 41 GB at 420 s, and
+            // mostly holds the delay alone. Validate has already checked the whole length fits.
+            bool sparse = SetSparse(file);
             file.SetLength(size);
 
-            // Touch the last byte so the extent is real now. Discovering the volume is full
-            // forty minutes into a recording is not a discovery worth making.
-            file.Seek(size - 1, SeekOrigin.Begin);
-            file.WriteByte(0);
-            file.Flush(true);
+            if (!sparse)
+            {
+                // Touch the last byte so the extent is real now. Discovering the volume is full
+                // forty minutes into a recording is not a discovery worth making.
+                file.Seek(size - 1, SeekOrigin.Begin);
+                file.WriteByte(0);
+                file.Flush(true);
+            }
 
             mmf = MemoryMappedFile.CreateFromFile(file, null, size, MemoryMappedFileAccess.ReadWrite,
                                                   HandleInheritability.None, leaveOpen: true);
             view = mmf.CreateViewAccessor(0, size, MemoryMappedFileAccess.ReadWrite);
 
-            var line = new DelayLine(path, file, mmf, view, format, slots, stride, target);
+            var line = new DelayLine(path, file, mmf, view, format, slots, stride, target, sparse);
             line.WriteFileHeader();
             return line;
         }
@@ -629,6 +705,101 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
                 Volatile.Write(ref _flushedThrough, from + count);
             }
+
+            ReleaseBehind();
+        }
+    }
+
+    /// <summary>
+    /// The oldest frame anything may still want: the kept distance behind the writer, less a
+    /// margin, and never past a transmitter's hold or a frame not yet on disk.
+    /// </summary>
+    private long ReleaseFloor(long written)
+    {
+        long margin = (long)Math.Max(1, FrameRate) * ReaderMarginSeconds;
+        long keep = TargetFrames;
+
+        try
+        {
+            if (Volatile.Read(ref _keep) is { } asked) keep = Math.Max(0, asked());
+        }
+        catch
+        {
+            keep = SlotCount;                  // when in doubt, keep everything
+        }
+
+        long floor = written - keep - margin;
+
+        lock (_holdsLock)
+            foreach (DelayHold hold in _holds)
+                floor = Math.Min(floor, hold.At - margin);
+
+        return Math.Min(floor, Volatile.Read(ref _flushedThrough));
+    }
+
+    /// <summary>
+    /// Gives the disk space of frames nothing will read again back to the volume, so the ring
+    /// file takes what it holds and not its whole length. On the flusher's thread, after a flush.
+    ///
+    /// The mark moves before the zeroing, so a reader is turned away from a frame before it can
+    /// be cleared under it. Never within a few seconds of the writer's next slots: zeroing a
+    /// slot the writer had just filled again would put a black frame in the delay.
+    /// </summary>
+    private void ReleaseBehind()
+    {
+        if (!_sparse || Volatile.Read(ref _releaseBroken) != 0) return;
+
+        long wrapMargin = (long)Math.Max(1, FrameRate) * WrapMarginSeconds;
+
+        while (!_stopFlushing.IsSet && Volatile.Read(ref _disposed) == 0)
+        {
+            long written = Volatile.Read(ref _written);
+            long floor = ReleaseFloor(written);
+            long from = Math.Max(Volatile.Read(ref _releasedThrough), written - SlotCount + wrapMargin);
+            if (floor <= from) return;
+
+            long count = Math.Min(floor - from, ReleaseChunkFrames);
+            Volatile.Write(ref _releasedThrough, from + count);
+
+            long first = from % SlotCount;
+            long toEnd = Math.Min(count, SlotCount - first);
+
+            bool ok = ZeroSlots(first, toEnd);
+            if (count > toEnd) ok &= ZeroSlots(0, count - toEnd);
+
+            if (!ok)
+            {
+                // Not fatal: the ring just keeps the disk it has, as it always used to.
+                Volatile.Write(ref _releaseBroken, 1);
+                ActivityLog.Shared.Warn(LogSource.TidalLock,
+                    $"The delay ring could not give disk space back (error {Marshal.GetLastWin32Error()}); " +
+                    "it will take its full size on disk.",
+                    @event: "delay.releasefailed", file: Path);
+                return;
+            }
+        }
+    }
+
+    private int _releaseBroken;
+
+    private unsafe bool ZeroSlots(long firstSlot, long count)
+    {
+        long* range = stackalloc long[2];
+        range[0] = FileHeaderBytes + firstSlot * _stride;
+        range[1] = range[0] + count * _stride;
+
+        return DeviceIoControl(_file.SafeFileHandle, SetZeroDataCode, range, 16, null, 0, out _, IntPtr.Zero);
+    }
+
+    private static unsafe bool SetSparse(FileStream file)
+    {
+        try
+        {
+            return DeviceIoControl(file.SafeFileHandle, SetSparseCode, null, 0, null, 0, out _, IntPtr.Zero);
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -753,6 +924,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
         long written = Volatile.Read(ref _written);
         if (sequence >= written) return DelayReadResult.NotYetWritten;
         if (sequence < written - SlotCount) return DelayReadResult.Lapped;
+        if (sequence < Volatile.Read(ref _releasedThrough)) return DelayReadResult.Lapped;
 
         NoteReader(written - sequence);
 
@@ -823,6 +995,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
         long written = Volatile.Read(ref _written);
         if (sequence >= written || sequence < written - SlotCount) return -1;
+        if (sequence < Volatile.Read(ref _releasedThrough)) return -1;
 
         byte* slot = SlotAt(sequence);
 
@@ -950,4 +1123,34 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern unsafe bool FlushViewOfFile(void* address, nuint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern unsafe bool DeviceIoControl(Microsoft.Win32.SafeHandles.SafeFileHandle device, uint code,
+        void* input, uint inputSize, void* output, uint outputSize, out uint returned, IntPtr overlapped);
+}
+
+/// <summary>
+/// A transmitter's claim on a <see cref="DelayLine"/>'s frames from <see cref="At"/> on; see
+/// <see cref="DelayLine.Hold"/>. Moved on as the transmitter reads, disposed when it stops.
+/// </summary>
+public sealed class DelayHold : IDisposable
+{
+    private readonly DelayLine _line;
+    private long _at;
+    private int _disposed;
+
+    internal DelayHold(DelayLine line, long at)
+    {
+        _line = line;
+        _at = at;
+    }
+
+    public long At => Volatile.Read(ref _at);
+
+    public void Move(long sequence) => Volatile.Write(ref _at, sequence);
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0) _line.Unhold(this);
+    }
 }

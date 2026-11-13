@@ -1192,7 +1192,7 @@ public partial class ShellWindow : Window
         // The line that has been filling since the recording began, when it holds this delay:
         // the transmitter starts a delay behind the recorder straight away, rather than sending
         // black while a new line fills.
-        if (TakeReadyLine(TidalLock.Shared.Delay) is { } ready)
+        if (TakeReadyLine(TidalLock.Shared.Delay, TidalLock.Shared.Delay) is { } ready)
         {
             _delayLine = ready;
             TidalLock.Shared.RecordingRolled(ready, LineStartedAt(ready));
@@ -1351,6 +1351,11 @@ public partial class ShellWindow : Window
         _capture.ReportDelayDrops(() => line.Dropped);
         RecordingPicture.Shared.Line = line;
 
+        // Room for any delay and its inserts, but on disk only what a transmitter could start
+        // from; see ReadyKeepFrames.
+        int rate = line.FrameRate;
+        line.KeepBehind(() => ReadyKeepFrames(rate));
+
         ActivityLog.Shared.Info(LogSource.Capture,
             $"DELAY  the last {TidalLock.Describe(TimeSpan.FromSeconds(line.TargetFrames / (double)line.FrameRate))} " +
             "of the recording is kept ready, so tidal lock and Go Live go to air as soon as they are armed.",
@@ -1358,15 +1363,42 @@ public partial class ShellWindow : Window
     }
 
     /// <summary>
-    /// The ready line, with a claim taken on it for a lock - when there is one and it holds
-    /// <paramref name="needs"/>. Null otherwise, and the lock makes a line of its own.
+    /// How much of the ready line stays on disk when nothing is reading it: the longest delay
+    /// tidal lock or Go Live could start with - the deck's, Live Edit's setting, or one either
+    /// has resolved - and not the headroom for inserts, which a transmitter only takes up once
+    /// it is on air and holding the recording back (it holds its own frames then). At 120 s
+    /// that is about 13 GB of a 41 GB ring. Asked from the line's flusher thread.
     /// </summary>
-    private DelayLine? TakeReadyLine(TimeSpan needs)
+    private long ReadyKeepFrames(int rate)
+    {
+        double seconds = Math.Max(Math.Max(_settings.LiveDelaySeconds, TidalLock.Shared.Delay.TotalSeconds),
+                                  LiveAir.Shared.Delay.TotalSeconds);
+        return (long)Math.Ceiling(seconds * rate);
+    }
+
+    /// <summary>
+    /// The ready line, with a claim taken on it for a lock - when there is one, it has
+    /// <paramref name="room"/>, and it still holds the last <paramref name="history"/> of the
+    /// recording. Null otherwise, and the lock makes a line of its own.
+    /// </summary>
+    private DelayLine? TakeReadyLine(TimeSpan room, TimeSpan history)
     {
         if (_readyLine is not { } ready || ready.IsSealed) return null;
 
-        long frames = (long)Math.Ceiling(needs.TotalSeconds * ready.FrameRate);
+        long frames = (long)Math.Ceiling(room.TotalSeconds * ready.FrameRate);
         if (ready.TargetFrames < frames) return null;
+
+        // A delay set longer than the line was keeping, after it had given the older frames
+        // back to the disk: starting it a delay behind would read frames that are gone.
+        long behind = (long)Math.Ceiling(history.TotalSeconds * ready.FrameRate);
+        if (Math.Max(0, ready.FramesWritten - behind) < ready.OldestHeld)
+        {
+            ActivityLog.Shared.Info(LogSource.Capture,
+                $"DELAY  the ready line holds only the last {new Timecode(ready.FramesWritten - ready.OldestHeld, ready.FrameRate)}, " +
+                $"less than the {new Timecode(behind, ready.FrameRate)} asked for, so this delay fills from now.",
+                @event: "delay.readyshort", correlation: _capture.SessionId);
+            return null;
+        }
 
         ready.AddRef();
         return ready;
@@ -1391,6 +1423,11 @@ public partial class ShellWindow : Window
         long reach = ready is null
             ? long.MaxValue
             : ready.TargetFrames - (long)Math.Ceiling(headroom.TotalSeconds * rate);
+
+        // Once the line has given older frames back to the disk, no further back than it still
+        // holds, less a couple of seconds for the frames given back while this is armed.
+        if (ready is { ReleasedThrough: > 0 })
+            reach = Math.Min(reach, written - ready.OldestHeld - 2L * rate);
 
         long frames = TidalLock.FramesFor(start, 0, written, segment, reach);
         var delay = new Timecode(frames, rate);
@@ -1482,7 +1519,7 @@ public partial class ShellWindow : Window
 
         // Straight on air from the line that has been filling all along, when it has room for the
         // delay and for the inserts to grow it into.
-        if (TakeReadyLine(LiveAir.Shared.Delay + LiveAir.Shared.Headroom) is { } ready)
+        if (TakeReadyLine(LiveAir.Shared.Delay + LiveAir.Shared.Headroom, LiveAir.Shared.Delay) is { } ready)
         {
             _liveLine = ready;
             LiveAir.Shared.RecordingRolled(ready, PipelineState.Shared.RecordingStartedAt);

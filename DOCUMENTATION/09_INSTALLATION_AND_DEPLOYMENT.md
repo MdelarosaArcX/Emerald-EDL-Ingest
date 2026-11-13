@@ -17,7 +17,7 @@ Commands are from the project's own scripts.
 
 | Item | Figure | Source |
 |---|---|---|
-| Ring disk | About 44 GB for the default 7-minute ring at 1080p25, plus 2 GB free-space margin. About 105 MB/s sustained. | Calculated from `src/Emerald.Video/DelayLine.cs` |
+| Ring disk | About 44 GB free needed for the default 7-minute ring at 1080p25, plus 2 GB margin, but the sparse ring takes about 13 GB of it at the default 120 s delay (more only while Live Edit holds the picture back for inserts). About 105 MB/s sustained. | Calculated from `src/Emerald.Video/DelayLine.cs` |
 | Master recording | DNxHD at 145 Mb/s, about 65 GB an hour before audio | `src/Emerald.Video/RecordingProfile.cs` |
 | Proxy recording | Depends on the bitrate setting | |
 

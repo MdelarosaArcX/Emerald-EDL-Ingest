@@ -69,6 +69,9 @@ public sealed class DelayTransmitter : IDisposable
     /// </summary>
     private readonly int[] _txChannels;
     private readonly DelayLine _line;
+
+    // Keeps the frames this will read on disk while it is not reading them (an insert, a stall).
+    private readonly DelayHold _hold;
     private readonly VideoFormat _format;
     private readonly TimeSpan _delay;
 
@@ -112,6 +115,7 @@ public sealed class DelayTransmitter : IDisposable
         _segmentFrames = segmentSeconds > 0 ? (long)segmentSeconds * _format.FrameRate : 0;
 
         _line.AddRef();
+        _hold = _line.Hold(Math.Max(0, _line.FramesWritten - _targetFrames));
     }
 
     /// <summary>The ports, as a phrase - "TX1" or "TX1, TX3" - for anything that says where.</summary>
@@ -192,6 +196,7 @@ public sealed class DelayTransmitter : IDisposable
             while (!ct.IsCancellationRequested)
             {
                 long written = _line.FramesWritten;
+                _hold.Move(readSeq);
 
                 PaceAction action = DelayPacer.Decide(
                     written, readSeq, target, _line.SlotCount,
@@ -335,6 +340,7 @@ public sealed class DelayTransmitter : IDisposable
             // rest of the session with nothing holding it.
             SdiPorts.Shared.ReleaseAll(PortOwner);
 
+            _hold.Dispose();
             _line.Release();
             PipelineState.Shared.ClearAired();
         }

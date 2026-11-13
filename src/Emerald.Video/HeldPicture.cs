@@ -55,8 +55,9 @@ public sealed class HeldPicture : IDisposable
         long written = line.FramesWritten;
         long newest = line.RecordingFrameAt(written - 1);
 
-        // A slot or two in from the far end: the writer may be just about to take the oldest.
-        long oldest = line.RecordingFrameAt(Math.Max(0, written - line.SlotCount + 2));
+        // A slot or two in from the far end: the writer may be just about to take the oldest, or
+        // the line about to give it back to the disk.
+        long oldest = line.RecordingFrameAt(Math.Max(Math.Max(0, written - line.SlotCount + 2), line.OldestHeld + 2));
 
         return newest >= 0 && oldest >= 0 ? (oldest, newest) : null;
     }
