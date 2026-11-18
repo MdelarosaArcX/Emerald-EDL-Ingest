@@ -23,8 +23,7 @@
 !/media/.gitkeep
 /graphify-out/
 .graphify*
-/assets/
-.assets*
+
 
 # --- video and audio anywhere else -----------------------------------------
 # A safety net for a clip dropped next to the solution or into a test folder.
