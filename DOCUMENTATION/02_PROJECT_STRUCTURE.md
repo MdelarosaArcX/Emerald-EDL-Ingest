@@ -18,7 +18,10 @@ run-monitor.bat             ... the Monitor (--monitor)
 publish.bat                 self-contained build into dist\Emerald
 publish-edl.bat             wrapper: publish.bat -edl into dist\Emerald-EDL
 installer\                  install.bat, update.bat, uninstall.bat, READ-ME-FIRST.txt,
-                            settings.ps1 (merges chosen folders into settings.json)
+                            settings.ps1 (merges chosen folders into settings.json),
+                            deltacast.ps1 (bundles and installs the DELTACAST driver),
+                            pack-setup.ps1 (appends the published folder to the setup)
+installer\setup\            Emerald-Setup.exe: the setup window (.NET Framework 4.8, x64)
 installer\edl\              the same set for the EDL-only product
 media\                      default recording store; contents not in git
 tools\check-xaml-styles.sh  checks Style/TargetType matches, which the compiler does not

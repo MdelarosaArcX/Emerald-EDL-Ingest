@@ -4,9 +4,21 @@ rem  Builds an installable Emerald into dist\.
 rem    publish.bat            - the whole plant, into dist\Emerald
 rem    publish.bat -edl       - the EDL Generator alone, into dist\Emerald-EDL
 rem    publish.bat -noffmpeg  - either of those, without bundling ffmpeg
+rem    publish.bat -nodeltacast - without the DELTACAST driver from this machine
+rem    publish.bat -nosetup   - the folder only, no Emerald-Setup.exe (quicker)
 rem
-rem  What comes out is a folder you copy anywhere - a USB stick, a network share -
-rem  and install on a fresh Windows machine by running install.bat inside it.
+rem  What comes out is two things that install the same way:
+rem
+rem    dist\Emerald-Setup.exe     one file: double-click it on the new machine, answer
+rem                               where things go, and it installs. (Emerald-EDL-Setup.exe
+rem                               for -edl.) Copy this one.
+rem    dist\Emerald\              the same as a folder: run install.bat inside it as
+rem                               administrator. For scripted rollouts and update.bat.
+rem
+rem  Both carry the DELTACAST driver when THIS machine has it installed: the signed
+rem  driver package from Windows' driver store and VideoMasterHD*.dll from System32
+rem  (installer\deltacast.ps1 -Collect). The install puts them on a machine with no
+rem  DELTACAST or an older one, and leaves a same or newer one alone.
 rem
 rem  It is published SELF-CONTAINED, which means the .NET runtime is inside the
 rem  folder. That is the whole point: a fresh Windows box needs no .NET installed,
@@ -46,11 +58,15 @@ rem Scanned rather than positional, so -edl and -noffmpeg can be given in either
 rem order. The old form - publish.bat -noffmpeg - still means what it did.
 set "FLAVOUR=full"
 set "WANTFFMPEG=1"
+set "WANTDELTACAST=1"
+set "WANTSETUP=1"
 
 :args
 if "%~1"=="" goto :argsdone
 if /i "%~1"=="-edl" set "FLAVOUR=edl"
 if /i "%~1"=="-noffmpeg" set "WANTFFMPEG=0"
+if /i "%~1"=="-nodeltacast" set "WANTDELTACAST=0"
+if /i "%~1"=="-nosetup" set "WANTSETUP=0"
 shift
 goto :args
 :argsdone
@@ -59,10 +75,12 @@ if /i "%FLAVOUR%"=="edl" (
     set "PRODUCT=Emerald EDL"
     set "DIST=%ROOT%dist\Emerald-EDL"
     set "INSTALLSRC=%ROOT%installer\edl"
+    set "SETUPEXE=%ROOT%dist\Emerald-EDL-Setup.exe"
 ) else (
     set "PRODUCT=Emerald"
     set "DIST=%ROOT%dist\Emerald"
     set "INSTALLSRC=%ROOT%installer"
+    set "SETUPEXE=%ROOT%dist\Emerald-Setup.exe"
 )
 
 rem See build.bat for why find.exe is fully qualified.
@@ -170,15 +188,93 @@ copy /y "%INSTALLSRC%\READ-ME-FIRST.txt" "%DIST%\READ-ME-FIRST.txt" >nul
 rem The settings helper both installers share: it merges the folders chosen into
 rem settings.json instead of overwriting it.
 copy /y "%~dp0installer\settings.ps1" "%DIST%\settings.ps1" >nul
+copy /y "%~dp0installer\deltacast.ps1" "%DIST%\deltacast.ps1" >nul
+
+rem ---------------------------------------------------------- the DELTACAST driver
+rem
+rem From this machine, as Windows installed it: the package in the driver store is the
+rem signed one, and System32 has the libraries DELTACAST's setup put there. A machine
+rem without the driver builds an installer without it, and says so.
+
+set "DELTACAST="
+if "%WANTDELTACAST%"=="1" (
+    echo.
+    echo Bundling the DELTACAST driver from this machine ...
+    for /f "delims=" %%L in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer\deltacast.ps1" -Source "%DIST%\deltacast" -Collect') do echo   %%L
+    for /f "tokens=1,* delims==" %%K in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer\deltacast.ps1" -Source "%DIST%\deltacast" -Status') do (
+        if /i "%%K"=="bundled" set "DELTACAST=%%L"
+    )
+    if not defined DELTACAST (
+        echo [WARN] No DELTACAST driver bundled. The install will report it missing
+        echo        until it is installed from DELTACAST's own installer.
+    )
+) else (
+    echo.
+    echo Skipping the DELTACAST driver ^(-nodeltacast^).
+)
+
+rem ------------------------------------------------- the Visual C++ runtime, app-local
+rem
+rem VideoMasterHD*.dll are built with Visual C++ and import MSVCP140, VCRUNTIME140 and
+rem VCRUNTIME140_1. DELTACAST's own installer brings the runtime; a fresh Windows does
+rem not have it, and without it the library will not load and no card opens. So the
+rem three DLLs go beside Emerald.App.exe - Microsoft's "app-local" deployment - where
+rem Windows looks first for anything a DLL loaded into Emerald needs. Copied whether or
+rem not the driver is bundled: a machine given the driver some other way needs them too.
+rem Emerald itself (self-contained .NET) and ffmpeg (static) need none of this.
+
+for %%F in (msvcp140.dll vcruntime140.dll vcruntime140_1.dll) do (
+    if exist "%SystemRoot%\System32\%%F" (
+        copy /y "%SystemRoot%\System32\%%F" "%DIST%\%%F" >nul
+    ) else (
+        echo [WARN] %%F is not in System32 on this machine, so it is not bundled. Install
+        echo        the Visual C++ 2015-2022 x64 runtime on machines with a DELTACAST card.
+    )
+)
+
+rem What the setup window says about this build. Read from the payload, so the window
+rem and the folder can never disagree about which build they are.
+for /f "delims=" %%V in ('powershell -NoProfile -Command "(Get-Item '%DIST%\Emerald.App.exe').VersionInfo.ProductVersion"') do set "VERSION=%%V"
+for /f "delims=" %%D in ('powershell -NoProfile -Command "Get-Date -Format 'd MMM yyyy HH:mm'"') do set "BUILT=%%D"
+(
+    echo Product=%PRODUCT%
+    echo Flavour=%FLAVOUR%
+    echo Version=%VERSION%
+    echo Built=%BUILT%
+    echo Deltacast=%DELTACAST%
+) > "%DIST%\setup.ini"
+
+rem ------------------------------------------------------------ Emerald-Setup.exe
+if "%WANTSETUP%"=="0" (
+    set "SETUPEXE="
+    goto :done
+)
 
 echo.
+echo Making %SETUPEXE% ...
+set "SETUPOUT=%ROOT%installer\setup\bin\publish"
+dotnet build "%ROOT%installer\setup\EmeraldSetup.csproj" -c Release -o "%SETUPOUT%" --nologo -v q
+if errorlevel 1 goto :fail
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%installer\pack-setup.ps1" -Dist "%DIST%" -Stub "%SETUPOUT%\Emerald-Setup.exe" -Out "%SETUPEXE%"
+if errorlevel 1 goto :fail
+
+:done
+echo.
 echo ---------------------------------------------------------------------------
-echo  Ready:  %DIST%
+if defined SETUPEXE echo  Setup:  %SETUPEXE%
+echo  Folder: %DIST%
 echo.
 for /f %%S in ('powershell -NoProfile -Command "[math]::Round((Get-ChildItem -Recurse -File '%DIST%' ^| Measure-Object Length -Sum).Sum / 1GB, 2)"') do echo  Size:   %%S GB
 echo.
-echo  Copy that folder to the new machine and run install.bat as administrator.
-echo  It installs "%PRODUCT%".
+if defined SETUPEXE (
+    echo  Copy the Setup file to the new machine and double-click it - or copy the
+    echo  folder and run install.bat as administrator. Either installs "%PRODUCT%".
+) else (
+    echo  Copy that folder to the new machine and run install.bat as administrator.
+    echo  It installs "%PRODUCT%".
+)
+if defined DELTACAST (echo  DELTACAST driver %DELTACAST% included.) else (echo  No DELTACAST driver included.)
 echo ---------------------------------------------------------------------------
 if "%INTERACTIVE%"=="1" pause
 exit /b 0

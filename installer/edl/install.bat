@@ -5,6 +5,7 @@ rem
 rem    install.bat                       - install, asking where its media lives
 rem    install.bat D:\Emerald\media      - install, media there, no questions
 rem    install.bat D:\Emerald\media -q   - the same, and no pauses (for a rollout)
+rem    ... -nodriver                     - leave the DELTACAST driver alone
 rem
 rem  Run it as administrator: it writes to Program Files, the Start Menu and the
 rem  registry. It will say so and stop if it is not elevated.
@@ -14,10 +15,12 @@ rem  with one shortcut, its own entry in Add/Remove Programs, and no monitoring
 rem  port opened, because an EDL machine serves no monitoring page.
 rem
 rem  Nothing needs to be installed first. The .NET runtime is inside this folder,
-rem  and so is ffmpeg if it was bundled. What it cannot bring with it is the
-rem  DELTACAST driver - that is a kernel driver and only DELTACAST's own installer
-rem  can put it on. This checks for it and says so rather than letting you find out
-rem  when a list will not play.
+rem  and so is ffmpeg if it was bundled, and so is the DELTACAST driver if the
+rem  machine that built it had one (deltacast\, installed by deltacast.ps1). Without
+rem  it, this checks for the driver and says so rather than letting you find out when
+rem  a list will not play.
+rem
+rem  Emerald-EDL-Setup.exe, beside this folder, is the same install with a window.
 rem ---------------------------------------------------------------------------
 setlocal EnableDelayedExpansion
 
@@ -35,6 +38,9 @@ rem index changes under them.
 set "FULL=%ProgramFiles%\Emerald\Emerald.App.exe"
 
 set "MEDIA=%~1"
+if /i "%~1"=="-nodriver" set "MEDIA="
+set "NODRIVER=0"
+for %%A in (%*) do if /i "%%~A"=="-nodriver" set "NODRIVER=1"
 set "QUIET=0"
 if /i "%~2"=="-q" set "QUIET=1"
 if /i "%~1"=="-q" set "QUIET=1" & set "MEDIA="
@@ -163,7 +169,7 @@ if not exist "%TARGET%" mkdir "%TARGET%" 2>nul
 rem /e all subdirectories, /purge remove what is no longer shipped, /njh /njs /ndl
 rem /nc /ns /nfl quiet. Robocopy returns 0-7 for success; 8 and above is a real
 rem failure.
-robocopy "%HERE%." "%TARGET%" /e /purge /xf install.bat uninstall.bat update.bat settings.ps1 READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
+robocopy "%HERE%." "%TARGET%" /e /purge /xd deltacast /xf install.bat uninstall.bat update.bat settings.ps1 deltacast.ps1 setup.ini READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
 if errorlevel 8 (
     echo [ERROR] Copying to %TARGET% failed.
     goto :fail
@@ -229,6 +235,29 @@ rem No firewall rule. The monitoring page is a capture-side thing; an EDL machin
 rem serves nothing, so nothing is opened. If this box should also serve monitoring,
 rem install the full Emerald on it instead.
 
+rem ---------------------------------------------------------- the DELTACAST driver
+rem
+rem A build made by publish.bat on a machine with the driver carries it in deltacast\: the
+rem signed driver package and the VideoMasterHD libraries for System32. deltacast.ps1 puts
+rem them on when this machine has no DELTACAST or an older one, and leaves a same or newer
+rem one alone. The driver goes into Windows' driver store, so a card fitted after this - with
+rem the machine off - is picked up at the next start with nothing to run.
+
+set "RESTART=0"
+if exist "%HERE%deltacast\system32\VideoMasterHD.dll" (
+    if "%NODRIVER%"=="1" (
+        echo DELTACAST driver: left alone ^(-nodriver^).
+    ) else (
+        echo DELTACAST driver ...
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%deltacast.ps1" -Source "%HERE%deltacast"
+        if errorlevel 3010 (
+            set "RESTART=1"
+        ) else if errorlevel 1 (
+            echo [WARN] The DELTACAST driver did not install completely - see the lines above.
+        )
+    )
+)
+
 rem ------------------------------------------------------------- what is missing
 echo.
 echo ---------------------------------------------------------------------------
@@ -244,8 +273,9 @@ if exist "%SystemRoot%\System32\VideoMasterHD.dll" (
     set "READY=0"
     echo   [--]   DELTACAST driver NOT found ^(no VideoMasterHD.dll in System32^).
     echo          The EDL will open and lists can be built and saved, but nothing
-    echo          can be played to air until the driver is installed from
-    echo          DELTACAST's own installer. Emerald cannot carry it.
+    echo          can be played to air until it is installed.
+    echo          Install it with Emerald-Setup.exe from a build that carries it, or
+    echo          with DELTACAST's own installer.
 )
 
 if exist "%TARGET%\ffmpeg.exe" (

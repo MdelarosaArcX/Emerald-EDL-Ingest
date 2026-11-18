@@ -7,15 +7,19 @@ rem    install.bat D:\Emerald\media               - recordings in its high\ and 
 rem                                                 the database where it always was
 rem    install.bat D:\Masters E:\Proxies D:\Data   - high-res, low-res and database folders
 rem    ... -q                                     - the same, and no pauses (for a rollout)
+rem    ... -nodriver                              - leave the DELTACAST driver alone
 rem
 rem  Run it as administrator: it writes to Program Files, the Start Menu and the
 rem  firewall. It will say so and stop if it is not elevated.
 rem
 rem  Nothing needs to be installed first. The .NET runtime is inside this folder,
-rem  and so is ffmpeg if it was bundled. What Emerald cannot bring with it is the
-rem  DELTACAST driver - that is a kernel driver and only DELTACAST's own installer
-rem  can put it on. This checks for it and says so rather than letting you find out
-rem  when a recording will not start.
+rem  and so is ffmpeg if it was bundled, and so is the DELTACAST driver if the
+rem  machine that built it had one (deltacast\, installed by deltacast.ps1). Without
+rem  it, this checks for the driver and says so rather than letting you find out when
+rem  a recording will not start.
+rem
+rem  Emerald-Setup.exe, beside this folder, is the same install with a window: it asks
+rem  for the folders and runs this with them, -q.
 rem ---------------------------------------------------------------------------
 setlocal EnableDelayedExpansion
 
@@ -31,16 +35,18 @@ set "HIGH="
 set "LOW="
 set "DATA="
 set "QUIET=0"
+set "NODRIVER=0"
 for %%A in (%*) do if /i "%%~A"=="-q" set "QUIET=1"
+for %%A in (%*) do if /i "%%~A"=="-nodriver" set "NODRIVER=1"
 
 rem Three folders given: high-res, low-res and the database. One: the store as it always
 rem was, masters in its high\ and proxies in its low\.
-if not "%~3"=="" if /i not "%~3"=="-q" (
+if not "%~3"=="" if /i not "%~3"=="-q" if /i not "%~3"=="-nodriver" (
     set "HIGH=%~1"
     set "LOW=%~2"
     set "DATA=%~3"
 )
-if not defined HIGH if not "%~1"=="" if /i not "%~1"=="-q" set "MEDIA=%~1"
+if not defined HIGH if not "%~1"=="" if /i not "%~1"=="-q" if /i not "%~1"=="-nodriver" set "MEDIA=%~1"
 
 rem See build.bat for why find.exe is fully qualified.
 set "INTERACTIVE=0"
@@ -198,7 +204,7 @@ if not exist "%TARGET%" mkdir "%TARGET%" 2>nul
 
 rem /e all subdirectories, /purge remove what is no longer shipped, /njh /njs /ndl /nc /ns
 rem quiet. Robocopy returns 0-7 for success; 8 and above is a real failure.
-robocopy "%HERE%." "%TARGET%" /e /purge /xf install.bat uninstall.bat update.bat settings.ps1 READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
+robocopy "%HERE%." "%TARGET%" /e /purge /xd deltacast /xf install.bat uninstall.bat update.bat settings.ps1 deltacast.ps1 setup.ini READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
 if errorlevel 8 (
     echo [ERROR] Copying to %TARGET% failed.
     goto :fail
@@ -272,6 +278,29 @@ if errorlevel 1 (
     echo Firewall opened for remote monitoring on TCP 8787 ^(read-only^).
 )
 
+rem ---------------------------------------------------------- the DELTACAST driver
+rem
+rem A build made by publish.bat on a machine with the driver carries it in deltacast\: the
+rem signed driver package and the VideoMasterHD libraries for System32. deltacast.ps1 puts
+rem them on when this machine has no DELTACAST or an older one, and leaves a same or newer
+rem one alone. The driver goes into Windows' driver store, so a card fitted after this - with
+rem the machine off - is picked up at the next start with nothing to run.
+
+set "RESTART=0"
+if exist "%HERE%deltacast\system32\VideoMasterHD.dll" (
+    if "%NODRIVER%"=="1" (
+        echo DELTACAST driver: left alone ^(-nodriver^).
+    ) else (
+        echo DELTACAST driver ...
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%deltacast.ps1" -Source "%HERE%deltacast"
+        if errorlevel 3010 (
+            set "RESTART=1"
+        ) else if errorlevel 1 (
+            echo [WARN] The DELTACAST driver did not install completely - see the lines above.
+        )
+    )
+)
+
 rem ------------------------------------------------------------- what is missing
 echo.
 echo ---------------------------------------------------------------------------
@@ -287,8 +316,9 @@ if exist "%SystemRoot%\System32\VideoMasterHD.dll" (
     set "READY=0"
     echo   [--]   DELTACAST driver NOT found ^(no VideoMasterHD.dll in System32^).
     echo          Emerald will open, and the Monitor and Live Edit will work, but
-    echo          nothing can be captured or transmitted until the driver is
-    echo          installed from DELTACAST's own installer. Emerald cannot carry it.
+    echo          nothing can be captured or transmitted until it is installed.
+    echo          Install it with Emerald-Setup.exe from a build that carries it, or
+    echo          with DELTACAST's own installer.
 )
 
 if exist "%TARGET%\ffmpeg.exe" (
@@ -325,6 +355,7 @@ if "%READY%"=="1" (
 ) else (
     echo  Emerald is installed but not yet ready to record - see the [--] lines above.
 )
+if "%RESTART%"=="1" echo  Restart the machine before using the DELTACAST card.
 echo.
 if "%INTERACTIVE%"=="1" pause
 exit /b 0

@@ -130,7 +130,7 @@ echo Replacing %TARGET% ...
 rem /purge so a file that is no longer shipped goes, rather than being left behind to
 rem be loaded by a version that knows nothing about it. The installer scripts are not
 rem copied in: they belong to the folder they came from.
-robocopy "%SOURCE%." "%TARGET%" /e /purge /xf install.bat uninstall.bat update.bat READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
+robocopy "%SOURCE%." "%TARGET%" /e /purge /xd deltacast /xf install.bat uninstall.bat update.bat settings.ps1 deltacast.ps1 setup.ini READ-ME-FIRST.txt /njh /njs /ndl /nc /ns /nfl >nul
 if errorlevel 8 (
     echo [ERROR] Copy failed. The install may be half replaced - run it again, or
     echo         run install.bat from the new folder.

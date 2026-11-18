@@ -11,6 +11,11 @@ use the full Emerald folder instead - this is not that.
 
 WHAT TO DO
 
+  The easy way: copy Emerald-EDL-Setup.exe onto the machine, double-click it,
+  and answer where the media lives. That is the whole install.
+
+  The same from this folder:
+
   1. Copy this whole folder onto the machine.
   2. Right-click install.bat and choose "Run as administrator".
   3. It asks where the media lives. Take the suggestion or type a path -
@@ -43,14 +48,24 @@ WHY IT IS NOT A SMALLER DOWNLOAD
   at it sees an EDL and nothing to go wrong with.
 
 
-WHAT IT CANNOT BRING WITH IT
+THE DELTACAST DRIVER
 
-  THE DELTACAST DRIVER.  Playout goes through VideoMasterHD.dll, which lives
-  in C:\Windows\System32 and is put there by DELTACAST's own installer. It is
-  a kernel driver; no application installer may carry it.
+  Included if the machine this was built on had it (the deltacast folder).
+  Playout goes through VideoMasterHD.dll in C:\Windows\System32 and
+  DELTACAST's kernel driver. The install puts both on when this machine has
+  no DELTACAST or an older one, and leaves a same or newer one alone. Without
+  the deltacast folder, install the driver from DELTACAST before expecting to
+  play to air; the install checks for it and tells you if it is not there.
 
-  Install it from DELTACAST before expecting to play to air. The install
-  script checks for it and tells you if it is not there.
+
+THE CARD - BEFORE OR AFTER?
+
+  Either. The card is PCIe, so fit it with the machine switched off.
+
+  Card fitted first: the install sets it up straight away.
+  Install first:     the driver waits in Windows. Switch off, fit the card,
+                     start up, and Windows sets the card up by itself.
+                     Nothing to run again.
 
   Without it the EDL still opens and lists can be built, saved and checked.
   Nothing will reach a transmitter.

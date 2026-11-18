@@ -8,8 +8,9 @@ Commands are from the project's own scripts.
 |---|---|---|
 | Windows 10/11 x64 | Everything. `VideoMasterHD.dll` is 64-bit. | |
 | .NET 8 SDK | Building. The scripts name 8.0. | <https://dotnet.microsoft.com/download/dotnet/8.0> |
+| .NET Framework 4.8 | Running `Emerald-Setup.exe`. Part of Windows 10 1903 and later and of Windows 11. | Windows |
 | .NET 8 Desktop Runtime | Running a build that isn't self-contained. `publish.bat` output needs nothing. | Same page |
-| DELTACAST VideoMaster driver | Any SDI work. Must come from DELTACAST's own installer, because it is a kernel driver. | DELTACAST |
+| DELTACAST VideoMaster driver | Any SDI work. Bundled by `publish.bat` from the build machine (signed driver package plus `VideoMasterHD*.dll`) and installed by the setup; otherwise from DELTACAST's own installer. | DELTACAST |
 | ffmpeg and ffprobe | Recording, playout, export, clip lengths. Can be bundled. | <https://ffmpeg.org> |
 | git | Cloning | |
 
@@ -90,7 +91,11 @@ publish.bat              # the whole plant, into dist\Emerald
 publish.bat -edl         # EDL Generator alone, into dist\Emerald-EDL
 publish-edl.bat          # the same
 publish.bat -noffmpeg    # either, without bundling ffmpeg
+publish.bat -nodeltacast # without the DELTACAST driver
+publish.bat -nosetup     # the folder only, no setup .exe
 ```
+
+Output: `dist\Emerald-Setup.exe` (`dist\Emerald-EDL-Setup.exe` for `-edl`), one file to copy to the new machine, and `dist\Emerald` (`dist\Emerald-EDL`), the same as a folder.
 
 Under the hood:
 
@@ -100,6 +105,9 @@ dotnet publish src\Emerald.App\Emerald.App.csproj -c Release -r win-x64 --self-c
 
 - **Self-contained.** The .NET runtime is inside the folder, about 170 MB per the script. No runtime, SDK or internet is needed on the target.
 - **ffmpeg** is bundled from `C:\ffmpeg\bin`, `C:\Program Files\ffmpeg\bin` or `PATH`, if found. Otherwise a warning is shown.
+- **DELTACAST driver** is bundled when the build machine has it: `installer\deltacast.ps1 -Collect` copies `VideoMasterHD*.dll` from System32 and the driver package of the same version from Windows' driver store (`delta-x300.inf`, `.sys`, `.cat`, signed by Microsoft's hardware programme) into `deltacast\`. Without a driver on the build machine, or with `-nodeltacast`, the build carries none and says so. Check that DELTACAST's licence allows passing the driver on to the machines you install.
+- **Visual C++ runtime.** `VideoMasterHD*.dll` import `MSVCP140.dll`, `VCRUNTIME140.dll` and `VCRUNTIME140_1.dll`, which DELTACAST's installer brings and a fresh Windows lacks. `publish.bat` copies those three from the build machine's System32 beside `Emerald.App.exe` (app-local), where Windows looks first for a dependency of a DLL loaded into Emerald. Emerald itself and ffmpeg need no runtime.
+- **Setup file.** `installer\setup` (`EmeraldSetup.csproj`, not in `Emerald.sln`) is built, then `installer\pack-setup.ps1` appends the published folder to it as a zip: `[program][zip][offset]["EMSETUP1"]`. The program targets .NET Framework 4.8, which every Windows 10 and 11 has, compiled against the copy in `%WINDIR%\Microsoft.NET` so the build needs no download. It is x64 so that its System32 and Program Files are the real ones. `setup.ini` in the folder tells it the product, flavour, version, build date and bundled driver version.
 - **`-edl` is the same binaries.** It changes the product: its own install folder, one module's shortcuts (Emerald EDL in the Start Menu and on the Desktop), its own Add/Remove Programs entry, and no firewall rule. A real split would need a second copy of the window styles.
 
 Check first that Emerald is not running from the source tree, or the publish refuses.
@@ -107,6 +115,16 @@ Check first that Emerald is not running from the source tree, or the publish ref
 The version is set in `Directory.Build.props`. `installer\install.bat` and `installer\edl\install.bat` each write `DisplayVersion` as a literal `1.0.0`, so all three have to be changed together. `update.bat` does not write the registry, so the listed version only changes on `install.bat`.
 
 ## Installing
+
+**With the setup file** (`Emerald-Setup.exe`):
+
+1. Copy it to the machine and double-click it. Windows asks for an administrator.
+2. The first page says whether this is an install or an update, which DELTACAST card is fitted and which driver is installed, with a tick box to install or update the bundled driver (greyed out when the same or a newer one is already there).
+3. The second page asks for the high-res, low-res and database folders (the EDL setup: the media folder), suggesting the roomiest drive that is not the system drive. Folders already in `settings.json` are shown and kept. Program Files and Windows are refused.
+4. It unpacks to `%TEMP%` and runs the payload's `install.bat <high> <low> <data> -q`, adding `-nodriver` if the box was cleared, showing its output. The last page shows `install.bat`'s report. The whole output is saved as `setup-<date>.log` in the program folder.
+5. **Start Emerald now** starts it through Explorer, as the logged-in user, not elevated.
+
+The setup file is the same install as running `install.bat` by hand, and the folder still works that way:
 
 1. Copy the published folder to the machine.
 2. Right-click `install.bat`, Run as administrator.
@@ -121,6 +139,7 @@ install.bat                                  install, asking where things go
 install.bat D:\Emerald\media                 masters in its high\, proxies in its low\
 install.bat D:\Masters E:\Proxies D:\Data    high-res, low-res and database folders
 ... -q                                       the same, no questions and no pauses, for a rollout
+... -nodriver                                leave the DELTACAST driver alone
 ```
 
 It asks only when started from Explorer (Run as administrator) and without `-q`. Run from a command prompt, or with `-q`, it takes the suggestions for anything not given. With one folder given, the database folder is not given, so it is asked for or defaults to `%APPDATA%\Emerald`.
@@ -140,6 +159,7 @@ What it does:
 | Shortcuts | Start Menu: Emerald, Emerald EDL, Emerald Ingest, Emerald Monitor. Plus a Desktop shortcut. |
 | Registry | Add/Remove Programs entry under `HKLM` |
 | Firewall | Rule `Emerald monitoring 8787`, inbound TCP. This is added even if remote monitoring is never switched on. |
+| DELTACAST | When the folder has `deltacast\` and `-nodriver` was not given: `deltacast.ps1` compares `VideoMasterHD.dll` in System32 with the bundled one. Missing or older: it copies the bundled `VideoMasterHD*.dll` to System32 and adds the driver with `pnputil /add-driver <inf> /install`. Same or newer: nothing is changed, library and driver being one product. Then it lists the fitted cards. A restart is asked for when Windows wants one. Not copied to Program Files. |
 | Report | Whether the driver, ffmpeg, ffprobe and the high-res, low-res and database folders are ready |
 
 `READ-ME-FIRST.txt` travels with the folder. The EDL product has its own set in `installer\edl\`. `publish.bat` copies `installer\settings.ps1` into both published folders.
@@ -203,6 +223,8 @@ Recordings are never touched. It shows the high-res, low-res, settings and datab
 | Delay rings | `%LOCALAPPDATA%\Emerald\delay`. Never on a recording drive: a ring folder there is passed over for this default. |
 
 **EDL product.** Program in `C:\Program Files\Emerald EDL`, updated from `dist\Emerald-EDL` by its own `update.bat`. It removes only itself. If a full Emerald is also installed, its `uninstall.bat` does not offer to delete settings. Both products share `%APPDATA%\Emerald`, so a board or port changed in one changes in the other.
+
+**Card and driver order.** Either order works. The DELTACAST cards are PCIe, so a card is only ever fitted with the machine switched off. If the card is fitted first, the install puts the driver on it straight away. If the install runs first, `pnputil` leaves the driver in Windows' driver store, and Windows sets the card up by itself the next time the machine starts with it fitted. Nothing needs running again. The setup's first page and the install report both say whether a card was found.
 
 **With no card or driver,** Emerald still opens. `READ-ME-FIRST.txt` says the Monitor, Live Edit and the clip store work, and SIMULATE covers Ingest.
 
