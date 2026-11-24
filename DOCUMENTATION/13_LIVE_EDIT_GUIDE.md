@@ -19,7 +19,7 @@ This guide covers how the window is built, how to use it, and what every button 
 | EDL | The list of edits made on the timeline. Edits change this list only. Nothing on the timeline changes a recorded file. |
 | Ingest media | Files placed on the timeline: ranges exported here, or files dragged in from Explorer. |
 
-**Edits reach air only through Go Live.** The playback deck's tidal lock is a separate transmission. It also shows an on-air mark here, and the no edit zone still applies, but it does not play this timeline's edits.
+**Edits reach air through Go Live or the playback deck's tidal lock.** Both arm the same `LiveAir` engine and transmit with `LiveAirTransmitter`, so deleted scenes, dropped ingest media and levels play into either. `LiveAir.Owner` says which deck armed it and runs the transmitter; only one can be live at a time. Closing Live Edit does not end a tidal lock armed on the playback deck.
 
 ## Structure
 
@@ -74,7 +74,7 @@ flowchart LR
 | Placed items, deleted scenes, sound levels, sound cuts | Memory only | **Lost, with no warning unless live** |
 | Marks and undo history | Memory only | Lost. Both are also cleared whenever the day changes, including at a midnight rollover. |
 | Bookmarks | `%APPDATA%\Emerald\bookmarks\yyyy-MM-dd.json` | Kept |
-| Exports | The exports folder: `<store>\ingest\` when the high-res and low-res folders are laid out the old way, otherwise `ingest\` inside the high-res folder. The media, a `.preview.mp4`, and a `.json` with the metadata. | Kept |
+| Exports | The recording's folder on the ingest media path (`ingestMediaFolder`; default `<store>\ingest\`, or `ingest\` inside the high-res folder): the media and a `.json` with the metadata in `high\`, the 960×540 low-res copy in `low\`. Exports from before folders sit at the top level with a `.preview.mp4`. | Kept |
 | Go Live choices | `settings.json` | Kept |
 | Edit history | The `log_edl` table of `emerald.db`, one row per entry with the whole entry as JSON | Kept for `logRetentionDays` (14), then deleted |
 | Waveforms | Memory, and `<data folder>\peaks\`, a small file per segment | Kept while used; deleted after `max(30, logRetentionDays)` days unused |
@@ -118,7 +118,9 @@ Pressing a mark again on the same frame removes it. A Mark In after the out poin
 
 1. Mark the range and press **Export**.
 2. Check the range shown, change the name if you wish, and add metadata if useful.
-3. Press **Export**. The panel switches to Ingest Media and shows progress: the cut takes seconds, and the preview copy can take minutes.
+3. Press **Export**. The panel switches to Ingest Media and shows a progress bar with the percentage and roughly how long is left. Press **Cancel** on it to stop; nothing half-made is left behind. When it finishes, the recording's folder opens with the new clip selected.
+
+The export goes into the folder of the recording it was cut from, on the [ingest media path](#ingest-media-folders): the cut in `high\` (what goes to air) and a 960×540 low-res copy in `low\` (what the list shows and the timeline plays). The low-res copy is made on the video card (NVENC or Quick Sync) when there is one that works, otherwise with libx264.
 
 Keep in mind:
 
@@ -128,11 +130,23 @@ Keep in mind:
 - The export is the recording as captured. Deleted scenes, placed items and sound levels are not applied.
 - A name already in the folder is refused rather than overwritten.
 
+### Ingest media folders
+
+All ingest media lives on one **ingest media path**: Live Edit's exports, the Ingest Controller's clips, and video dropped in by hand. There is one folder per capture recording, named like the recording (`yyyy-MM-dd_HH-mm-ss`), each with `high\` and `low\`.
+
+- **Choose the path** with **Path** on the INGEST MEDIA tab. Blank uses the default, the store's `ingest` folder. A recording folder (high-res or low-res) itself is refused, because the storage warden deletes old recordings there.
+- **A folder is made as soon as a recording starts**, by the capture deck or the EDL, so the recording on air always has one.
+- **INGEST MEDIA opens on the folder list**, newest first, with the recording on air at the top marked **ON AIR**. Double-click a folder (or press Enter) to see its clips; **← Folders** (or Backspace) goes back. Files from before folders existed appear as **Earlier exports** at the bottom.
+- **Only low-res copies are listed**, so only low-res is dragged onto the timeline. What is placed, and what goes to air, is the high-res beside it.
+- **It refreshes by itself** when a folder is made, an export finishes or a file is dropped in. **Refresh** reads it again on demand.
+- **Video dropped into a recording folder in Explorer** is moved into its `high\`, and a low-res copy is made automatically. A bar on the tab shows which file and how far. Video dropped onto the INGEST MEDIA tab is copied into the open folder (or the recording on air) the same way.
+- **Ingest Controller clips** go into the folder of the recording on air when the job starts, or a new folder named for that moment if nothing is recording, as long as the Ingest Controller's directory is the ingest media path (its default).
+
 ### Place ingest media
 
-1. Open **INGEST MEDIA**. To use one of the two range modes, mark a range first.
-2. Drag an item from the list onto the segments, or drag a playable file from Explorer. The ruler and the recording's sound lane do not accept a drop.
-3. In the dialog, choose a mode and tracks, and check the start under **PLACE AT**.
+1. **Set a mark in** on the timeline (**I**). A drop is refused without one, whatever the mode. To use one of the two range modes, mark a range.
+2. Open **INGEST MEDIA**, open a folder, and drag a clip onto the segments, or drag a playable file from Explorer. The ruler and the recording's sound lane do not accept a drop.
+3. In the dialog, choose a mode and tracks. **PLACE AT** starts at mark in, wherever the clip was dropped; change it to place the clip elsewhere.
 4. Read the summary box, which says exactly what will happen, then press **Place**.
 
 Choose the mode by what should happen to the recording:
@@ -255,11 +269,13 @@ The volume slider and MUTE do not control this monitor. After 5 minutes with not
 | Control | What it does |
 |---|---|
 | **CAPTURE MEDIA** | Lists the current recording's segments, newest first, with the one being recorded on top. The master column reads **master in-progress** while the 5-minute master holding that segment is still being recorded. |
-| **INGEST MEDIA** | Lists exported ranges and any other media in the ingest folder |
-| **Folder** | Opens the folder for the tab showing in Explorer |
-| **Refresh** | Reads the capture store again. It does not refresh the ingest list: to do that, click **CAPTURE MEDIA** and then **INGEST MEDIA**. |
+| **INGEST MEDIA** | Lists the recording folders on the ingest media path, newest first, the one on air at the top. Double-click a folder to list its low-res clips. |
+| **Path** | Ingest tab only. Chooses the ingest media path. |
+| **Folder** | Opens the folder for the tab showing in Explorer: on the Ingest tab, the open recording folder or the ingest media path |
+| **Refresh** | Reads the list being shown again: the capture store, or the ingest media. The ingest list also refreshes by itself. |
 | Capture list row | Click to preview, double-click to take the timeline there |
-| Ingest list row | Click to preview and see its metadata, drag onto the timeline to place |
+| Ingest folder row | Double-click or Enter to open it. **ON AIR** marks the recording running now. |
+| Ingest list row | Click to preview and see its metadata. With a mark in set, drag onto the timeline to place it at the mark. Backspace or **← Folders** goes back. |
 
 ### View controls (area D, left)
 
@@ -380,7 +396,7 @@ These work in the go-to box. The Place and Bookmarks boxes use the same rules, b
 | Board | Boards that have a TX port |
 | TX ports | Tick the ports to send on. A port another transmission holds is greyed out, with its user named. |
 | Delay | No delay, 30 s, 1, 2, 5 or 10 min, **from first segment**, or **when first segment is ready**. The last two settle the delay from how much is recorded when the deck hands over. |
-| Insert room | How much the delay may grow from inserts: none to 30 min. This sets the size of the delay buffer on disk. |
+| Insert room | How much the delay may grow from inserts: none to 30 min. This is what is asked for. The delay is held in RAM, so what you get is cut to what memory can hold: about 20 s behind a 120 s delay on 32 GB. The log says so (`delay.insertroom`) and the delay readout's tooltip shows what is left. |
 | Summary | The delay, the most it can grow to, about how much disk the buffer needs, and the ports |
 | **Cancel** / **Go Live** | Go Live needs a board and at least one port, and saves these choices for next time |
 
@@ -389,8 +405,8 @@ These work in the go-to box. The Place and Bookmarks boxes use the same rules, b
 | Control | What it does |
 |---|---|
 | Overlay, Fit to fill, Replace, Insert | The [placement modes](#place-ingest-media). Fit to fill and Replace are greyed out with no marked range. |
-| PLACE AT box | Where the item starts, already filled in from the drop point. Locked to Mark In for the two range modes. |
-| **Drop point** | Puts the box back to where the file was dropped |
+| PLACE AT box | Where the item starts, filled in with mark in. Type another timecode to place it elsewhere. Locked to Mark In for the two range modes. |
+| **Mark in** | Puts the box back to mark in |
 | Video and audio, Video only, Audio only | Which tracks air. Video only keeps the recording's sound, or silence under an Insert. Audio only keeps the recording's picture, or black under an Insert. A file with one track offers only that track. |
 | Summary box | What this choice will do. A problem shown here in red also disables Place. |
 | **Cancel** / **Place** | Cancel places nothing |
@@ -471,7 +487,8 @@ The lower list is Live Edit's part of the application log. **Clear** empties thi
 | Message | What to do |
 |---|---|
 | `NO EDIT ZONE - ...` | Work further ahead of the on-air mark. |
-| `That insert would make the delay ... room for ...` | Remove an insert, or go live again with more insert room. Deleting a scene does not make room, despite the message: a deleted scene no longer changes the delay. |
+| `That insert is ... long and there is room for ...` | Remove an insert air has not reached yet, use Overlay or Replace instead, or go live again with a shorter delay. Deleting a scene makes no room: it goes out as black for its own length. |
+| `The inserts on the timeline would make the delay ...` | Inserts placed before Go Live add up to more than there is room for. The ones that do not fit are not played (REFUSED in the logs window) and the recording carries on. |
 | `PLAYBACK REFUSED THE EDL - version ...` | Undo the change. See B1 under [Known issues](#known-issues). |
 | `Click the audio lane to pick up a piece of sound first` | Click the AUDIO lane, then adjust. |
 | `The marked range runs into an ingest item or a scene cut.` | Delete the scene on either side of the item. |
@@ -492,7 +509,7 @@ These are faults in the current code, not setup mistakes. IDs refer to the [tech
 | B24 | Losing the source on a delayed feed holds a frozen, silent frame and does not fail. | Watch the output, and press **END LIVE** if needed. |
 | A4 | A source with more than one audio pair corrupts the sound on air. The recording is correct. | Use one pair until this is fixed. |
 | B1 | Once an edit is refused as too late, every later edit is refused until it is undone. | Undo the refused change. |
-| B20 | Inserts placed before Go Live are not checked against insert room, which can cause black on air. | Allow enough insert room for them. |
+| B20 | Fixed: inserts placed before Go Live are now checked. One that does not fit is not played, and the recording carries on. | None needed. |
 
 ### Can cost work or give wrong results
 
@@ -507,7 +524,6 @@ These are faults in the current code, not setup mistakes. IDs refer to the [tech
 | ID | Problem | What to do |
 |---|---|---|
 | New | The small **Live Edit** button in the capture deck's lower panel opens the playback deck. (`src/Emerald.App/ShellWindow.xaml:1052`) | Use the top navigation. |
-| New | **Refresh** on the Ingest tab reloads the capture list, not the ingest list. (`src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:875`) | Switch tabs and back. |
 | New | The **▶** button is greyed out while the big screen shows the unfinished segment from the delay buffer, including while it plays. (`src/Emerald.LiveEdit/LiveEditWindow.xaml.cs:3812`) | Use **Space**. |
 | B18 | The last segment can stay marked as recording after a stop, which also holds back the day rollover. | Press **Refresh** if it does not clear. |
 | C14 | The on-air mark is wrong during Fit to fill. | Trust the output, not the mark, for that stretch. |

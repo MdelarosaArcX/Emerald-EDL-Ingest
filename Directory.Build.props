@@ -5,4 +5,12 @@
     <Version>1.0.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
+
+  <!-- NU1900 only says the vulnerability check could not reach nuget.org - which is every build
+       on the playout machines, kept off the internet. It is not a finding, and repeated for every
+       project it buried real warnings. The audit itself stays on: an actual vulnerable package is
+       still NU1901-NU1904 whenever the feed can be reached. -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);NU1900</NoWarn>
+  </PropertyGroup>
 </Project>

@@ -28,7 +28,17 @@ public sealed class AudioTrackSetting
 /// <summary>User-visible configuration, persisted to %APPDATA%\Emerald\settings.json.</summary>
 public sealed class AppSettings
 {
-    [JsonPropertyName("timecodeApiUrl")] public string TimecodeApiUrl { get; set; } = "http://10.0.0.31:8888/api/timecode";
+    /// <summary>
+    /// The timecode API. Defaults to this computer's own address, so a fresh install points at the
+    /// machine it is installed on rather than at one site's network.
+    /// </summary>
+    [JsonPropertyName("timecodeApiUrl")] public string TimecodeApiUrl { get; set; } = DefaultTimecodeApiUrl;
+
+    /// <summary>The timecode API on this computer: its LAN IPv4 address, port 8888.</summary>
+    public static string DefaultTimecodeApiUrl => $"http://{LocalAddress.IPv4}:8888/api/timecode";
+
+    /// <summary>The fixed address earlier builds defaulted to, moved to <see cref="DefaultTimecodeApiUrl"/> on load.</summary>
+    public const string FormerDefaultTimecodeApiUrl = "http://10.0.0.31:8888/api/timecode";
     [JsonPropertyName("captureBoardIndex")] public uint CaptureBoardIndex { get; set; }
     [JsonPropertyName("capturePort")] public string CapturePort { get; set; } = "RX0";
     [JsonPropertyName("playbackBoardIndex")] public uint PlaybackBoardIndex { get; set; }
@@ -244,6 +254,19 @@ public sealed class AppSettings
     /// <summary>Where ingested clips are written. Empty means the Emerald media store.</summary>
     [JsonPropertyName("ingestDirectory")] public string IngestDirectory { get; set; } = "";
 
+    /// <summary>
+    /// Where ingest media lives: Live Edit's exports, the Ingest Controller's clips and anything
+    /// dropped in by hand, one folder per capture recording, each with high\ and low\. Empty means
+    /// the store's ingest folder (StorePaths.Exports). Set from Live Edit's Ingest tab; read fresh
+    /// from disk with <see cref="SavedIngestMediaFolder"/>, because the deck and Live Edit each hold
+    /// their own copy of the settings.
+    /// </summary>
+    [JsonPropertyName("ingestMediaFolder")] public string IngestMediaFolder { get; set; } = "";
+
+    // What IngestMediaFolder was when this copy was loaded, so Save can tell a change made here
+    // from a stale copy that would put an older value back over one Live Edit saved.
+    private string _ingestMediaFolderAsLoaded = "";
+
     /// <summary>The operator's standing note, carried between ingests.</summary>
     [JsonPropertyName("ingestMetadata")] public string IngestMetadata { get; set; } = "";
 
@@ -347,9 +370,14 @@ public sealed class AppSettings
                         : "";
 
             if (path.Length > 0)
-                return Migrate(
+            {
+                AppSettings loaded = Migrate(
                     JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Options)
                     ?? new AppSettings());
+
+                loaded._ingestMediaFolderAsLoaded = loaded.IngestMediaFolder;
+                return loaded;
+            }
         }
         catch
         {
@@ -369,6 +397,11 @@ public sealed class AppSettings
     /// </summary>
     public static AppSettings Migrate(AppSettings settings)
     {
+        // The old fixed default was one site's address, not a decision: it becomes this computer's.
+        if (string.IsNullOrWhiteSpace(settings.TimecodeApiUrl) ||
+            settings.TimecodeApiUrl.Trim() == FormerDefaultTimecodeApiUrl)
+            settings.TimecodeApiUrl = DefaultTimecodeApiUrl;
+
         if (!settings.RecordingSegmentChosen &&
             settings.RecordingSegmentSeconds == FormerDefaultSegmentSeconds)
             settings.RecordingSegmentSeconds = DefaultSegmentSeconds;
@@ -433,8 +466,52 @@ public sealed class AppSettings
         saved.Save();
     }
 
+    /// <summary>The ingest media folder as last saved, read fresh from the file; "" when not set or unreadable.</summary>
+    public static string SavedIngestMediaFolder() => SavedString("ingestMediaFolder") ?? "";
+
+    /// <summary>
+    /// Writes the ingest media folder into the saved settings and nothing else, like
+    /// <see cref="SaveStoreFolders"/>.
+    /// </summary>
+    public static void SaveIngestMediaFolder(string folder)
+    {
+        if (File.Exists(FilePath) && SavedStoreFolders() is null) return;
+
+        AppSettings saved = Load();
+        if (saved.IngestMediaFolder == folder) return;
+
+        saved.IngestMediaFolder = folder;
+        saved.Save();
+    }
+
+    private static string? SavedString(string name)
+    {
+        try
+        {
+            if (!File.Exists(FilePath)) return null;
+
+            using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(FilePath));
+
+            return doc.RootElement.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public void Save()
     {
+        // Not changed by this copy: keep whatever is on disk, which another window may have set
+        // since this copy was loaded. The deck saves everything when it closes, and would otherwise
+        // put the ingest folder back to what it was when the deck opened.
+        if (IngestMediaFolder == _ingestMediaFolderAsLoaded && SavedString("ingestMediaFolder") is { } onDisk)
+            IngestMediaFolder = onDisk;
+
+        _ingestMediaFolderAsLoaded = IngestMediaFolder;
+
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);

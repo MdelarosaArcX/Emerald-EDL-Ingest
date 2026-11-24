@@ -106,10 +106,11 @@ public partial class IngestControllerWindow : Window
             ? IngestTimingMode.EomControlsDuration
             : IngestTimingMode.DurationControlsEom;
 
-        // A blank setting means the operator has never chosen. Point at the Emerald media
-        // store, so an ingested clip lands where Live Edit and the deck can already see it.
+        // A blank setting means the operator has never chosen. Point at the ingest media path,
+        // so each clip goes into the folder of the recording on air and shows up in Live Edit's
+        // Ingest tab beside that recording's exports.
         DirectoryBox.Text = string.IsNullOrWhiteSpace(_settings.IngestDirectory)
-                          ? MediaLibrary.DefaultFolder
+                          ? IngestLibrary.RootFor(_settings)
                           : _settings.IngestDirectory;
 
         ClipNameBox.Text = _clipNames.Generate();
@@ -772,9 +773,11 @@ public partial class IngestControllerWindow : Window
 
         long? free = DiskSpace.AvailableBytes(folder);
 
-        DirectoryHint.Text = free is { } bytes
-            ? $"{DiskSpace.Describe(bytes)} free. Masters are written to \\high, proxies to \\low."
+        string where = IngestLibrary.SameFolder(folder, IngestLibrary.RootFor(_settings))
+            ? "The ingest media path: each clip goes into the folder of the recording on air (or a new one), masters to \\high, proxies to \\low."
             : "Masters are written to \\high, proxies to \\low.";
+
+        DirectoryHint.Text = free is { } bytes ? $"{DiskSpace.Describe(bytes)} free. {where}" : where;
 
         DirectoryHint.Foreground = Brush("Muted", "#6B7382");
     }

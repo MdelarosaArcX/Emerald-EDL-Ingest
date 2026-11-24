@@ -137,8 +137,17 @@ public partial class LiveEditWindow
 
         switch (air.State)
         {
-            case LiveAirState.CountingDown when _liveTx is null:
+            // Only a transmission armed here is transmitted from here. One armed from the playback
+            // deck's tidal lock runs its transmitter there; this window still sends it the EDL.
+            case LiveAirState.CountingDown when _liveTx is null && air.Owner == LiveAirOwner.LiveEdit:
                 StartLiveTx(air);
+                break;
+
+            // The cues the playback deck's transmitter will play, sent as soon as it is filling.
+            case LiveAirState.CountingDown when air.Owner == LiveAirOwner.Playback:
+                _liveRate = air.Line?.FrameRate ?? _liveRate;
+                _liveStartedAt = air.RecordingStartedAt ?? PipelineState.Shared.RecordingStartedAt;
+                PushCues("tidal lock on the playback deck");
                 break;
 
             case LiveAirState.Off or LiveAirState.Failed:
@@ -187,6 +196,8 @@ public partial class LiveEditWindow
         _liveTx = tx;
         tx.Status += OnLiveStatus;
         tx.Start();
+
+        WarnIfInsertsDoNotFit();
     }
 
     /// <summary>
@@ -293,6 +304,9 @@ public partial class LiveEditWindow
         if (!LiveAir.Shared.Active) return;
 
         _liveStartedAt ??= LiveAir.Shared.RecordingStartedAt ?? PipelineState.Shared.RecordingStartedAt;
+
+        // Also when the transmitter is the playback deck's, or this window opened after it started.
+        if (LiveAir.Shared.Line is { FrameRate: > 0 } line) _liveRate = line.FrameRate;
 
         if (_liveStartedAt is null) return;
 
@@ -702,7 +716,11 @@ public partial class LiveEditWindow
         DelayText.ToolTip = ours
             ? $"How far behind the recording air is: {TidalLock.Describe(LiveAir.Shared.Delay)} chosen, " +
               "plus every insert, less every deleted scene - each taking effect as air reaches it. " +
-              (DelayCapacityFrames() is { } most ? $"It can grow to {new Timecode(most, _rate)}." : "")
+              (DelayCapacityFrames() is { } most
+                  ? $"It can grow to {new Timecode(most, _rate)}: room for {InsertRoomText(most - delay - _rate)} more of inserts." +
+                    (LiveAir.Shared.Line is DelayLine { Compressed: > 0 } line && now > line.MemoryRoomFrames
+                        ? " It is past what memory holds, so the recording is going to air through DNxHD." : "")
+                  : "")
             : "The playback deck's tidal lock delay. That transmission does not play this timeline's inserts or cuts.";
         DelayText.Visibility = Visibility.Visible;
     }
@@ -855,12 +873,32 @@ public partial class LiveEditWindow
 
         if (DelayCapacityFrames() is not { } most || DelayCounterFrames() is not { } delay) return true;
 
-        // A second of guard, as the ring itself keeps two.
-        if (delay + frames <= most - _rate) return true;
+        if (LiveCues.InsertFits(delay, frames, most, _rate)) return true;
 
-        why = $"That insert would make the delay {new Timecode(delay + frames, _rate)}, and Live Edit went live " +
-              $"with room for {new Timecode(most, _rate)}. Go live again with more insert room, or delete a scene first.";
+        why = $"That insert is {new Timecode(frames, _rate)} long and there is room for {InsertRoomText(most - delay - _rate)}. " +
+              $"An insert makes the delay longer for the rest of the show. Overlay or Replace need no " +
+              "room. To make some, remove an insert air has not reached yet, or go live again with a shorter delay. Deleting a " +
+              "scene makes none: it goes out as black for its own length.";
         return false;
+    }
+
+    private string InsertRoomText(long frames) => new Timecode(Math.Max(0, frames), _rate).ToString();
+
+    /// <summary>
+    /// Said as Live Edit goes live, when the inserts already on the timeline add up to more than there is
+    /// room for: placed before, they were never asked, and the transmitter will not play the ones that do
+    /// not fit. Better known now than as each is reached.
+    /// </summary>
+    private void WarnIfInsertsDoNotFit()
+    {
+        if (DelayCapacityFrames() is not { } most || DelayCounterFrames() is not { } delay || delay <= most - _rate) return;
+
+        string said = $"The inserts on the timeline would make the delay {new Timecode(delay, _rate)}, and there is room for " +
+                      $"{new Timecode(most, _rate)}. Inserts past that will not be played. Delete some, or go live with a shorter delay.";
+
+        LayerText.Text = said;
+        LayerText.Foreground = Brush("Bad");
+        ActivityLog.Shared.Warn(LogSource.LiveEdit, $"EDL  {said}", @event: "liveedit.insertroom");
     }
 
     // ------------------------------------------------------------------ the logs
@@ -907,6 +945,7 @@ public partial class LiveEditWindow
                         "playing" => "ON AIR",
                         "done" or "cut" => "AIRED",
                         "failed" or "openfailed" => "FAILED",
+                        "refused" => "REFUSED",
                         _ => s.ToUpperInvariant(),
                     }
                     : onAir is { } air && x.At < air ? (LiveAir.Shared.Active ? "MISSED" : "PAST")

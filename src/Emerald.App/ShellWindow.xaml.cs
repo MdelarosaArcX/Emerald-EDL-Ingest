@@ -210,6 +210,7 @@ public partial class ShellWindow : Window
         StorePaths paths = MediaLibrary.PathsFor(_settings);
         HighResBox.Text = paths.High;
         LowResBox.Text = paths.Low;
+        DelayPathBox.Text = App.TidalLockRingFolder(_settings);
         RecordTitleBox.Text = RecordingSequence.PrefixOr(_settings.RecordingTitle);
         RecordDescriptionBox.Text = _settings.RecordingDescription;
         SetDurationBox.Text = _settings.RecordingDuration;
@@ -614,6 +615,9 @@ public partial class ShellWindow : Window
         // not wait for this deck to close to find out where the recording is going.
         AppSettings.SaveStoreFolders(store.High, store.Low);
 
+        // The ring is never put on a recording drive, so moving the recordings can move it.
+        DelayPathBox.Text = App.TidalLockRingFolder(_settings);
+
         ActivityLog.Shared.Info(LogSource.Capture,
             $"Masters go to {store.High}, proxies to {store.Low}" +
             (store.Split ? " - on different drives." : "."),
@@ -639,6 +643,111 @@ public partial class ShellWindow : Window
 
         box.Text = dialog.FolderName;
         ApplyStorePaths();
+    }
+
+    // ------------------------------------------------------------------ delay ring folder
+
+    private void DelayPath_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+
+        ApplyDelayPath();
+    }
+
+    private void DelayPath_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key != System.Windows.Input.Key.Enter) return;
+
+        ApplyDelayPath();
+        e.Handled = true;
+    }
+
+    private void BrowseDelayPath_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "Folder for the delay ring (a fast local drive, not the Windows or recording drive)",
+        };
+
+        if (Directory.Exists(DelayPathBox.Text.Trim())) dialog.InitialDirectory = DelayPathBox.Text.Trim();
+        if (dialog.ShowDialog(this) != true) return;
+
+        DelayPathBox.Text = dialog.FolderName;
+        ApplyDelayPath();
+    }
+
+    /// <summary>
+    /// Takes the folder typed or chosen for the delay ring. An empty box, or the folder
+    /// automatic would pick anyway, is stored as automatic, so it keeps following the drives.
+    /// A folder that cannot be created is refused and the box goes back to what is in use.
+    /// Takes effect when the next ring is made - the next recording - since one already
+    /// filling cannot move.
+    /// </summary>
+    private void ApplyDelayPath()
+    {
+        string typed = DelayPathBox.Text.Trim().Trim('"');
+        string automatic = App.AutomaticTidalLockRingFolder(_settings);
+        string before = _settings.TidalLockRingFolder;
+
+        string wanted = typed.Length == 0 || SameFolder(typed, automatic) ? "" : typed;
+
+        if (wanted.Length > 0)
+        {
+            try
+            {
+                wanted = Path.GetFullPath(wanted);
+                Directory.CreateDirectory(wanted);
+            }
+            catch (Exception ex)
+            {
+                SetStatus($"The delay folder {typed} cannot be used: {ex.Message}", true);
+                DelayPathBox.Text = App.TidalLockRingFolder(_settings);
+                return;
+            }
+        }
+
+        if (!string.Equals(wanted, before, StringComparison.OrdinalIgnoreCase))
+        {
+            _settings.TidalLockRingFolder = wanted;
+            _settings.Save();
+
+            string inUse = App.TidalLockRingFolder(_settings);
+            string disk = DelayLine.DescribeDisk(inUse);
+            string windows = Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.Windows)) ?? "";
+            bool onWindows = string.Equals(Path.GetPathRoot(inUse), windows, StringComparison.OrdinalIgnoreCase);
+
+            if (wanted.Length == 0)
+                ActivityLog.Shared.Info(LogSource.Capture,
+                    $"DELAY  ring folder back to automatic: {inUse} ({disk}), from the next recording.",
+                    @event: "delay.folderchoice");
+            else if (onWindows)
+                ActivityLog.Shared.Warn(LogSource.Capture,
+                    $"DELAY  ring folder set to {inUse} ({disk}), from the next recording. That is the Windows " +
+                    "drive, which is the drive most likely to fall behind and drop frames from air.",
+                    @event: "delay.folderchoice");
+            else
+                ActivityLog.Shared.Info(LogSource.Capture,
+                    $"DELAY  ring folder set to {inUse} ({disk}), from the next recording.",
+                    @event: "delay.folderchoice");
+
+            if (disk.Contains("network", StringComparison.OrdinalIgnoreCase))
+                ActivityLog.Shared.Warn(LogSource.Capture,
+                    $"DELAY  {inUse} is a network drive. The ring needs about 104 MB/s of local writes; expect dropped frames.",
+                    @event: "delay.foldernetwork");
+        }
+
+        // What will actually be used - a folder on a recording drive is passed over, and said so.
+        DelayPathBox.Text = App.TidalLockRingFolder(_settings);
+    }
+
+    private static bool SameFolder(string a, string b)
+    {
+        try
+        {
+            return string.Equals(Path.GetFullPath(a).TrimEnd('\\', '/'), Path.GetFullPath(b).TrimEnd('\\', '/'),
+                                 StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception) { return false; }
     }
 
     /// <summary>Read on the capture thread, which cannot ask the window itself.</summary>
@@ -1133,6 +1242,14 @@ public partial class ShellWindow : Window
             file: Path.Combine(store.Low, naming.Folder),
             detail: $"folder {naming.Folder}\nfirst number {naming.Start}\nhigh {store.High}\nlow {store.Low}");
 
+        // Its ingest folder too, now rather than at the first export: Live Edit lists it straight
+        // away, on air at the top, and anything dropped in for this recording has somewhere to go.
+        string ingestRoot = IngestLibrary.RootFor(_settings);
+        if (IngestLibrary.Ensure(ingestRoot, naming.Folder) is null)
+            ActivityLog.Shared.Warn(LogSource.Capture,
+                $"The ingest folder for {naming.Folder} could not be made in {ingestRoot}; Live Edit will try again.",
+                @event: "capture.ingestfolderfailed", correlation: _capture.SessionId);
+
         // After Start, because that is where the session is minted, and the whole point of the
         // line is to name the recording everything after it will refer to.
         ActivityLog.Shared.Ok(LogSource.Capture,
@@ -1201,7 +1318,8 @@ public partial class ShellWindow : Window
 
         try
         {
-            _delayLine = DelayLine.Create(App.TidalLockRingFolder(_settings), format, TidalLock.Shared.Delay);
+            _delayLine = DelayLine.Create(App.TidalLockRingFolder(_settings), format, TidalLock.Shared.Delay,
+                                          TimeSpan.Zero, DelayInMemory(TidalLock.Shared.Delay, TimeSpan.Zero));
         }
         catch (DelayLineException ex)
         {
@@ -1264,7 +1382,7 @@ public partial class ShellWindow : Window
         if (line.Fault is { } fault)
             SetStatus($"the delay line stopped: {fault}", true);
         else if (line.Dropped > 0)
-            SetStatus($"the delay line dropped {line.Dropped} frame(s) - the disk could not keep up.", true);
+            SetStatus($"the delay line dropped {line.Dropped} frame(s) - disk {line.Disk} could not keep up.", true);
 
         TidalLock.Shared.RecordingStopped();
 
@@ -1329,7 +1447,14 @@ public partial class ShellWindow : Window
         {
             try
             {
-                _readyLine = DelayLine.Create(App.TidalLockRingFolder(_settings), format, size);
+                // In RAM: what a transmitter could start from, and as much insert room as memory allows.
+                // Only the first has to fit - the line's whole length is the delay and every insert.
+                TimeSpan keep = TimeSpan.FromSeconds(ReadyKeepFrames(1));
+                if (keep > size) keep = size;
+
+                _readyLine = DelayLine.Create(App.TidalLockRingFolder(_settings), format, size, TimeSpan.Zero,
+                                              DelayInMemory(keep, TimeSpan.FromSeconds(Math.Max(0, _settings.LiveHeadroomSeconds))),
+                                              required: keep, ffmpeg: Ffmpeg.Locate(_settings.FfmpegPath));
                 break;
             }
             catch (DelayLineException ex)
@@ -1351,19 +1476,21 @@ public partial class ShellWindow : Window
         _capture.ReportDelayDrops(() => line.Dropped);
         RecordingPicture.Shared.Line = line;
 
-        // Room for any delay and its inserts, but on disk only what a transmitter could start
-        // from; see ReadyKeepFrames.
+        // Only what a transmitter could start from (see ReadyKeepFrames), and never more than the line
+        // has room for: a longer delay chosen after this line opened would otherwise have every frame
+        // written out of RAM to the disk from then on, with nothing on air. Go Live with that delay
+        // gets a line of its own.
         int rate = line.FrameRate;
-        line.KeepBehind(() => ReadyKeepFrames(rate));
+        line.KeepBehind(() => Math.Min(ReadyKeepFrames(rate), line.MemoryRoomFrames));
 
         ActivityLog.Shared.Info(LogSource.Capture,
-            $"DELAY  the last {TidalLock.Describe(TimeSpan.FromSeconds(line.TargetFrames / (double)line.FrameRate))} " +
+            $"DELAY  the last {TidalLock.Describe(TimeSpan.FromSeconds(Math.Min(ReadyKeepFrames(rate), Math.Min(line.TargetFrames, line.MemoryRoomFrames)) / (double)line.FrameRate))} " +
             "of the recording is kept ready, so tidal lock and Go Live go to air as soon as they are armed.",
             @event: "delay.ready", correlation: _capture.SessionId, file: line.Path);
     }
 
     /// <summary>
-    /// How much of the ready line stays on disk when nothing is reading it: the longest delay
+    /// How much of the ready line is kept when nothing is reading it: the longest delay
     /// tidal lock or Go Live could start with - the deck's, Live Edit's setting, or one either
     /// has resolved - and not the headroom for inserts, which a transmitter only takes up once
     /// it is on air and holding the recording back (it holds its own frames then). At 120 s
@@ -1377,6 +1504,36 @@ public partial class ShellWindow : Window
     }
 
     /// <summary>
+    /// How much of a line to ask for in RAM: the delay, the insert room it may grow into, and ten seconds
+    /// more. DelayLine gives what memory can spare - about 147 s of 1080p25 on 32 GB. What inserts push past
+    /// that is compressed; if it cannot be, the insert room is cut to match (FitRoom).
+    /// </summary>
+    private static TimeSpan DelayInMemory(TimeSpan delay, TimeSpan headroom) =>
+        delay + headroom + TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Cuts Go Live's insert room to what its line really has, so Live Edit refuses an insert that would
+    /// push the delay out of RAM and onto the disk for the rest of the transmission.
+    /// </summary>
+    private void FitRoom(DelayLine line)
+    {
+        line.WaitForOverflow(TimeSpan.FromSeconds(3));
+
+        TimeSpan room = TimeSpan.FromSeconds(line.RoomFrames / (double)Math.Max(1, line.FrameRate)) - LiveAir.Shared.Delay;
+        if (room >= LiveAir.Shared.Headroom) return;
+
+        if (room < TimeSpan.Zero) room = TimeSpan.Zero;
+
+        ActivityLog.Shared.Warn(LogSource.Capture,
+            $"DELAY  room for {(int)room.TotalSeconds} s of inserts in all, rather than the " +
+            $"{TidalLock.Describe(LiveAir.Shared.Headroom)} asked for: that is what the delay line can hold behind a delay of " +
+            $"{TidalLock.Describe(LiveAir.Shared.Delay)}. Live Edit refuses a longer insert. A shorter delay or more memory makes room.",
+            @event: "delay.insertroom", correlation: _capture.SessionId);
+
+        LiveAir.Shared.FitHeadroom(room);
+    }
+
+    /// <summary>
     /// The ready line, with a claim taken on it for a lock - when there is one, it has
     /// <paramref name="room"/>, and it still holds the last <paramref name="history"/> of the
     /// recording. Null otherwise, and the lock makes a line of its own.
@@ -1386,7 +1543,7 @@ public partial class ShellWindow : Window
         if (_readyLine is not { } ready || ready.IsSealed) return null;
 
         long frames = (long)Math.Ceiling(room.TotalSeconds * ready.FrameRate);
-        if (ready.TargetFrames < frames) return null;
+        if (ready.TargetFrames < frames || ready.RoomFrames < frames) return null;
 
         // A delay set longer than the line was keeping, after it had given the older frames
         // back to the disk: starting it a delay behind would read frames that are gone.
@@ -1424,9 +1581,13 @@ public partial class ShellWindow : Window
             ? long.MaxValue
             : ready.TargetFrames - (long)Math.Ceiling(headroom.TotalSeconds * rate);
 
-        // Once the line has given older frames back to the disk, no further back than it still
-        // holds, less a couple of seconds for the frames given back while this is armed.
-        if (ready is { ReleasedThrough: > 0 })
+        // And no further back than a transmitter on it may be.
+        if (ready is not null) reach = Math.Min(reach, ready.MemoryRoomFrames);
+
+        // Once the line has let older frames go - given back to the disk, or out of RAM unspilled -
+        // no further back than it still holds, less a couple of seconds for those let go while
+        // this is armed.
+        if (ready is not null && ready.OldestHeld > Math.Max(0, written - ready.SlotCount))
             reach = Math.Min(reach, written - ready.OldestHeld - 2L * rate);
 
         long frames = TidalLock.FramesFor(start, 0, written, segment, reach);
@@ -1449,8 +1610,12 @@ public partial class ShellWindow : Window
     private Timecode? LineStartedAt(DelayLine line) =>
         _timecode.TryGetCurrent(out Timecode now) ? now.AddWrapping(-line.FramesWritten) : null;
 
-    /// <summary>The recording has stopped: no more frames, so whatever is reading it plays out and finishes.</summary>
-    private void ReleaseReadyLine()
+    /// <summary>
+    /// The recording has stopped: no more frames, so whatever is reading it plays out and finishes.
+    /// With <paramref name="wait"/>, let go on this thread, so that if nothing else holds it its RAM
+    /// is back before this returns - for a line about to be opened in its place.
+    /// </summary>
+    private void ReleaseReadyLine(bool wait = false)
     {
         if (_readyLine is not { } line) return;
 
@@ -1461,7 +1626,7 @@ public partial class ShellWindow : Window
         _capture.ReportDelayDrops(null);
         line.Seal();
 
-        _ = Task.Run(() =>
+        void Release()
         {
             try { line.Release(); }
             catch (Exception ex)
@@ -1469,7 +1634,10 @@ public partial class ShellWindow : Window
                 ActivityLog.Shared.Warn(LogSource.Capture,
                     $"The ready delay line did not close cleanly: {ex.Message}", @event: "delay.releasefailed");
             }
-        });
+        }
+
+        if (wait) Release();
+        else _ = Task.Run(Release);
     }
 
     // ------------------------------------------------------------------ Live Edit's line
@@ -1517,6 +1685,9 @@ public partial class ShellWindow : Window
         if (LiveAir.Shared.Start != DelayStart.Fixed)
             LiveAir.Shared.Resolve(ResolveStart(LiveAir.Shared.Start, LiveAir.Shared.Headroom, format.FrameRate, "Go Live"));
 
+        // Tried out as the recording rolled, so this is not normally a wait at all.
+        _readyLine?.WaitForOverflow(TimeSpan.FromSeconds(3));
+
         // Straight on air from the line that has been filling all along, when it has room for the
         // delay and for the inserts to grow it into.
         if (TakeReadyLine(LiveAir.Shared.Delay + LiveAir.Shared.Headroom, LiveAir.Shared.Delay) is { } ready)
@@ -1526,23 +1697,71 @@ public partial class ShellWindow : Window
             return;
         }
 
+        // The ready line holds the delay but not all the headroom asked for. Gone live from it all the
+        // same, with the headroom it does have: a line of its own would have the same memory to hold
+        // its delay in, and would have to fill it first.
+        if (TakeReadyLine(LiveAir.Shared.Delay, LiveAir.Shared.Delay) is { } shorter)
+        {
+            FitRoom(shorter);
+
+            _liveLine = shorter;
+            LiveAir.Shared.RecordingRolled(shorter, PipelineState.Shared.RecordingStartedAt);
+            return;
+        }
+
+        // The ready line cannot serve this delay, and only one line holds its delay in RAM. Let it
+        // go first, and wait for it, so the RAM goes to the line about to go on air rather than
+        // staying with one nothing will read. Kept beside it, the two would want 27 GB at 120 s,
+        // or the new one would get the scraps and play most of its delay from disk. It comes back
+        // once this line has closed (ReopenReadyLineAfter).
+        if (_readyLine is not null)
+        {
+            ActivityLog.Shared.Info(LogSource.Capture,
+                "DELAY  Go Live needs a line of its own, so the line kept ready is let go and its RAM goes to the new one.",
+                @event: "delay.readyreleased", correlation: _capture.SessionId);
+
+            ReleaseReadyLine(wait: true);
+        }
+
         DelayLine line;
 
         try
         {
             line = DelayLine.Create(App.TidalLockRingFolder(_settings), format,
-                                    LiveAir.Shared.Delay, LiveAir.Shared.Headroom);
+                                    LiveAir.Shared.Delay, LiveAir.Shared.Headroom,
+                                    DelayInMemory(LiveAir.Shared.Delay, LiveAir.Shared.Headroom),
+                                    required: LiveAir.Shared.Delay, ffmpeg: Ffmpeg.Locate(_settings.FfmpegPath));
         }
         catch (DelayLineException ex)
         {
             LiveAir.Shared.Fail(ex.Message);
+            Dispatcher.BeginInvoke(() => OpenReadyLine(format));
             return;
         }
 
         _liveLine = line;
         _capture.Frame += line.Offer;
+        FitRoom(line);
+        ReopenReadyLineAfter(line);
+
+        // The REC view reads the newest frames of the recording, which this line holds as well.
+        RecordingPicture.Shared.Line = line;
 
         LiveAir.Shared.RecordingRolled(line, PipelineState.Shared.RecordingStartedAt);
+    }
+
+    /// <summary>
+    /// Opens the ready line again once <paramref name="line"/> has closed and given its RAM back -
+    /// not as soon as Go Live ends, because the transmitter plays out the rest of the delay first,
+    /// and a ready line opened meanwhile would find the RAM taken and write every frame to disk.
+    /// </summary>
+    private void ReopenReadyLineAfter(DelayLine line)
+    {
+        line.Closed += _ => Dispatcher.BeginInvoke(() =>
+        {
+            if (DelayLine.MemoryRingHeld || _captureFormat is not { } format) return;
+            OpenReadyLine(format);
+        });
     }
 
     /// <summary>
@@ -1565,6 +1784,8 @@ public partial class ShellWindow : Window
 
         _capture.Frame -= line.Offer;
         line.Seal();
+
+        if (ReferenceEquals(RecordingPicture.Shared.Line, line)) RecordingPicture.Shared.Line = null;
 
         LiveAir.Shared.RecordingStopped();
 
@@ -1633,6 +1854,9 @@ public partial class ShellWindow : Window
         // Nor can the folders: the recorder, the segment watch and the storage limit are all
         // told them once. Moving them mid-recording left the limit policing an empty folder.
         HighResBox.IsEnabled = LowResBox.IsEnabled = HighResBrowse.IsEnabled = LowResBrowse.IsEnabled = !live;
+
+        // Nor the delay folder: the ring files are already open on it.
+        DelayPathBox.IsEnabled = DelayPathBrowse.IsEnabled = !live;
     }
 
     private void OnCaptureMessage(string text, bool problem) =>

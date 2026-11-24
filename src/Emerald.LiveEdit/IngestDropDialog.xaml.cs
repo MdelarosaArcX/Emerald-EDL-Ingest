@@ -37,7 +37,10 @@ public partial class IngestDropDialog : Window
     /// <summary>The start last typed, kept while a range mode has the box showing mark in.</summary>
     private string _typed = "";
 
-    /// <param name="dropFrame">The timeline frame the file was dropped at - where it goes unless another is typed.</param>
+    /// <param name="dropFrame">
+    /// Where it goes unless another is typed: the timeline's mark in. A drop needs one, because the
+    /// pointer is rarely frame accurate.
+    /// </param>
     /// <param name="markIn">Mark in, in timeline frames.</param>
     /// <param name="markOut">Mark out, in timeline frames.</param>
     /// <param name="day">The date the timeline's frames count from.</param>
@@ -75,7 +78,7 @@ public partial class IngestDropDialog : Window
         WhatText.Text =
             $"{Path.GetFileName(path)}\n" +
             $"{ingestFrames:N0} frames ({new Timecode(ingestFrames, rate)})   " +
-            $"dropped at {Stamp(dropFrame)}\n" +
+            $"placed at mark in {Stamp(dropFrame)}\n" +
             (ranged
                 ? $"marked range {Stamp(markIn!.Value)} - {Stamp(markOut!.Value)} " +
                   $"({markOut.Value - markIn.Value:N0} frames)"

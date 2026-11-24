@@ -103,9 +103,13 @@ public static class RangePlan
 /// <summary>What came of an export.</summary>
 public readonly record struct ExportResult(bool Ok, string Path, string Problem);
 
+/// <summary>How far an export has got: what it is doing, and the whole job's fraction from 0 to 1.</summary>
+public readonly record struct ExportProgress(string Stage, double Fraction);
+
 /// <summary>
 /// Cuts a marked range out of the store and writes it, with whatever the operator said about it,
-/// into the ingest folder.
+/// into the recording's folder on the ingest media path: the cut in high\, its 960x540 low-res
+/// copy in low\ (see <see cref="IngestLibrary"/>).
 ///
 /// <b>From the masters, not the proxies.</b> The proxy exists so the timeline can scrub; what
 /// comes out of an export is something somebody will transmit or hand on, so it is cut from the
@@ -127,56 +131,43 @@ public static class RangeExport
     /// <summary>Where exported ranges go with the high-res and low-res folders chosen apart (see <see cref="StorePaths.Exports"/>).</summary>
     public static string FolderFor(StorePaths store) => store.Exports;
 
-    public static ExportResult Write(string ffmpegPath, StorePaths store, string name,
-                                     string metadata, IReadOnlyList<RangePart> parts,
-                                     int frameRate, string extension,
-                                     Action<string>? progress = null,
-                                     CancellationToken cancel = default) =>
-        WriteInto(ffmpegPath, store.Exports, name, metadata, parts, frameRate, extension, progress, cancel);
-
-    public static IReadOnlyList<CapturedClip> List(StorePaths store, string? ffprobePath, int frameRate = 25) =>
-        ListIn(store.Exports, ffprobePath, frameRate);
+    // Of the whole job, how much is the cut and how much the low-res copy. The cut is a stream copy
+    // but reads and writes every byte of DNxHD; the copy decodes and encodes, on the card when
+    // there is one.
+    private const double CutShare = 0.35;
 
     /// <summary>
-    /// Writes the range as one file plus a sidecar carrying the metadata.
+    /// Writes the range into a recording's ingest folder (<see cref="IngestLibrary.FolderFor"/>):
+    /// the cut itself and a sidecar carrying the metadata in high\, and its low-res copy in low\.
     ///
     /// Synchronous and slow — it shells out to ffmpeg — so callers run it off the UI thread.
     /// </summary>
     /// <param name="progress">
-    /// Told what is happening, as it happens, on the calling thread.
-    ///
-    /// An export is two jobs of very different length: the cut is a stream copy and takes
-    /// seconds, and the playable copy beside it is a real encode and can take minutes on a long
-    /// range. Without this the window could only say "writing..." for the whole of it, which on
-    /// the long one is indistinguishable from a hang.
+    /// Told what is happening and how far through the whole job it is, on the calling thread, a
+    /// few times a second - from ffmpeg's own progress, so the bar is a real fraction.
     /// </param>
-    public static ExportResult Write(string ffmpegPath, string storeRoot, string name,
+    public static ExportResult Write(string ffmpegPath, string folder, string name,
                                      string metadata, IReadOnlyList<RangePart> parts,
                                      int frameRate, string extension,
-                                     Action<string>? progress = null,
-                                     CancellationToken cancel = default) =>
-        WriteInto(ffmpegPath, FolderFor(storeRoot), name, metadata, parts, frameRate, extension, progress, cancel);
-
-    private static ExportResult WriteInto(string ffmpegPath, string folder, string name,
-                                          string metadata, IReadOnlyList<RangePart> parts,
-                                          int frameRate, string extension,
-                                          Action<string>? progress,
-                                          CancellationToken cancel)
+                                     Action<ExportProgress>? progress = null,
+                                     CancellationToken cancel = default)
     {
         if (parts.Count == 0) return new ExportResult(false, "", "The range covers no media.");
         if (name.Length == 0) return new ExportResult(false, "", "The export has no name.");
 
-        string output = Path.Combine(folder, $"{name}.{extension}");
+        string high = IngestLibrary.HighOf(folder);
+        string output = Path.Combine(high, $"{name}.{extension}");
 
         try
         {
-            Directory.CreateDirectory(folder);
+            Directory.CreateDirectory(high);
+            Directory.CreateDirectory(IngestLibrary.LowOf(folder));
 
-            progress?.Invoke($"cutting {parts.Count} segment(s) into {name}.{extension}");
+            progress?.Invoke(new ExportProgress($"cutting {parts.Count} segment(s)", 0));
 
             // A concat list rather than one -i per part: the parts are the same codec from the
             // same encoder, so they join without being decoded.
-            string list = Path.Combine(folder, $".{name}.concat.txt");
+            string list = Path.Combine(high, $".{name}.concat.txt");
 
             var text = new StringBuilder();
             foreach (RangePart part in parts)
@@ -189,13 +180,6 @@ public static class RangeExport
             double from = parts[0].FromFrame / (double)frameRate;
             double length = parts.Sum(p => p.Frames) / (double)frameRate;
 
-            var info = new ProcessStartInfo(ffmpegPath)
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardError = true,
-            };
-
             // -ss goes AFTER -i, which is not the usual advice and is measured.
             //
             // Before -i, the concat demuxer does not seek: it hands back the whole of the first
@@ -205,50 +189,37 @@ public static class RangeExport
             // segments. After -i, the same range comes out at 500 frames, 20.005s, and decodes
             // end to end without a complaint. The cost is the usual one for a stream copy: the
             // picture starts at the first keyframe at or after the mark.
-            foreach (string a in new[]
-                     {
-                         "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                         "-f", "concat", "-safe", "0",
-                         "-i", list,
-                         "-ss", Seconds(from),
-                         "-t", Seconds(length),
-                         "-c", "copy",
-                         // The timestamps come off the middle of a recording. Without this the
-                         // export can open on a negative or multi-hour offset and players report
-                         // the wrong duration. A generic muxer option, so it is safe whatever
-                         // container the master happens to be in.
-                         "-avoid_negative_ts", "make_zero",
-                         output,
-                     })
-                info.ArgumentList.Add(a);
-
-            using Process? ffmpeg = Process.Start(info);
-            if (ffmpeg is not null) BackgroundPriority.Apply(ffmpeg);
-
-            if (ffmpeg is null)
-                return new ExportResult(false, "", "ffmpeg could not be started.");
-
-            string complaints;
-
-            // Called off - its window closed, say: the cut is stopped rather than left to run on
-            // with nobody to see it finish, and what it had written is not left as an export.
-            using (cancel.Register(() => Stop(ffmpeg)))
+            string[] cut =
             {
-                complaints = ffmpeg.StandardError.ReadToEnd();
-                ffmpeg.WaitForExit();
-            }
+                "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", list,
+                "-ss", Seconds(from),
+                "-t", Seconds(length),
+                "-c", "copy",
+                // The timestamps come off the middle of a recording. Without this the
+                // export can open on a negative or multi-hour offset and players report
+                // the wrong duration. A generic muxer option, so it is safe whatever
+                // container the master happens to be in.
+                "-avoid_negative_ts", "make_zero",
+                output,
+            };
+
+            // Called off - its window closed, or the operator pressed Cancel: the cut is stopped
+            // rather than left to run on, and what it had written is not left as an export.
+            FfmpegOutcome cutting = FfmpegRun.Run(ffmpegPath, cut, length,
+                f => progress?.Invoke(new ExportProgress("cutting the high-res", f * CutShare)), cancel);
 
             try { File.Delete(list); } catch (IOException) { }
 
-            if (cancel.IsCancellationRequested)
+            if (cutting.Cancelled)
             {
                 try { File.Delete(output); } catch (IOException) { }
                 return new ExportResult(false, "", "Called off.");
             }
 
-            if (ffmpeg.ExitCode != 0 || !File.Exists(output))
-                return new ExportResult(false, "",
-                    complaints.Length > 0 ? complaints.Trim() : $"ffmpeg exited {ffmpeg.ExitCode}.");
+            if (!cutting.Ok || !File.Exists(output))
+                return new ExportResult(false, "", cutting.Problem.Length > 0 ? cutting.Problem : "ffmpeg wrote nothing.");
 
             // The metadata beside it, as JSON rather than inside the container: a sidecar can be
             // read and corrected without rewriting a file that may be gigabytes.
@@ -265,13 +236,24 @@ public static class RangeExport
                 }, new JsonSerializerOptions { WriteIndented = true }),
                 new UTF8Encoding(false));
 
-            // And the small playable copy, so the Ingest list can show what was just made. After
-            // the sidecar, because the export itself is the thing that must be right and this is
-            // a convenience on top of it.
-            progress?.Invoke("writing the playable preview copy - this is the slow part");
+            // And the low-res copy, which is what the Ingest list shows and the timeline plays.
+            // After the sidecar, because the export itself is the thing that must be right.
+            FfmpegOutcome low = IngestProxy.Make(ffmpegPath, output, IngestLibrary.LowPathFor(output), frameRate,
+                f => progress?.Invoke(new ExportProgress("making the low-res copy", CutShare + f * (1 - CutShare))), cancel);
 
-            WritePreview(ffmpegPath, output, frameRate, cancel);
+            if (low.Cancelled)
+            {
+                foreach (string done in new[] { output, Path.ChangeExtension(output, ".json") })
+                    try { File.Delete(done); } catch (IOException) { }
 
+                return new ExportResult(false, "", "Called off.");
+            }
+
+            // A failed low-res copy is still a good export: it goes to air from high\. The low-res
+            // maker in Live Edit tries again for any high-res left without one.
+            if (!low.Ok) return new ExportResult(true, output, $"The low-res copy was not made: {low.Problem}");
+
+            progress?.Invoke(new ExportProgress("done", 1));
             return new ExportResult(true, output, "");
         }
         catch (Exception ex)
@@ -315,6 +297,10 @@ public static class RangeExport
     /// </summary>
     public static string? PlayablePathFor(string exportPath)
     {
+        // Ingest media in its recording folder: the low-res beside it, always - it is small and
+        // made to be scrubbed, whatever the high-res is.
+        if (IngestLibrary.LowFor(exportPath) is { } low) return low;
+
         if (Path.GetExtension(exportPath).Equals(".mp4", StringComparison.OrdinalIgnoreCase))
             return exportPath;
 
@@ -336,116 +322,4 @@ public static class RangeExport
     /// <summary>True for the preview copies, which are not themselves exports.</summary>
     public static bool IsPreview(string path) =>
         path.EndsWith(PreviewSuffix, StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Writes the small playable copy. Best effort: an export whose preview fails is still a
-    /// good export, and saying it failed would send somebody looking for a problem with media
-    /// that is fine.
-    /// </summary>
-    private static void WritePreview(string ffmpegPath, string exportPath, int frameRate, CancellationToken cancel)
-    {
-        try
-        {
-            var info = new ProcessStartInfo(ffmpegPath)
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardError = true,
-            };
-
-            foreach (string a in new[]
-                     {
-                         "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                         "-i", exportPath,
-
-                         // Full raster, and no scale filter at all.
-                         //
-                         // This was 640x360 on the reasoning that it only had to answer "is this
-                         // the right material". That was true when the only thing playing it was
-                         // the thumbnail beside the ingest list. It is not true now: an ingest
-                         // placement plays this copy on the main viewer, because the export
-                         // itself is DNxHD and nothing here can decode that - so this is the
-                         // picture, and 360 lines blown up to fill a viewer is what "very low
-                         // quality" looks like.
-                         "-c:v", "libx264",
-
-                         // Stated, as on the recording's own proxy: ffmpeg's default follows the
-                         // machine's CPU count, and memory follows the threads.
-                         "-threads", "6",
-                         "-preset", "veryfast",
-                         "-profile:v", "high",
-                         "-crf", "20",
-                         "-pix_fmt", "yuv420p",
-
-                         // No B-frames and a keyframe every half second, for the same reason the
-                         // capture proxy has them: this copy gets scrubbed and stepped through,
-                         // and reordered pictures with eleven seconds between keyframes is what
-                         // makes that lurch.
-                         "-bf", "0",
-                         "-g", Math.Max(1, frameRate / 2).ToString(),
-                         "-sc_threshold", "0",
-
-                         "-c:a", "aac", "-b:a", "192k",
-                         PreviewPathFor(exportPath),
-                     })
-                info.ArgumentList.Add(a);
-
-            using Process? ffmpeg = Process.Start(info);
-            if (ffmpeg is not null) BackgroundPriority.Apply(ffmpeg);
-
-            if (ffmpeg is null) return;
-
-            using (cancel.Register(() => Stop(ffmpeg)))
-            {
-                ffmpeg.StandardError.ReadToEnd();
-                ffmpeg.WaitForExit();
-            }
-
-            if (cancel.IsCancellationRequested)
-                try { File.Delete(PreviewPathFor(exportPath)); } catch (IOException) { }
-        }
-        catch (Exception) { }
-    }
-
-    private static void Stop(Process ffmpeg)
-    {
-        try { if (!ffmpeg.HasExited) ffmpeg.Kill(entireProcessTree: true); }
-        catch (InvalidOperationException) { }
-        catch (System.ComponentModel.Win32Exception) { }
-    }
-
-    /// <summary>Everything already exported, newest first, for the Ingest Media list.</summary>
-    public static IReadOnlyList<CapturedClip> List(string storeRoot, string? ffprobePath,
-                                                   int frameRate = 25) =>
-        ListIn(FolderFor(storeRoot), ffprobePath, frameRate);
-
-    private static IReadOnlyList<CapturedClip> ListIn(string folder, string? ffprobePath, int frameRate)
-    {
-        var clips = new List<CapturedClip>();
-
-        try
-        {
-            if (!Directory.Exists(folder)) return clips;
-
-            foreach (string path in Directory.EnumerateFiles(folder))
-            {
-                if (!MediaScanner.IsPlayable(path)) continue;
-
-                // The preview copies belong to the exports beside them; listing them as well
-                // would double every row.
-                if (IsPreview(path)) continue;
-
-                var file = new FileInfo(path);
-
-                clips.Add(new CapturedClip(
-                    path, file.Name, file.LastWriteTime, file.Length,
-                    ffprobePath is null ? null : MediaProbe.Probe(ffprobePath, path, frameRate)));
-            }
-        }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
-
-        clips.Sort((a, b) => b.Recorded.CompareTo(a.Recorded));
-        return clips;
-    }
 }

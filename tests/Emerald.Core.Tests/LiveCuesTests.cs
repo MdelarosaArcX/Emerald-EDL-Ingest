@@ -17,6 +17,15 @@ public sealed class LiveCuesTests
     private static LiveCue Insert(string id, long at, long frames = 4500) =>
         new(id, IngestMode.Insert, "insert.mov", at, frames, frames);
 
+    [Theory]
+    [InlineData(3000, 600, 3625, true)]     // 120 s, a 24 s insert, 145 s of room: fits with the second to spare
+    [InlineData(3000, 601, 3625, false)]    // a frame more does not
+    [InlineData(3000, 2738, 3625, false)]   // the 1:49 insert of 21 November, on 32 GB
+    [InlineData(3000, 2738, 10500, true)]   // the same with 420 s of room
+    [InlineData(3610, 1, 3625, false)]      // no room left
+    public void An_insert_fits_only_inside_the_room_the_line_has(long delay, long frames, long room, bool fits) =>
+        Assert.Equal(fits, LiveCues.InsertFits(delay, frames, room, 25));
+
     private static LiveCue Overlay(string id, long at, long frames = 500) =>
         new(id, IngestMode.Overlay, "overlay.mov", at, frames, frames);
 

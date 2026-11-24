@@ -113,7 +113,7 @@
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBox x:Name="ApiUrlBox" Grid.Column="0" Text="http://10.0.0.31:8888/api/timecode"/>
+                            <TextBox x:Name="ApiUrlBox" Grid.Column="0"/>
                             <Button x:Name="ApplyApiButton" Grid.Column="1" Content="Apply"
                                     Style="{StaticResource GhostButton}" Margin="8,0,0,0"
                                     Click="ApplyApi_Click"/>

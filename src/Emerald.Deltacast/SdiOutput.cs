@@ -9,7 +9,18 @@ namespace Emerald.Deltacast;
 /// </summary>
 public sealed class SdiOutput : ISdiOutput
 {
-    private const uint BufferQueueDepth = 4;
+    /// <summary>Frames the card queues ahead of the wire, unless the caller asks for more.</summary>
+    public const uint DefaultQueueDepth = 4;
+
+    /// <summary>
+    /// The deeper queue for a delay transmitter: about a third of a second at 25 fps of frames
+    /// already on the card. Latency does not matter a delay behind the recorder, and the slack is
+    /// what lets a slow read of the ring, or a moment of a busy machine, go by without the card
+    /// running dry and repeating a frame on air.
+    /// </summary>
+    public const uint DelayQueueDepth = 8;
+
+    private readonly uint _queueDepth;
     private const uint IoTimeoutMs = 2000;
 
     private IntPtr _board = IntPtr.Zero;
@@ -23,20 +34,22 @@ public sealed class SdiOutput : ISdiOutput
     /// <summary>Frame size the card actually reports, which is what PushFrame writes.</summary>
     public int SlotBytes { get; private set; }
 
-    private SdiOutput(uint boardIndex, int txChannel, VideoFormat format)
+    private SdiOutput(uint boardIndex, int txChannel, VideoFormat format, uint queueDepth)
     {
         BoardIndex = boardIndex;
         TxChannel = txChannel;
         Format = format;
+        _queueDepth = Math.Clamp(queueDepth, 2u, 16u);
     }
 
     /// <summary>
     /// Opens and starts the TX channel. Throws <see cref="SdiOutputException"/> with the
     /// failing SDK call named, so the operator sees which step the board refused.
     /// </summary>
-    public static SdiOutput Open(uint boardIndex, int txChannel, VideoFormat format)
+    public static SdiOutput Open(uint boardIndex, int txChannel, VideoFormat format,
+                                 uint queueDepth = DefaultQueueDepth)
     {
-        var output = new SdiOutput(boardIndex, txChannel, format);
+        var output = new SdiOutput(boardIndex, txChannel, format, queueDepth);
 
         try
         {
@@ -71,7 +84,7 @@ public sealed class SdiOutput : ISdiOutput
         Check("VHD_CORE_SP_BUFFER_PACKING",
             VideoMasterHD.VHD_SetStreamProperty(_stream, VideoMasterHD.VHD_CORE_SP_BUFFER_PACKING, VideoMasterHD.VHD_BUFPACK_VIDEO_YUV422_8));
         Check("VHD_CORE_SP_BUFFERQUEUE_DEPTH",
-            VideoMasterHD.VHD_SetStreamProperty(_stream, VideoMasterHD.VHD_CORE_SP_BUFFERQUEUE_DEPTH, BufferQueueDepth));
+            VideoMasterHD.VHD_SetStreamProperty(_stream, VideoMasterHD.VHD_CORE_SP_BUFFERQUEUE_DEPTH, _queueDepth));
         Check("VHD_CORE_SP_IO_TIMEOUT",
             VideoMasterHD.VHD_SetStreamProperty(_stream, VideoMasterHD.VHD_CORE_SP_IO_TIMEOUT, IoTimeoutMs));
         Check("VHD_CORE_SP_TX_OUTPUT",

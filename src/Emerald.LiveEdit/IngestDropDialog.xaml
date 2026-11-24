@@ -74,9 +74,9 @@
             </RadioButton>
         </StackPanel>
 
-        <!-- Where on the timeline it starts. Filled in with where it was dropped, because a drop
-             with the pointer is rarely frame accurate and the operator usually has a timecode in
-             mind. The two range modes start at mark in, so for them it shows that and is locked. -->
+        <!-- Where on the timeline it starts. Filled in with mark in - a drop needs one - because a
+             drop with the pointer is rarely frame accurate. It can be changed to another timecode.
+             The two range modes start at mark in, so for them it shows that and is locked. -->
         <StackPanel Grid.Row="3" Margin="0,16,0,0">
             <TextBlock Text="PLACE AT" Foreground="{StaticResource Muted}" FontSize="10.5"
                        FontWeight="Bold"/>
@@ -85,10 +85,10 @@
                          FontFamily="Consolas" VerticalContentAlignment="Center"
                          TextChanged="Start_Changed"
                          ToolTip="Timeline timecode HH:MM:SS:FF, or a frame number. Frames are exact."/>
-                <Button x:Name="DropPointButton" Content="Drop point" Margin="8,0,0,0"
+                <Button x:Name="DropPointButton" Content="Mark in" Margin="8,0,0,0"
                         Style="{StaticResource GhostButton}" Height="28" Padding="10,0"
                         Click="DropPoint_Click"
-                        ToolTip="Put the timecode back to where the file was dropped"/>
+                        ToolTip="Put the timecode back to mark in"/>
                 <TextBlock x:Name="StartHint" Margin="10,0,0,0" VerticalAlignment="Center"
                            FontSize="11" Foreground="{StaticResource Muted}"/>
             </StackPanel>

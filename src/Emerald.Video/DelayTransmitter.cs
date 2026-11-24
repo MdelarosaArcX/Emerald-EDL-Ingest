@@ -173,6 +173,7 @@ public sealed class DelayTransmitter : IDisposable
         // Where the delay already is, when the line has been filling since before this was armed:
         // straight on air, the delay behind the recorder, rather than black while it fills again.
         long readSeq = Math.Max(0, _line.FramesWritten - target);
+        var hold = new OverflowWait();
         long segmentOnAir = 0;
         bool firstPictureSaid = false;
         var phase = DelayPhase.Opening;
@@ -189,14 +190,18 @@ public sealed class DelayTransmitter : IDisposable
                 _txChannels.Select(c => new SdiPort(_boardIndex, c)).ToArray());
 
             output = _txChannels.Length == 1
-                ? SdiOutput.Open(_boardIndex, _txChannels[0], _format)
-                : SdiOutputFan.Open(_boardIndex, _txChannels, _format);
+                ? SdiOutput.Open(_boardIndex, _txChannels[0], _format, SdiOutput.DelayQueueDepth)
+                : SdiOutputFan.Open(_boardIndex, _txChannels, _format, SdiOutput.DelayQueueDepth);
             byte[] black = output.BlackFrame();
 
             while (!ct.IsCancellationRequested)
             {
                 long written = _line.FramesWritten;
                 _hold.Move(readSeq);
+
+                // The next seconds of the ring brought back into memory in the background, so no
+                // read below waits on the disk and the card never runs dry. Returns at once.
+                _line.PrefetchAhead(readSeq);
 
                 PaceAction action = DelayPacer.Decide(
                     written, readSeq, target, _line.SlotCount,
@@ -260,11 +265,28 @@ public sealed class DelayTransmitter : IDisposable
                             $"The delay has played out. {Counters}.", written);
                         return;
 
+                    // As the live transmitter does: see OverflowWait.
+                    case DelayReadResult.NotReady when !hold.GiveUp(out bool push):
+                        if (!push) continue;
+                        Counters.Repeats++;
+                        if (!output.PushFrame(onAir?.Video ?? black)) return;
+                        continue;
+
+                    case DelayReadResult.NotReady or DelayReadResult.Missing:
+                        hold.Reset();
+                        Counters.Repeats++;
+                        if (!output.PushFrame(onAir?.Video ?? black)) return;
+                        readSeq++;
+                        Counters.FramesOut++;
+                        continue;
+
                     default:
                         // The policy and the line disagreed, which means the writer moved
                         // between the two. Ask again rather than guessing.
                         continue;
                 }
+
+                hold.Reset();
 
                 if (!PushWithAudio(output, into))
                 {
@@ -499,21 +521,25 @@ public sealed class DelayTransmitter : IDisposable
     // ------------------------------------------------------------------ reporting
 
     /// <summary>Reports only when the phase actually changes; this runs every frame.</summary>
+    private readonly HoldNotices _holdNotices = new();
+
     private void Announce(ref DelayPhase phase, DelayPhase now, string message, long buffered)
     {
         if (phase == now) return;
 
+        DelayPhase was = phase;
         phase = now;
-        Report(now, message, buffered);
+        string logged = _holdNotices.Filter(was, now, message);
+        Report(now, logged.Length > 0 ? logged : message, buffered, log: logged.Length > 0);
     }
 
-    private void Report(DelayPhase phase, string message, long buffered)
+    private void Report(DelayPhase phase, string message, long buffered, bool log = true)
     {
         // The empty-message call is the once-a-second nudge that keeps the countdown and the
         // frame count on screen moving. It carries nothing to say, and writing it down put
         // over a thousand blank lines an hour into the record — exactly what the comment at
         // the call site was trying to avoid. The screen still gets it; the record does not.
-        if (message.Length > 0)
+        if (log && message.Length > 0)
         {
             ActivityLog.Shared.Write(
                 LogSource.TidalLock,

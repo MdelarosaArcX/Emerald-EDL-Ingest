@@ -339,6 +339,15 @@ public sealed class IngestSchedulerService : IIngestSchedulerService
             return;
         }
 
+        // Pointed at the ingest media path: into the folder of the recording on air now, which a
+        // job scheduled earlier could not have known (see IngestLibrary.JobFolder).
+        string folder = Emerald.Media.IngestLibrary.JobFolder(job.Directory, Emerald.Media.IngestLibrary.RootFor(AppSettings.Load()));
+        if (!string.Equals(folder, job.Directory, StringComparison.OrdinalIgnoreCase))
+        {
+            _log.Write($"Ingest {Short(job)} records into {folder}.", IngestLogLevel.Info);
+            job.Directory = folder;
+        }
+
         IIngestRecorder recorder = _newRecorder();
         recorder.Message += (text, level) => _log.Write(text, level);
         recorder.Finished += result => _completions.Enqueue(result);

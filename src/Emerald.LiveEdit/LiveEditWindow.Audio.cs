@@ -572,9 +572,9 @@ public partial class LiveEditWindow
             }
             else if (to - from >= 3)
             {
-                // A master-quality export is gigabytes of DNxHD; its preview copy has the same
-                // sound in a few megabytes.
-                ReadWaveform(overlay.Path, RangeExport.PreviewFor(overlay.Path));
+                // A master-quality export is gigabytes of DNxHD; its low-res copy (or an older
+                // export's preview copy) has the same sound in a few megabytes.
+                ReadWaveform(overlay.Path, RangeExport.PlayablePathFor(overlay.Path));
             }
 
             if (to - from > 60)

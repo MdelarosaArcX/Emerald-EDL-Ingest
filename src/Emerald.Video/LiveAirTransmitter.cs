@@ -152,6 +152,7 @@ public sealed class LiveAirTransmitter : IDisposable
         // live: straight on air rather than black while it fills again.
         long readSeq = Math.Max(0, _line.FramesWritten - Interlocked.Read(ref _target));
         long lastRecording = -1;
+        var hold = new OverflowWait();
         var phase = DelayPhase.Opening;
 
         int samples = AudioSource.SampleRate / _format.FrameRate;
@@ -181,8 +182,8 @@ public sealed class LiveAirTransmitter : IDisposable
             }
 
             output = _txChannels.Length == 1
-                ? SdiOutput.Open(_boardIndex, _txChannels[0], _format)
-                : SdiOutputFan.Open(_boardIndex, _txChannels, _format);
+                ? SdiOutput.Open(_boardIndex, _txChannels[0], _format, SdiOutput.DelayQueueDepth)
+                : SdiOutputFan.Open(_boardIndex, _txChannels, _format, SdiOutput.DelayQueueDepth);
 
             byte[] black = output.BlackFrame();
 
@@ -191,6 +192,10 @@ public sealed class LiveAirTransmitter : IDisposable
                 long written = _line.FramesWritten;
                 long target = Interlocked.Read(ref _target);
                 _hold.Move(readSeq);
+
+                // The next seconds of the ring brought back into memory in the background, so no
+                // read below waits on the disk and the card never runs dry. Returns at once.
+                _line.PrefetchAhead(readSeq);
 
                 // The newest EDL, read every pass - while filling and holding as well as on air -
                 // because reading it is what tells Live Edit this transmitter has its version.
@@ -358,10 +363,27 @@ public sealed class LiveAirTransmitter : IDisposable
                         Announce(ref phase, DelayPhase.Finished, $"The delay has played out. {Counters}.", written);
                         return;
 
+                    // Compressed and not decoded yet. The card has a third of a second queued: waited for
+                    // inside that, then the picture on air is held, and after a second it is given up.
+                    case DelayReadResult.NotReady when !hold.GiveUp(out bool push):
+                        if (!push) continue;
+                        Counters.Repeats++;
+                        if (!output.PushFrame(onAir?.Video ?? black)) return;
+                        continue;
+
+                    case DelayReadResult.NotReady or DelayReadResult.Missing:
+                        hold.Reset();
+                        Counters.Repeats++;
+                        if (!output.PushFrame(onAir?.Video ?? black)) return;
+                        readSeq++;
+                        Counters.FramesOut++;
+                        continue;
+
                     default:
                         continue;
                 }
 
+                hold.Reset();
                 long recording = into.RecordingFrame;
 
                 Prepare(recording, lookahead, cues, done, prepared);
@@ -392,7 +414,21 @@ public sealed class LiveAirTransmitter : IDisposable
                     long late = cue.Mode == IngestMode.Insert ? 0 : recording - cue.RecordingFrame;
                     long frames = cue.Frames - late;
 
-                    if (frames > 0 && TakeMedia(cue, late, prepared) is { } media)
+                    // Live Edit refuses an insert that would push the delay past what the line has
+                    // room for, but one placed before going live was never asked. Not played: past
+                    // that room every frame for the rest of the transmission would go through the
+                    // disk, and the recording carrying on is the better picture.
+                    long delayNow = Interlocked.Read(ref _target);
+
+                    if (cue.Mode == IngestMode.Insert &&
+                        !LiveCues.InsertFits(delayNow, cue.Frames, _line.RoomFrames, _format.FrameRate))
+                    {
+                        Cue(cue, LogLevel.Error, "refused",
+                            $"EDL  {cue.Name} was not played: inserting {new Timecode(cue.Frames, _format.FrameRate)} would make the " +
+                            $"delay {new Timecode(delayNow + cue.Frames, _format.FrameRate)}, and the delay line has room for " +
+                            $"{new Timecode(_line.RoomFrames, _format.FrameRate)}. The recording carried on instead.");
+                    }
+                    else if (frames > 0 && TakeMedia(cue, late, prepared) is { } media)
                     {
                         media.Length = frames;
                         media.ConsumesRing = cue.Mode != IngestMode.Insert;
@@ -413,8 +449,7 @@ public sealed class LiveAirTransmitter : IDisposable
                         // out after the media; for the rest the media has taken its place.
                         continue;
                     }
-
-                    if (frames > 0)
+                    else if (frames > 0)
                         Cue(cue, LogLevel.Error, "failed",
                             $"EDL  {cue.Name} could not be played to air - the recording carried on instead.");
                 }
@@ -771,17 +806,21 @@ public sealed class LiveAirTransmitter : IDisposable
         ActivityLog.Shared.Write(LogSource.LiveEdit, level, message,
                                  @event: $"liveair.cue.{what}", correlation: cue.Id, file: cue.MediaPath);
 
+    private readonly HoldNotices _holdNotices = new();
+
     private void Announce(ref DelayPhase phase, DelayPhase now, string message, long buffered)
     {
         if (phase == now) return;
 
+        DelayPhase was = phase;
         phase = now;
-        Report(now, message, buffered);
+        string logged = _holdNotices.Filter(was, now, message);
+        Report(now, logged.Length > 0 ? logged : message, buffered, log: logged.Length > 0);
     }
 
-    private void Report(DelayPhase phase, string message, long buffered)
+    private void Report(DelayPhase phase, string message, long buffered, bool log = true)
     {
-        if (message.Length > 0)
+        if (log && message.Length > 0)
         {
             ActivityLog.Shared.Write(
                 LogSource.LiveEdit,

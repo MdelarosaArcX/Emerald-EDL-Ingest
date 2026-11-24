@@ -23,6 +23,12 @@ public enum DelayReadResult
 
     /// <summary>Sealed, and this frame is past the end.</summary>
     EndOfLine,
+
+    /// <summary>Compressed (see DelayOverflow) and not decoded yet: ask again shortly, and hold the picture meanwhile.</summary>
+    NotReady,
+
+    /// <summary>It left memory and was lost: there is nothing to wait for. Hold a picture in its place and go on.</summary>
+    Missing,
 }
 
 /// <summary>
@@ -67,10 +73,21 @@ public sealed class DelayFrameBuffer
 /// Holding them as they arrived means the bytes the receiver produced are the bytes the
 /// transmitter sends, and the delay is a number of frames rather than an emergent property.
 ///
-/// <b>Why a file.</b> A minute of 1080p at 25 is six gigabytes. That is not a thing to hold
-/// in the heap, but it is an unremarkable file, and a memory-mapped one lets the operating
-/// system decide how much stays resident - so a ten-second delay never really touches the
-/// disk while a five-minute one does not exhaust memory.
+/// <b>Why RAM.</b> The ring is 104 MB/s in and, on air, 104 MB/s out, for as long as it runs. On this
+/// plant's delay drive (a Crucial BX500) that held for about 38 GB, some six minutes, and from then
+/// on the drive stalled for around ten seconds in every 43 - 100% busy at 40 MB/s - whether the ring
+/// went through the Windows cache or past it (measured 2026-11-23). In RAM the same plant lost no
+/// frame and did not touch the disk. So the newest frames, enough for the delay and as much insert
+/// room as memory allows, are held in a ring in RAM, locked so Windows cannot page it out
+/// (see <see cref="Create(string, CaptureFormat, TimeSpan, TimeSpan, TimeSpan)"/>).
+///
+/// <b>Why a file as well.</b> A minute of 1080p at 25 is six gigabytes, and not every machine has the
+/// memory for its delay. When it does not, the ring is the file, and the log says so.
+///
+/// <b>Inserts.</b> An insert makes the delay longer for the rest of the transmission, not only while
+/// it plays. Past the end of RAM the frames it holds back are compressed (DelayOverflow), a seventh of the
+/// size, so the drive can take them; without that, an insert that would not fit is refused
+/// (<see cref="RoomFrames"/>).
 ///
 /// <b>Why it trims what it has written.</b> Left to decide, the operating system keeps all of it:
 /// a ready line nothing is reading sat at 41 GB of working set, for frames nobody may ever ask
@@ -89,16 +106,20 @@ public sealed class DelayLine : IDelayLine, IDisposable
     // ------------------------------------------------------------------ layout
 
     private const int FileHeaderBytes = 4096;
-    private const int SlotHeaderBytes = 64;
+    internal const int SlotHeaderBytes = 64;
     private const long Alignment = 4096;
 
     // Slot header offsets.
-    private const int OffSequence = 0;      // long, written last
-    private const int OffVideoBytes = 8;    // int
-    private const int OffAudioBytes = 12;   // int
-    private const int OffFlags = 16;        // int
-    private const int OffRecordingFrame = 24; // long
+    internal const int OffSequence = 0;      // long, written last
+    internal const int OffVideoBytes = 8;    // int
+    internal const int OffAudioBytes = 12;   // int
+    internal const int OffFlags = 16;        // int
+    internal const int OffRecordingFrame = 24; // long
     private const int FlagAudioReal = 1;
+
+    // Set on every slot a frame was written to. A slot of the file no frame was ever spilled to
+    // reads as zeros - sequence 0 - and without this would pass for frame 0.
+    private const int FlagWritten = 2;
 
     // What stays in the working set: seconds behind the writer. A reader within NearReaderSeconds
     // of the writer keeps its distance and a margin resident too, so it never walks into pages
@@ -120,8 +141,14 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
     // Disk given back at a time behind what is kept (ReleaseBehind), and how far clear of the
     // writer's next slots that stays: the writer must never be writing a slot as it is zeroed.
-    private const int ReleaseChunkFrames = 250;
+    // Small, because on an SSD each chunk is a TRIM and the drive may be busy with it for a while.
+    private const int ReleaseChunkFrames = 25;
     private const int WrapMarginSeconds = 5;
+
+    // Disk is given back only when the volume is short of it: less free than the ring's whole
+    // length and this much besides. Asked of the volume at most this often.
+    private const long ReleaseFreeMarginBytes = 20L * 1024 * 1024 * 1024;
+    private const long FreeCheckEveryMs = 10_000;
 
     // FSCTL_SET_SPARSE and FSCTL_SET_ZERO_DATA.
     private const uint SetSparseCode = 0x000900C4;
@@ -157,16 +184,31 @@ public sealed class DelayLine : IDelayLine, IDisposable
     public static long SlotCountFor(CaptureFormat format, TimeSpan delay)
     {
         long wanted = (long)Math.Ceiling(delay.TotalSeconds * format.FrameRate);
-        return wanted + Math.Max(2L * format.FrameRate, 50);
+        return wanted + GuardFramesFor(format.FrameRate);
     }
+
+    private static long GuardFramesFor(int frameRate) => Math.Max(2L * frameRate, 50);
+
+    /// <summary>Frames that may wait between the receiver and the ring's writer: three seconds' worth, at least eight.</summary>
+    public static int QueueDepthFor(int frameRate) => Math.Max(8, frameRate * QueueSeconds);
+
+    private const int QueueSeconds = 3;
 
     public static long SizeFor(CaptureFormat format, TimeSpan delay) =>
         FileHeaderBytes + SlotCountFor(format, delay) * SlotStrideFor(format);
 
     // ------------------------------------------------------------------ state
 
-    private readonly MemoryMappedFile _mmf;
-    private readonly MemoryMappedViewAccessor _view;
+    private readonly MemoryMappedFile? _mmf;
+    private readonly MemoryMappedViewAccessor? _view;
+
+    // Direct: the file is read and written past the Windows cache, and nothing is mapped (see IsDirect).
+    private readonly bool _direct;
+    private unsafe byte* _directWrite;
+    private unsafe byte* _directRead;
+    private readonly object _directReadLock = new();
+    private ReadAhead? _readAhead;
+    private readonly object _readAheadLock = new();
     private readonly FileStream _file;
     private readonly long _stride;
     private readonly int _audioCapacity;
@@ -201,6 +243,50 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private readonly IDisposable _heldGauge;
 
     public string Path { get; }
+
+    /// <summary>
+    /// The drive the ring is written to, as an operator would recognise it - "D: (Media, SSD)" -
+    /// so a line that cannot keep up says which disk it is waiting on.
+    /// </summary>
+    public string Disk => _disk ??= DescribeDisk(Path);
+
+    private string? _disk;
+
+    public static string DescribeDisk(string path)
+    {
+        string root;
+
+        try
+        {
+            root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(path)) ?? path;
+        }
+        catch
+        {
+            return path;
+        }
+
+        string name = root.TrimEnd('\\', '/');
+
+        try
+        {
+            var drive = new DriveInfo(root);
+            string label = drive.IsReady && drive.VolumeLabel.Length > 0 ? drive.VolumeLabel : "";
+            string kind = drive.DriveType switch
+            {
+                DriveType.Fixed => "local",
+                DriveType.Network => "network",
+                DriveType.Removable => "removable",
+                _ => drive.DriveType.ToString().ToLowerInvariant(),
+            };
+
+            return label.Length > 0 ? $"{name} ({label}, {kind})" : $"{name} ({kind})";
+        }
+        catch
+        {
+            return name;
+        }
+    }
+
     public int Width { get; }
     public int Height { get; }
     public int FrameRate { get; }
@@ -239,17 +325,205 @@ public sealed class DelayLine : IDelayLine, IDisposable
     public bool IsSparse => _sparse;
 
     /// <summary>
-    /// The oldest frame that can still be read: the ring's far end, or the last frame given back
-    /// to the disk, whichever is newer.
+    /// The delay is held on disk and read and written directly, past the Windows cache: one steady
+    /// stream each way, with a few seconds read ahead of the transmitter into memory of its own.
+    /// False for a line held in RAM, or one through the mapped file.
+    /// </summary>
+    public bool IsDirect => _direct;
+
+    /// <summary>
+    /// The oldest frame that can still be read: the ring's far end, the last frame given back
+    /// to the disk, or the last frame let go from memory without being spilled, whichever is newest.
     /// </summary>
     public long OldestHeld
     {
         get
         {
             long written = Volatile.Read(ref _written);
-            return Math.Max(Math.Max(0, written - SlotCount), Volatile.Read(ref _releasedThrough));
+
+            // Let go is decided a moment before a frame leaves memory; until it does, it reads.
+            long lost = Math.Min(Volatile.Read(ref _lostThrough), Math.Max(0, written - _ramSlots));
+
+            return Math.Max(Math.Max(Math.Max(0, written - SlotCount), Volatile.Read(ref _releasedThrough)), lost);
         }
     }
+
+    /// <summary>
+    /// Frames held in memory: the newest this many are written to and read from RAM, and the disk
+    /// sees a frame only if something still wants it once it leaves. 0 for a line on disk alone.
+    /// </summary>
+    public long MemorySlots => _ramSlots;
+
+    // How far short of the end of memory a transmitter must stay for nothing to be written out: a
+    // frame is decided SpillLeadSeconds before it leaves, and a hold keeps ReaderMarginSeconds
+    // behind itself. A second on top for a transmitter that repeats a frame or two.
+    private const int MemoryGuardSeconds = SpillLeadSeconds + ReaderMarginSeconds + 1;
+
+    /// <summary>
+    /// How far behind the recorder a transmitter on this line may be, in frames: the delay and every
+    /// insert it has grown by. Held in RAM, as far as memory reaches without a frame being written
+    /// out; on disk, the ring's length less its guard.
+    /// </summary>
+    public long RoomFrames =>
+        _ramSlots > 0 && _ramSlots < SlotCount && !OverflowReady
+            ? MemoryRoomFrames
+            : Math.Max(0, SlotCount - GuardFramesFor(FrameRate));
+
+    /// <summary>
+    /// How far behind the recorder a transmitter may be with every frame still raw and in memory - as far
+    /// as a transmission can start, and as much as an idle line keeps. Beyond it, up to
+    /// <see cref="RoomFrames"/>, frames are compressed (see DelayOverflow).
+    /// </summary>
+    public long MemoryRoomFrames =>
+        _ramSlots > 0 && _ramSlots < SlotCount
+            ? Math.Max(0, _ramSlots - (long)Math.Max(1, FrameRate) * MemoryGuardSeconds)
+            : Math.Max(0, SlotCount - GuardFramesFor(FrameRate));
+
+    private DelayOverflow? _overflow;
+    private Task<string?>? _overflowProbe;
+    private Thread? _overflowThread;
+
+    /// <summary>Frames pushed past the end of memory can be compressed: proved on this machine, and not since gone wrong.</summary>
+    public bool OverflowReady =>
+        _overflow is { Faulted: false } && _overflowProbe is { IsCompletedSuccessfully: true, Result: null };
+
+    /// <summary>Frames compressed so far; 0 until an insert pushes the delay past memory.</summary>
+    public long Compressed => _overflow?.Encoded ?? 0;
+
+    /// <summary>Frames that should have been compressed and were lost.</summary>
+    public long CompressedLost => _overflow?.Missing ?? 0;
+
+    /// <summary>Waits for the overflow to have been tried out. False when there is none, or it did not work, or took too long.</summary>
+    public bool WaitForOverflow(TimeSpan most)
+    {
+        try { _overflowProbe?.Wait(most); }
+        catch (AggregateException) { }
+
+        return OverflowReady;
+    }
+
+    /// <summary>
+    /// Lets a line held in RAM take inserts past the end of memory, compressed. Straight after it is opened,
+    /// before any frame. Nothing is started, and nothing taken, until one does.
+    /// </summary>
+    private void OpenOverflow(string ffmpeg)
+    {
+        if (_ramSlots <= 0 || _ramSlots >= SlotCount) return;
+
+        if (!DelayOverflow.Supports(Format))
+        {
+            NoOverflow($"{Format.Name} is not a picture it is made for");
+            return;
+        }
+
+        string folder = System.IO.Path.GetDirectoryName(Path) ?? ".";
+        long free = FreeBytes(folder);
+
+        if (free >= 0 && free < DelayOverflow.DiskFor(Format, SlotCount))
+        {
+            NoOverflow($"it needs {Describe(DelayOverflow.DiskFor(Format, SlotCount))} free on {Disk}, and {Describe(free)} is");
+            return;
+        }
+
+        try
+        {
+            string path = System.IO.Path.Combine(folder, System.IO.Path.GetFileNameWithoutExtension(Path) + "-over.ring");
+            _overflow = new DelayOverflow(this, path, ffmpeg, Format, SlotCount, _stride);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            NoOverflow(ex.Message);
+            return;
+        }
+
+        _overflowProbe = DelayOverflow.Probe(ffmpeg, Format);
+        _overflowProbe.ContinueWith(t =>
+        {
+            if (t.Result is { } why) NoOverflow(why);
+            else
+                ActivityLog.Shared.Info(LogSource.TidalLock,
+                    $"DELAY  inserts may grow the delay to {Describe(TimeSpan.FromSeconds(RoomFrames / (double)Math.Max(1, FrameRate)))}: past the " +
+                    $"{Describe(TimeSpan.FromSeconds(MemoryRoomFrames / (double)Math.Max(1, FrameRate)))} memory holds, it is compressed (DNxHD) to {Disk}.",
+                    @event: "delay.overflowready", file: Path);
+        }, TaskScheduler.Default);
+
+        _overflowThread = new Thread(OverflowLoop) { IsBackground = true, Name = "tidal overflow" };
+        _overflowThread.Start();
+    }
+
+    private void NoOverflow(string why) =>
+        ActivityLog.Shared.Warn(LogSource.TidalLock,
+            $"DELAY  inserts are limited to what memory holds: the delay cannot be compressed past it ({why}).",
+            @event: "delay.overflowoff", file: Path);
+
+    /// <summary>
+    /// Hands frames about to leave memory, and still wanted, to the overflow. On its own thread, which waits for
+    /// the encoder: the writer does not wait for this one (see <see cref="SpillThrough"/>).
+    /// </summary>
+    private unsafe void OverflowLoop()
+    {
+        byte* raw = (byte*)NativeMemory.AlignedAlloc((nuint)_stride, DirectAlignment);
+
+        try
+        {
+            while (!_stopFlushing.Wait(40))
+            {
+                while (!_stopFlushing.IsSet)
+                {
+                    long upTo = Volatile.Read(ref _written) - _ramSlots + (long)Math.Max(1, FrameRate) * SpillLeadSeconds;
+                    long seq;
+                    bool take, lose = false;
+
+                    lock (_spillLock)
+                    {
+                        seq = _spilledThrough;
+                        if (seq >= upTo) break;
+
+                        take = seq >= KeepFloor(Volatile.Read(ref _written));
+
+                        if (take && !OverflowReady)
+                        {
+                            take = false;
+                            lose = true;
+                        }
+                        else if (take)
+                        {
+                            byte* slot = RamSlotAt(seq);
+                            Buffer.MemoryCopy(slot, raw, _stride, _stride);
+                            take = *(long*)(raw + OffSequence) == seq;
+                            lose = !take;
+                        }
+                        else
+                        {
+                            Volatile.Write(ref _lostThrough, seq + 1);
+                        }
+
+                        Volatile.Write(ref _spilledThrough, seq + 1);
+                    }
+
+                    if (take) _overflow!.Submit(seq, raw);
+                    else if (lose) _overflow!.Lose(seq);
+                }
+
+                _overflow!.CloseIfIdle();
+            }
+        }
+        catch (Exception ex)
+        {
+            ActivityLog.Shared.Error(LogSource.TidalLock, $"DELAY  compressing the delay stopped: {ex.Message}",
+                                     @event: "delay.overflowfault", file: Path);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(raw);
+        }
+    }
+
+    /// <summary>True once the memory ring is locked in RAM, so Windows cannot page it out.</summary>
+    public bool MemoryLocked => Volatile.Read(ref _ramLocked) != 0;
+
+    /// <summary>Frames written to the disk because they left memory still wanted. 0 in normal running.</summary>
+    public long Spilled => Interlocked.Read(ref _spilled);
 
     /// <summary>
     /// How far behind the writer the line keeps frames on disk when no transmitter is holding
@@ -296,15 +570,17 @@ public sealed class DelayLine : IDelayLine, IDisposable
         }
     }
 
-    private unsafe DelayLine(string path, FileStream file, MemoryMappedFile mmf,
-                             MemoryMappedViewAccessor view, CaptureFormat format,
-                             long slotCount, long stride, long targetFrames, bool sparse)
+    private unsafe DelayLine(string path, FileStream file, MemoryMappedFile? mmf,
+                             MemoryMappedViewAccessor? view, CaptureFormat format,
+                             long slotCount, long stride, long targetFrames, bool sparse, long ramSlots,
+                             long ramRequired)
     {
         Path = path;
         _sparse = sparse;
         _file = file;
         _mmf = mmf;
         _view = view;
+        _direct = view is null;
         Format = format;
         Width = format.Width;
         Height = format.Height;
@@ -315,18 +591,33 @@ public sealed class DelayLine : IDelayLine, IDisposable
         _stride = stride;
         _audioCapacity = AudioCapacityFor(format.FrameRate);
 
-        _view.SafeMemoryMappedViewHandle.AcquirePointer(ref _base);
+        if (_direct)
+        {
+            // One slot's worth each, sector-aligned, for the writer and for reads not served by
+            // the read-ahead. Native rather than managed: the disk reads into it directly.
+            _directWrite = (byte*)NativeMemory.AlignedAlloc((nuint)stride, DirectAlignment);
+            _directRead = (byte*)NativeMemory.AlignedAlloc((nuint)stride, DirectAlignment);
+        }
+        else
+        {
+            _view!.SafeMemoryMappedViewHandle.AcquirePointer(ref _base);
+        }
 
-        // Mapped, not private: only the part not yet trimmed shows in the working set.
-        long mapped = FileHeaderBytes + slotCount * stride;
+        // Mapped, not private: only the part not yet trimmed shows in the working set. Direct, nothing is mapped.
+        long mapped = _direct ? 0 : FileHeaderBytes + slotCount * stride;
         _gauge = MemoryGauges.Register("Delay", $"ring mapped ({System.IO.Path.GetFileName(path)})", () => mapped);
 
         // A target rather than a measurement: a reader's cold frames come back in until they are trimmed again.
         _heldGauge = MemoryGauges.Register("Delay", $"ring held in memory, target ({System.IO.Path.GetFileName(path)})",
-            () => Math.Min(FramesWritten - TrimmedThrough, slotCount) * stride);
+            () => _direct ? (_readAhead?.Bytes ?? 0) : Math.Min(FramesWritten - TrimmedThrough, slotCount) * stride);
 
         _dirtyGauge = MemoryGauges.Register("Delay", $"ring not yet on disk ({System.IO.Path.GetFileName(path)})",
-            () => Math.Min(Math.Max(0, FramesWritten - FlushedThrough), slotCount) * stride);
+            () => _direct ? 0 : Math.Min(Math.Max(0, FramesWritten - FlushedThrough), slotCount) * stride);
+
+        OpenMemoryRing(Math.Min(ramSlots, slotCount), Math.Min(ramRequired, slotCount));
+
+        long ramBytes = _ramSlots * stride;
+        _ramGauge = MemoryGauges.Register("Delay", $"ring in RAM ({System.IO.Path.GetFileName(path)})", () => ramBytes);
 
         _flusher = new Thread(FlushLoop)
         {
@@ -337,9 +628,15 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
         _flusher.Start();
 
-        // Eight frames of slack between the receiver and the disk - the same depth the
-        // recorder allows its encoder, and for the same reason.
-        _queue = new System.Collections.Concurrent.BlockingCollection<CapturedFrame>(8);
+        // Three seconds of slack between the receiver and the disk. It was eight frames, the depth
+        // the recorder allows its encoder - but the encoder's queue protects the recording, which
+        // must never wait, while this one only protects the delay, and a third of a second was
+        // too little to ride out the disk being busy for a moment: every hiccup longer than that
+        // was frames turned away and missing on air. Three seconds rides out a short pause; it does
+        // not ride out a drive that stalls for ten, which is why the ring is in RAM when it can be.
+        // A frame waiting here is a buffer held from the capture pool, so three seconds cost about
+        // 300 MB at 1080p25 - only while the disk is behind, and given back as it catches up.
+        _queue = new System.Collections.Concurrent.BlockingCollection<CapturedFrame>(QueueDepthFor(format.FrameRate));
 
         _writer = new Thread(WriteLoop)
         {
@@ -399,23 +696,116 @@ public sealed class DelayLine : IDelayLine, IDisposable
         return true;
     }
 
+    /// <summary>A line through a memory-mapped file and the Windows cache - the engine RAM mode spills into.</summary>
     public static DelayLine Create(string folder, CaptureFormat format, TimeSpan delay) =>
-        Create(folder, format, delay, TimeSpan.Zero);
+        Open(folder, format, delay, TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero, direct: false);
+
+    /// <summary>The same, holding <paramref name="headroom"/> more than the delay for inserts.</summary>
+    public static DelayLine Create(string folder, CaptureFormat format, TimeSpan delay, TimeSpan headroom) =>
+        Open(folder, format, delay, headroom, TimeSpan.Zero, TimeSpan.Zero, direct: false);
+
+    /// <summary>What a line held in RAM still wants free on its drive. Nothing is expected to be written to it.</summary>
+    private const long SpillRoomBytes = 4L * 1024 * 1024 * 1024;
+
+    /// <summary>The same, needing the delay itself to fit in RAM for RAM to be used.</summary>
+    public static DelayLine Create(string folder, CaptureFormat format, TimeSpan delay, TimeSpan headroom,
+                                   TimeSpan memory) =>
+        Create(folder, format, delay, headroom, memory, required: delay);
 
     /// <summary>
-    /// A line that fills to <paramref name="delay"/> but holds <paramref name="headroom"/> more.
+    /// A line that fills to <paramref name="delay"/> but has room for <paramref name="headroom"/> more:
+    /// <b>in RAM</b>, up to <paramref name="memory"/> of it, when memory can hold at least
+    /// <paramref name="required"/> and the guard behind it; otherwise <b>on disk</b>, in the folder given,
+    /// with a warning. Decided once, as the line opens: a delay already on air is never moved.
     ///
     /// For a transmitter whose delay grows while it runs - Live Edit's, where an insert holds
     /// the recording back for as long as it plays. The ring cannot be enlarged once it exists,
     /// so the room has to be made up front; the target, and so the countdown, is still only the
-    /// delay asked for.
+    /// delay asked for. In RAM the room is what memory gave, which can be less than was asked for:
+    /// <see cref="RoomFrames"/>.
+    ///
+    /// <b>On disk</b> it is read and written directly, past the Windows cache, with a few seconds
+    /// read ahead of the transmitter into memory of its own (see <see cref="IsDirect"/>). That does
+    /// not make a slow drive fast: one that stalls for longer than those seconds still loses frames.
     /// </summary>
-    public static DelayLine Create(string folder, CaptureFormat format, TimeSpan delay, TimeSpan headroom)
+    /// <param name="required">
+    /// The least that must fit in RAM: the furthest back a transmitter could start. Not always
+    /// <paramref name="delay"/> - the ready line's is its whole length, inserts and all.
+    /// </param>
+    /// <param name="ffmpeg">To compress with, for inserts that grow the delay past memory. Null: they are refused.</param>
+    public static DelayLine Create(string folder, CaptureFormat format, TimeSpan delay, TimeSpan headroom,
+                                   TimeSpan memory, TimeSpan required, string? ffmpeg = null)
+    {
+        if (memory > TimeSpan.Zero)
+        {
+            DelayLine held = Open(folder, format, delay, headroom, memory, required, direct: false);
+
+            if (held.MemorySlots > 0)
+            {
+                if (ffmpeg is not null) held.OpenOverflow(ffmpeg);
+                return held;
+            }
+
+            // Not enough memory, or another line has it - said by OpenMemoryRing. Nothing has been
+            // written to it yet.
+            held.Dispose();
+        }
+
+        DelayLine line = Open(folder, format, delay, headroom, TimeSpan.Zero, TimeSpan.Zero, direct: true);
+
+        if (memory > TimeSpan.Zero)
+            ActivityLog.Shared.Warn(LogSource.TidalLock,
+                $"DELAY  the delay is held on disk {line.Disk}, not in RAM, so every frame is written to it and read " +
+                "back. If that drive cannot keep up, frames will be missing on air. Free some memory, or choose a " +
+                "shorter delay, and start the recording again.",
+                @event: "delay.ondisk", file: line.Path);
+
+        return line;
+    }
+
+    /// <summary>Free bytes on the folder's drive, or -1 when it cannot be read.</summary>
+    private static long FreeBytes(string folder)
+    {
+        try
+        {
+            Directory.CreateDirectory(folder);
+            string? root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(folder));
+            return root is { Length: > 0 } ? new DriveInfo(root).AvailableFreeSpace : -1;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return -1;
+        }
+    }
+
+    // FILE_FLAG_NO_BUFFERING: reads and writes go to the disk, not through the system cache. They
+    // must then be whole sectors at sector-aligned offsets from sector-aligned memory - which a
+    // slot, page-aligned and a whole number of pages long, already is.
+    private const FileOptions NoBuffering = (FileOptions)0x20000000;
+    private const int DirectAlignment = 4096;
+
+    private static DelayLine Open(string folder, CaptureFormat format, TimeSpan delay, TimeSpan headroom,
+                                  TimeSpan memory, TimeSpan required, bool direct)
     {
         TimeSpan holds = delay + (headroom > TimeSpan.Zero ? headroom : TimeSpan.Zero);
+        long size;
 
-        if (!Validate(folder, format, holds, out long size, out string? problem))
+        if (memory > TimeSpan.Zero)
+        {
+            // Held in RAM, the file takes only frames pushed out of memory - none, while transmitters
+            // keep to RoomFrames - so it need not fit the whole ring.
+            size = SizeFor(format, holds);
+            long free = FreeBytes(folder);
+
+            if (free >= 0 && free < SpillRoomBytes)
+                throw new DelayLineException(
+                    $"The delay line needs at least {Describe(SpillRoomBytes)} free on {DescribeDisk(folder)}, " +
+                    $"even held in RAM, and only {Describe(free)} is free.");
+        }
+        else if (!Validate(folder, format, holds, out size, out string? problem))
+        {
             throw new DelayLineException(problem!);
+        }
 
         long stride = SlotStrideFor(format);
         long slots = SlotCountFor(format, holds);
@@ -430,11 +820,26 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
         try
         {
+            if (direct)
+            {
+                file = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read,
+                                      0, FileOptions.WriteThrough | NoBuffering);
+
+                // Sparse, as below: the ring takes disk for the frames it holds.
+                bool directSparse = SetSparse(file);
+                file.SetLength(size);
+
+                var direct_ = new DelayLine(path, file, null, null, format, slots, stride, target, directSparse, 0, 0);
+                direct_.WriteFileHeader();
+                return direct_;
+            }
+
             file = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read,
                                   4096, FileOptions.RandomAccess);
             // Sparse, so the ring takes disk for the frames it holds and not for its whole length:
             // a ready line is sized for the longest delay plus every insert, 41 GB at 420 s, and
             // mostly holds the delay alone. Validate has already checked the whole length fits.
+            // It gives that disk back only when the volume runs short (see ReleaseBehind).
             bool sparse = SetSparse(file);
             file.SetLength(size);
 
@@ -451,7 +856,15 @@ public sealed class DelayLine : IDelayLine, IDisposable
                                                   HandleInheritability.None, leaveOpen: true);
             view = mmf.CreateViewAccessor(0, size, MemoryMappedFileAccess.ReadWrite);
 
-            var line = new DelayLine(path, file, mmf, view, format, slots, stride, target, sparse);
+            long ramSlots = memory > TimeSpan.Zero ? (long)Math.Ceiling(memory.TotalSeconds * format.FrameRate) : 0;
+
+            // The guard as well as what is required: without it a transmitter exactly that far back
+            // would have its frames written out.
+            long ramRequired = memory > TimeSpan.Zero
+                ? (long)Math.Ceiling(required.TotalSeconds * format.FrameRate) + (long)format.FrameRate * MemoryGuardSeconds
+                : 0;
+
+            var line = new DelayLine(path, file, mmf, view, format, slots, stride, target, sparse, ramSlots, ramRequired);
             line.WriteFileHeader();
             return line;
         }
@@ -469,19 +882,34 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// <summary>Enough to identify an orphan on disk, and to know whose it was.</summary>
     private unsafe void WriteFileHeader()
     {
-        ReadOnlySpan<byte> magic = "EMLDLY01"u8;
-        for (int i = 0; i < magic.Length; i++) _base[i] = magic[i];
+        byte* header = _direct
+            ? (byte*)NativeMemory.AlignedAlloc(FileHeaderBytes, DirectAlignment)
+            : _base;
 
-        *(int*)(_base + 8) = 1;
-        *(int*)(_base + 12) = Width;
-        *(int*)(_base + 16) = Height;
-        *(int*)(_base + 20) = FrameRate;
-        *(int*)(_base + 24) = FrameBytes;
-        *(int*)(_base + 28) = _audioCapacity;
-        *(long*)(_base + 32) = _stride;
-        *(long*)(_base + 40) = SlotCount;
-        *(long*)(_base + 48) = DateTime.UtcNow.Ticks;
-        *(int*)(_base + 56) = Environment.ProcessId;
+        try
+        {
+            if (_direct) new Span<byte>(header, FileHeaderBytes).Clear();
+
+            ReadOnlySpan<byte> magic = "EMLDLY01"u8;
+            for (int i = 0; i < magic.Length; i++) header[i] = magic[i];
+
+            *(int*)(header + 8) = 1;
+            *(int*)(header + 12) = Width;
+            *(int*)(header + 16) = Height;
+            *(int*)(header + 20) = FrameRate;
+            *(int*)(header + 24) = FrameBytes;
+            *(int*)(header + 28) = _audioCapacity;
+            *(long*)(header + 32) = _stride;
+            *(long*)(header + 40) = SlotCount;
+            *(long*)(header + 48) = DateTime.UtcNow.Ticks;
+            *(int*)(header + 56) = Environment.ProcessId;
+
+            if (_direct) RandomAccess.Write(_file.SafeFileHandle, new ReadOnlySpan<byte>(header, FileHeaderBytes), 0);
+        }
+        finally
+        {
+            if (_direct) NativeMemory.AlignedFree(header);
+        }
     }
 
     /// <summary>
@@ -544,28 +972,46 @@ public sealed class DelayLine : IDelayLine, IDisposable
         try
         {
             long seq = _written;
-            byte* slot = SlotAt(seq);
+
+            if (_direct)
+            {
+                WriteDirect(seq, video, videoBytes, audio, audioBytes, audioReal, recordingFrame);
+                return;
+            }
+
+            // Held in RAM: the frame this slot last held leaves memory now, so it is written to the
+            // file first if anything still wants it. Normally the flusher has done that already.
+            if (_ram is not null)
+            {
+                long leaving = seq - _ramSlots;
+                if (leaving >= Volatile.Read(ref _spilledThrough)) SpillThrough(leaving + 1);
+            }
+
+            byte* slot = _ram is not null ? RamSlotAt(seq) : SlotAt(seq);
 
             // Mark the slot in flight before touching its payload, so a reader arriving
             // mid-write sees a sequence matching nothing rather than half a frame.
             Volatile.Write(ref *(long*)(slot + OffSequence), -1L);
 
             int keptVideo = Math.Min(videoBytes, FrameBytes);
-            fixed (byte* src = video)
-                Buffer.MemoryCopy(src, slot + SlotHeaderBytes, FrameBytes, keptVideo);
+            int keptAudio = audio is not null && audioBytes > 0 ? Math.Min(audioBytes, _audioCapacity) : 0;
+            long frameOfRecording = recordingFrame >= 0 ? recordingFrame : seq;
 
-            int keptAudio = 0;
-            if (audio is not null && audioBytes > 0)
+            if (_ram is not null || !WriteSlotThroughFile(seq, video, keptVideo, audio, keptAudio, audioReal, frameOfRecording))
             {
-                keptAudio = Math.Min(audioBytes, _audioCapacity);
-                fixed (byte* src = audio)
-                    Buffer.MemoryCopy(src, slot + SlotHeaderBytes + FrameBytes, _audioCapacity, keptAudio);
-            }
+                // The file write was refused: straight into the mapping, as it always was.
+                fixed (byte* src = video)
+                    Buffer.MemoryCopy(src, slot + SlotHeaderBytes, FrameBytes, keptVideo);
 
-            *(int*)(slot + OffVideoBytes) = keptVideo;
-            *(int*)(slot + OffAudioBytes) = keptAudio;
-            *(int*)(slot + OffFlags) = audioReal ? FlagAudioReal : 0;
-            *(long*)(slot + OffRecordingFrame) = recordingFrame >= 0 ? recordingFrame : seq;
+                if (keptAudio > 0)
+                    fixed (byte* src = audio)
+                        Buffer.MemoryCopy(src, slot + SlotHeaderBytes + FrameBytes, _audioCapacity, keptAudio);
+
+                *(int*)(slot + OffVideoBytes) = keptVideo;
+                *(int*)(slot + OffAudioBytes) = keptAudio;
+                *(int*)(slot + OffFlags) = (audioReal ? FlagAudioReal : 0) | FlagWritten;
+                *(long*)(slot + OffRecordingFrame) = frameOfRecording;
+            }
 
             // Last, with a release: everything above must be visible before the sequence is.
             Volatile.Write(ref *(long*)(slot + OffSequence), seq);
@@ -583,9 +1029,114 @@ public sealed class DelayLine : IDelayLine, IDisposable
     }
 
     /// <summary>
+    /// Direct: the whole slot built in the writer's sector-aligned buffer and written to the disk in
+    /// one call, which returns once it is there (write-through). Only then is the frame counted as
+    /// written, so a reader never reaches a frame that is not yet whole on disk. No in-flight mark:
+    /// a reader tells a slot written over while it read from the count of frames written (see
+    /// <see cref="ReadDirect"/>), which a direct write cannot race with a mark in the file.
+    /// </summary>
+    private unsafe void WriteDirect(long seq, byte[] video, int videoBytes, byte[]? audio, int audioBytes,
+                                    bool audioReal, long recordingFrame)
+    {
+        byte* s = _directWrite;
+
+        int keptVideo = Math.Min(videoBytes, FrameBytes);
+        int keptAudio = audio is not null && audioBytes > 0 ? Math.Min(audioBytes, _audioCapacity) : 0;
+
+        *(long*)(s + OffSequence) = seq;
+        *(int*)(s + OffVideoBytes) = keptVideo;
+        *(int*)(s + OffAudioBytes) = keptAudio;
+        *(int*)(s + OffFlags) = (audioReal ? FlagAudioReal : 0) | FlagWritten;
+        *(long*)(s + OffRecordingFrame) = recordingFrame >= 0 ? recordingFrame : seq;
+
+        fixed (byte* src = video)
+            Buffer.MemoryCopy(src, s + SlotHeaderBytes, FrameBytes, keptVideo);
+
+        if (keptAudio > 0)
+            fixed (byte* src = audio)
+                Buffer.MemoryCopy(src, s + SlotHeaderBytes + FrameBytes, _audioCapacity, keptAudio);
+
+        RandomAccess.Write(_file.SafeFileHandle, new ReadOnlySpan<byte>(s, (int)_stride),
+                           FileHeaderBytes + seq % SlotCount * _stride);
+
+        Volatile.Write(ref _lastWriteTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+        Volatile.Write(ref _written, seq + 1);
+
+        // On disk the moment the write returned.
+        Volatile.Write(ref _flushedThrough, seq + 1);
+    }
+
+    /// <summary>The whole slot, built here and written to the file in one call. The writer's thread only.</summary>
+    private byte[]? _staging;
+
+    private int _fileWritesBroken;
+
+    /// <summary>
+    /// Writes a slot's header, picture and sound to the ring file in one call, rather than copying
+    /// them into the mapped view. False if the file would not take it, and the caller copies into
+    /// the mapping as before.
+    ///
+    /// <b>Why.</b> This is what "the disk could not keep up" mostly was. Copying a frame into the
+    /// mapping writes over a slot last used a whole ring ago, whose pages have long since been
+    /// taken out of memory (see <see cref="TrimBehind"/>). A write into a page that is not in memory
+    /// is a page fault, and Windows answers it by <i>reading the old page back from the disk</i>
+    /// before letting it be written over - a thousand reads of four kilobytes for every frame,
+    /// one after another, on the writer's thread, for data that is about to be thrown away. That
+    /// doubled the disk traffic of the ring and made the writer wait on the disk for every page;
+    /// once the eight frames of slack between the receiver and the writer were used up, frames
+    /// were turned away.
+    ///
+    /// A file write that covers whole pages needs nothing read: the system cache knows every byte
+    /// is about to be replaced. The slot is page-aligned and a whole number of pages long, so the
+    /// write covers exactly whole pages. The cache and the mapping are the same pages of the same
+    /// file, so a reader of the mapping sees the frame as soon as the write returns; the sequence is
+    /// still marked -1 before and set after, through the mapping, so the torn-read rule is unchanged.
+    /// </summary>
+    private unsafe bool WriteSlotThroughFile(long seq, byte[] video, int videoBytes, byte[]? audio, int audioBytes,
+                                             bool audioReal, long recordingFrame)
+    {
+        if (Volatile.Read(ref _fileWritesBroken) != 0) return false;
+
+        byte[] staging = _staging ??= GC.AllocateUninitializedArray<byte>((int)_stride);
+
+        fixed (byte* s = staging)
+        {
+            *(long*)(s + OffSequence) = -1L;
+            *(int*)(s + OffVideoBytes) = videoBytes;
+            *(int*)(s + OffAudioBytes) = audioBytes;
+            *(int*)(s + OffFlags) = (audioReal ? FlagAudioReal : 0) | FlagWritten;
+            *(long*)(s + OffRecordingFrame) = recordingFrame;
+        }
+
+        Buffer.BlockCopy(video, 0, staging, SlotHeaderBytes, videoBytes);
+
+        // Past the picture and the sound the slot holds whatever an earlier frame left there, as it
+        // always did: readers go by the lengths in the header, never by the slot's size.
+        if (audioBytes > 0) Buffer.BlockCopy(audio!, 0, staging, SlotHeaderBytes + FrameBytes, audioBytes);
+
+        try
+        {
+            long offset = FileHeaderBytes + seq % SlotCount * _stride;
+            RandomAccess.Write(_file.SafeFileHandle, staging, offset);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref _fileWritesBroken, 1);
+
+            ActivityLog.Shared.Warn(LogSource.TidalLock,
+                $"The delay ring at {Path} could not be written as a file ({ex.Message}); writing it through " +
+                "memory instead, which is slower once the ring has wrapped.",
+                @event: "delay.filewritefailed", file: Path);
+
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Gives back the pages of frames nothing is about to read. On the writer's thread, once a
     /// second of frames: a frame took about half a millisecond to trim when measured, so a second's
-    /// worth at 25 fits well inside the writer's eight frames of slack.
+    /// worth at 25 fits well inside the writer's slack.
     ///
     /// The mark follows the target down as well as up. A reader armed far behind faults frames
     /// back in that were already trimmed, and moving the mark back with it is what lets those
@@ -664,7 +1215,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// counts as available and gives up the moment anything else wants it.
     ///
     /// On its own thread, below normal priority: a flush waits for the disk, and the writer has
-    /// only eight frames of slack. Half a second behind the writer, so the slot being written
+    /// only a few seconds of slack. Half a second behind the writer, so the slot being written
     /// is never the one being flushed, and a second at a time so a dispose is never kept waiting.
     /// </summary>
     private unsafe void FlushLoop()
@@ -675,6 +1226,15 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
         while (!_stopFlushing.Wait(FlushEveryMs))
         {
+            // Direct writes are on disk when they return: nothing to flush, only disk to give back.
+            if (_direct)
+            {
+                ReleaseBehind();
+                continue;
+            }
+
+            if (_ramSlots > 0 && _overflow is null) SpillAhead();
+
             while (!_stopFlushing.IsSet && Volatile.Read(ref _disposed) == 0)
             {
                 long written = Volatile.Read(ref _written);
@@ -688,9 +1248,13 @@ public sealed class DelayLine : IDelayLine, IDisposable
                 long first = from % SlotCount;
                 long toEnd = Math.Min(count, SlotCount - first);
 
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
+
                 bool ok = FlushViewOfFile(_base + FileHeaderBytes + first * _stride, (nuint)(toEnd * _stride));
                 if (count > toEnd)
                     ok &= FlushViewOfFile(_base + FileHeaderBytes, (nuint)((count - toEnd) * _stride));
+
+                NoteSlowest(ref _slowestFlush, started);
 
                 // Not fatal: Windows writes the pages itself in the end. Worth a line once,
                 // because until it does they stay in memory.
@@ -711,10 +1275,15 @@ public sealed class DelayLine : IDelayLine, IDisposable
     }
 
     /// <summary>
-    /// The oldest frame anything may still want: the kept distance behind the writer, less a
-    /// margin, and never past a transmitter's hold or a frame not yet on disk.
+    /// The oldest frame anything may still want, never past a frame not yet on disk. See <see cref="KeepFloor"/>.
     /// </summary>
-    private long ReleaseFloor(long written)
+    private long ReleaseFloor(long written) => Math.Min(KeepFloor(written), Volatile.Read(ref _flushedThrough));
+
+    /// <summary>
+    /// The oldest frame anything may still want: the kept distance behind the writer, less a
+    /// margin, and never past a transmitter's hold.
+    /// </summary>
+    private long KeepFloor(long written)
     {
         long margin = (long)Math.Max(1, FrameRate) * ReaderMarginSeconds;
         long keep = TargetFrames;
@@ -734,12 +1303,18 @@ public sealed class DelayLine : IDelayLine, IDisposable
             foreach (DelayHold hold in _holds)
                 floor = Math.Min(floor, hold.At - margin);
 
-        return Math.Min(floor, Volatile.Read(ref _flushedThrough));
+        return floor;
     }
 
     /// <summary>
     /// Gives the disk space of frames nothing will read again back to the volume, so the ring
     /// file takes what it holds and not its whole length. On the flusher's thread, after a flush.
+    ///
+    /// <b>Only when the volume is short of room.</b> Giving space back is not free: each chunk is a
+    /// TRIM on an SSD, and the writer then lands new frames in holes the file system has to fill
+    /// again. A ready line did that nonstop for no gain on a drive with hundreds of gigabytes free.
+    /// With it off, frames lost on this plant fell from 17,323 in 22 minutes to 682 in 46 - but did
+    /// not stop, and the queue was made longer in the same change, so how much was this is not known.
     ///
     /// The mark moves before the zeroing, so a reader is turned away from a frame before it can
     /// be cleared under it. Never within a few seconds of the writer's next slots: zeroing a
@@ -748,6 +1323,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
     private void ReleaseBehind()
     {
         if (!_sparse || Volatile.Read(ref _releaseBroken) != 0) return;
+        if (!AlwaysRelease && VolumeHasRoom()) return;
 
         long wrapMargin = (long)Math.Max(1, FrameRate) * WrapMarginSeconds;
 
@@ -764,8 +1340,12 @@ public sealed class DelayLine : IDelayLine, IDisposable
             long first = from % SlotCount;
             long toEnd = Math.Min(count, SlotCount - first);
 
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+
             bool ok = ZeroSlots(first, toEnd);
             if (count > toEnd) ok &= ZeroSlots(0, count - toEnd);
+
+            NoteSlowest(ref _slowestRelease, started);
 
             if (!ok)
             {
@@ -782,6 +1362,49 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
     private int _releaseBroken;
 
+    /// <summary>
+    /// Gives disk back whatever the volume has free, as the line always used to. For tests,
+    /// whose rings are far too small for the volume ever to be short of room.
+    /// </summary>
+    internal bool AlwaysRelease
+    {
+        get => Volatile.Read(ref _alwaysRelease);
+        set => Volatile.Write(ref _alwaysRelease, value);
+    }
+
+    private bool _alwaysRelease;
+    private long _freeCheckedAt;
+    private bool _freeChecked;
+    private bool _volumeHasRoom;
+
+    /// <summary>
+    /// True while the ring's volume could take the ring's whole length and the margin besides,
+    /// so nothing need be given back. The flusher's thread only; asked of the volume every ten
+    /// seconds at most. When the volume cannot be asked, false: give back, as before.
+    /// </summary>
+    private bool VolumeHasRoom()
+    {
+        long now = Environment.TickCount64;
+        if (_freeChecked && now - _freeCheckedAt < FreeCheckEveryMs) return _volumeHasRoom;
+        _freeChecked = true;
+        _freeCheckedAt = now;
+
+        try
+        {
+            string? root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(Path));
+            long free = root is { Length: > 0 } ? new DriveInfo(root).AvailableFreeSpace : 0;
+            long length = FileHeaderBytes + SlotCount * _stride;
+
+            _volumeHasRoom = free >= length + ReleaseFreeMarginBytes;
+        }
+        catch
+        {
+            _volumeHasRoom = false;
+        }
+
+        return _volumeHasRoom;
+    }
+
     private unsafe bool ZeroSlots(long firstSlot, long count)
     {
         long* range = stackalloc long[2];
@@ -791,7 +1414,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
         return DeviceIoControl(_file.SafeFileHandle, SetZeroDataCode, range, 16, null, 0, out _, IntPtr.Zero);
     }
 
-    private static unsafe bool SetSparse(FileStream file)
+    internal static unsafe bool SetSparse(FileStream file)
     {
         try
         {
@@ -836,6 +1459,9 @@ public sealed class DelayLine : IDelayLine, IDisposable
             if (_queue.TryAdd(frame))
             {
                 Interlocked.Increment(ref _accepted);
+
+                int waiting = _queue.Count;
+                if (waiting > Volatile.Read(ref _queueHigh)) Volatile.Write(ref _queueHigh, waiting);
                 return;
             }
         }
@@ -856,13 +1482,42 @@ public sealed class DelayLine : IDelayLine, IDisposable
         if (now - Volatile.Read(ref _dropSaidAt) > 5000)
         {
             Volatile.Write(ref _dropSaidAt, now);
+
+            // What was slowest since the last of these lines, so the line says which wait it
+            // was rather than only that the disk was behind. Read and reset together.
+            long write = TakeSlowestMs(ref _slowestWrite);
+            long flush = TakeSlowestMs(ref _slowestFlush);
+            long release = TakeSlowestMs(ref _slowestRelease);
+            int queued = Interlocked.Exchange(ref _queueHigh, 0);
+            int depth = _queue.BoundedCapacity;
+
             ActivityLog.Shared.Warn(LogSource.TidalLock,
-                $"DROP  frame {frame.Sequence} not taken into the delay ring - the disk could not " +
-                $"keep up ({dropped} dropped so far). It will not reach air.",
+                $"DROP  frame {frame.Sequence} not taken into the delay ring - disk {Disk} could not " +
+                $"keep up ({dropped} dropped so far). It will not reach air. Slowest since last: " +
+                $"write {write} ms, flush {flush} ms, give-back {release} ms; queue {queued}/{depth}.",
                 @event: "delay.dropped",
-                detail: $"frame {frame.Sequence}\ndropped total {dropped}");
+                file: Path,
+                detail: $"frame {frame.Sequence}\ndropped total {dropped}\ndisk {Disk}\nring {Path}\n" +
+                        $"slowest write {write} ms\nslowest flush {flush} ms\nslowest give-back {release} ms\n" +
+                        $"queue high {queued}/{depth}\nsparse {_sparse}");
         }
     }
+
+    // Slowest of each since the last drop line, in stopwatch ticks, and the deepest the queue got.
+    private long _slowestWrite;
+    private long _slowestFlush;
+    private long _slowestRelease;
+    private int _queueHigh;
+
+    /// <summary>Keeps the longest time since <paramref name="started"/>. Each figure has one thread writing it.</summary>
+    private static void NoteSlowest(ref long slowest, long started)
+    {
+        long took = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+        if (took > Volatile.Read(ref slowest)) Volatile.Write(ref slowest, took);
+    }
+
+    private static long TakeSlowestMs(ref long slowest) =>
+        Interlocked.Exchange(ref slowest, 0) * 1000 / System.Diagnostics.Stopwatch.Frequency;
 
     private void WriteLoop()
     {
@@ -871,6 +1526,8 @@ public sealed class DelayLine : IDelayLine, IDisposable
             foreach (CapturedFrame frame in _queue!.GetConsumingEnumerable())
             {
                 // Copied into the ring, and the buffer is then free for a later frame.
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
+
                 try
                 {
                     Write(frame.Video, frame.VideoBytes, frame.Audio, frame.AudioBytes, frame.AudioReal,
@@ -879,6 +1536,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
                 finally
                 {
                     frame.Release();
+                    NoteSlowest(ref _slowestWrite, started);
                 }
             }
         }
@@ -906,6 +1564,358 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// <summary>A frame the capture loop offered that the ring could not take.</summary>
     public void CountDrop() => Interlocked.Increment(ref _dropped);
 
+    // ------------------------------------------------------------------ memory ring
+
+    // Physical memory left alone when the ring in RAM is sized: Windows, the recorder's encoders,
+    // Live Edit's players, inserts and exports, and everything else on the machine live in this.
+    // At 4 GB a second ring could leave the machine paging the moment an export started.
+    private const long MemoryReserveBytes = 6L * 1024 * 1024 * 1024;
+
+    /// <summary>The reserve in force. Tests lower it, so they do not depend on the machine's free memory.</summary>
+    internal static long MemoryReserve { get; set; } = MemoryReserveBytes;
+
+    // The line holding the process's one ring in RAM, if any. One, because a second ring of the
+    // same recording doubles the memory for nothing - and could only ever get the scraps the
+    // first left, a fraction of its delay, so the disk would be on air again anyway. Under
+    // WorkingSetGate.
+    private static DelayLine? _memoryHolder;
+
+    /// <summary>
+    /// Raised once the line is closed and its RAM given back - after its last holder let go, which
+    /// for a sealed line is when the transmitter has played out what was in it. From whichever
+    /// thread let go last.
+    /// </summary>
+    public event Action<DelayLine>? Closed;
+
+    /// <summary>True while some line in this process holds its delay in RAM.</summary>
+    public static bool MemoryRingHeld
+    {
+        get { lock (WorkingSetGate) return _memoryHolder is not null; }
+    }
+
+    // How far ahead of a frame leaving memory the flusher writes it out, if it is still wanted,
+    // so the writer itself almost never has to.
+    private const int SpillLeadSeconds = 4;
+
+    private unsafe byte* _ram;
+    private long _ramSlots;
+    private int _ramLocked;
+    private Task? _ramLocking;
+    private long _ramWorkingSetAdded;
+    private readonly IDisposable _ramGauge;
+
+    // Frames before _spilledThrough have been decided: written to the file if still wanted, or
+    // let go. Frames before _lostThrough were let go, and once out of memory cannot be read.
+    private long _spilledThrough;
+    private long _lostThrough;
+    private long _spilled;
+    private readonly object _spillLock = new();
+    private byte[]? _spillStaging;
+    private int _spillSaid;
+
+    private static readonly object WorkingSetGate = new();
+
+    private unsafe byte* RamSlotAt(long sequence) => _ram + sequence % _ramSlots * _stride;
+
+    /// <summary>
+    /// Takes the ring in RAM: as many of <paramref name="slots"/> as physical memory can spare
+    /// beyond a reserve, or none, and the line runs from disk as it always did. Then locks it in
+    /// the background, so a line opened on the interface's thread does not wait for 13 GB to be
+    /// made resident.
+    /// </summary>
+    private unsafe void OpenMemoryRing(long slots, long required)
+    {
+        if (slots <= 0) return;
+
+        // Claimed before anything is allocated, so two lines opening at once cannot both take it.
+        string? holder = null;
+
+        lock (WorkingSetGate)
+        {
+            if (_memoryHolder is null) _memoryHolder = this;
+            else holder = _memoryHolder.Path;
+        }
+
+        if (holder is not null)
+        {
+            ActivityLog.Shared.Warn(LogSource.TidalLock,
+                $"DELAY  another delay line already holds the RAM ({System.IO.Path.GetFileName(holder)}), so this one cannot.",
+                @event: "delay.memoryshort", file: Path);
+            return;
+        }
+
+        try
+        {
+            AllocateMemoryRing(slots, required);
+        }
+        finally
+        {
+            if (_ram is null)
+                lock (WorkingSetGate)
+                    if (_memoryHolder == this) _memoryHolder = null;
+        }
+    }
+
+    private unsafe void AllocateMemoryRing(long slots, long required)
+    {
+        int rate = Math.Max(1, FrameRate);
+        long wanted = slots;
+        long room = Math.Max(0, AvailablePhysical() - MemoryReserve);
+        if (slots * _stride > room) slots = room / _stride;
+
+        // Short of the delay and its guard it is worse than none: a transmitter a delay behind would
+        // have every frame written out of memory and read back off the disk.
+        if (slots < Math.Max(required, 1))
+        {
+            ActivityLog.Shared.Warn(LogSource.TidalLock,
+                $"DELAY  not enough free memory to hold the delay in RAM: {Describe(room)} to spare after leaving " +
+                $"{Describe(MemoryReserve)} for everything else, and {Describe(Math.Max(required, 1) * _stride)} needed.",
+                @event: "delay.memoryshort", file: Path);
+            return;
+        }
+
+        void* ram = VirtualAlloc(null, (nuint)(slots * _stride), MemCommit | MemReserve, PageReadWrite);
+
+        if (ram is null)
+        {
+            ActivityLog.Shared.Warn(LogSource.TidalLock,
+                $"DELAY  {Describe(slots * _stride)} for the delay in RAM could not be had (error " +
+                $"{Marshal.GetLastWin32Error()}).",
+                @event: "delay.memoryshort", file: Path);
+            return;
+        }
+
+        _ram = (byte*)ram;
+        _ramSlots = slots;
+
+        TimeSpan held = TimeSpan.FromSeconds(slots / (double)rate);
+
+        // Less than asked for is usual: what was asked for includes all the insert room there might be.
+        ActivityLog.Shared.Info(LogSource.TidalLock,
+            $"DELAY  the newest {Describe(held)} of the ring is held in RAM ({Describe(slots * _stride)})" +
+            (slots < wanted
+                ? $", of the {Describe(TimeSpan.FromSeconds(wanted / (double)rate))} asked for - all that memory can spare"
+                : "") +
+            $". {Describe(Math.Max(0, AvailablePhysical()))} of memory was free.",
+            @event: "delay.memory", file: Path);
+
+        _ramLocking = Task.Run(LockMemoryRing);
+    }
+
+    /// <summary>
+    /// Locks the ring in RAM, so Windows cannot page it out - a frame read back from the page file
+    /// would be the disk on the path to air again, on the system drive. Locking that much needs
+    /// the process's minimum working set raised by as much first. Best effort: unlocked, the ring
+    /// still works, and with memory to spare Windows leaves it where it is.
+    /// </summary>
+    private unsafe void LockMemoryRing()
+    {
+        long bytes = _ramSlots * _stride;
+
+        try
+        {
+            lock (WorkingSetGate)
+            {
+                IntPtr me = GetCurrentProcess();
+
+                if (!GetProcessWorkingSetSize(me, out nuint min, out nuint max) ||
+                    !SetProcessWorkingSetSizeEx(me, min + (nuint)bytes, max + (nuint)bytes,
+                                                QuotaLimitsHardWsMinDisable | QuotaLimitsHardWsMaxDisable))
+                {
+                    SayNotLocked(Marshal.GetLastWin32Error());
+                    return;
+                }
+
+                _ramWorkingSetAdded = bytes;
+            }
+
+            if (Volatile.Read(ref _disposed) != 0) return;
+
+            if (!VirtualLock(_ram, (nuint)bytes))
+            {
+                SayNotLocked(Marshal.GetLastWin32Error());
+                return;
+            }
+
+            Volatile.Write(ref _ramLocked, 1);
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException)
+        {
+            SayNotLocked(0);
+        }
+    }
+
+    private void SayNotLocked(int error) =>
+        ActivityLog.Shared.Info(LogSource.TidalLock,
+            $"DELAY  the delay's RAM could not be locked (error {error}); it is held all the same, " +
+            "and only paged out if the machine runs short of memory.",
+            @event: "delay.memoryunlocked", file: Path);
+
+    /// <summary>Gives the ring's RAM back, and the working set it was locked under. From Dispose, writer stopped.</summary>
+    private unsafe void CloseMemoryRing()
+    {
+        if (_ram is null) return;
+
+        try { _ramLocking?.Wait(TimeSpan.FromSeconds(30)); } catch { }
+
+        VirtualFree(_ram, 0, MemRelease);       // a lock goes with the memory
+        _ram = null;
+
+        lock (WorkingSetGate)
+            if (_memoryHolder == this) _memoryHolder = null;
+
+        if (_ramWorkingSetAdded <= 0) return;
+
+        lock (WorkingSetGate)
+        {
+            IntPtr me = GetCurrentProcess();
+
+            if (GetProcessWorkingSetSize(me, out nuint min, out nuint max))
+            {
+                nuint less = (nuint)_ramWorkingSetAdded;
+                SetProcessWorkingSetSizeEx(me, min > less ? min - less : min, max > less ? max - less : max,
+                                           QuotaLimitsHardWsMinDisable | QuotaLimitsHardWsMaxDisable);
+            }
+
+            _ramWorkingSetAdded = 0;
+        }
+    }
+
+    /// <summary>
+    /// Decides every frame before <paramref name="upTo"/> that has not been: written to the file
+    /// if something still wants it once it leaves memory - a transmitter's hold, or the distance the
+    /// line keeps - and let go otherwise. One at a time under the lock, so the writer waiting on a
+    /// frame it is about to write over never waits behind more than one.
+    /// </summary>
+    private void SpillThrough(long upTo)
+    {
+        while (true)
+        {
+            lock (_spillLock)
+            {
+                long seq = _spilledThrough;
+                if (seq >= upTo) return;
+
+                // With the whole ring in memory there is nothing to spill to: by the time a frame leaves
+                // memory the ring has come round on it, and no read of it would be answered.
+                if (_ramSlots < SlotCount && seq >= KeepFloor(Volatile.Read(ref _written)))
+                {
+                    // Reached by the writer before the overflow's thread: it has fallen behind, and the
+                    // recorder is not made to wait for it.
+                    if (_overflow is { } overflow) overflow.Lose(seq);
+                    else SpillOne(seq);
+                }
+                else
+                {
+                    Volatile.Write(ref _lostThrough, seq + 1);
+                }
+
+                Volatile.Write(ref _spilledThrough, seq + 1);
+            }
+        }
+    }
+
+    /// <summary>The flusher's share: frames about to leave memory, written out before the writer gets to them.</summary>
+    private void SpillAhead()
+    {
+        long upTo = Volatile.Read(ref _written) - _ramSlots + (long)Math.Max(1, FrameRate) * SpillLeadSeconds;
+
+        while (!_stopFlushing.IsSet && Volatile.Read(ref _disposed) == 0 &&
+               Volatile.Read(ref _spilledThrough) < upTo)
+            SpillThrough(Volatile.Read(ref _spilledThrough) + 1);
+    }
+
+    /// <summary>
+    /// One frame from memory to its slot of the file, the way the writer writes a slot: the
+    /// sequence marked -1 in what is written and set through the mapping after, so a reader of an
+    /// older frame in that slot discards what it copied. Under the spill lock.
+    /// </summary>
+    private unsafe void SpillOne(long seq)
+    {
+        byte* ram = RamSlotAt(seq);
+        if (Volatile.Read(ref *(long*)(ram + OffSequence)) != seq) return;
+
+        byte* disk = SlotAt(seq);
+        byte[] staging = _spillStaging ??= GC.AllocateUninitializedArray<byte>((int)_stride);
+
+        fixed (byte* s = staging)
+        {
+            Buffer.MemoryCopy(ram, s, _stride, _stride);
+            *(long*)(s + OffSequence) = -1L;
+
+            try
+            {
+                if (Volatile.Read(ref _fileWritesBroken) != 0) throw new IOException("file writes refused earlier");
+                RandomAccess.Write(_file.SafeFileHandle, staging, FileHeaderBytes + seq % SlotCount * _stride);
+            }
+            catch (Exception ex)
+            {
+                if (Interlocked.Exchange(ref _fileWritesBroken, 1) == 0)
+                    ActivityLog.Shared.Warn(LogSource.TidalLock,
+                        $"The delay ring at {Path} could not be written as a file ({ex.Message}); writing it through " +
+                        "memory instead.", @event: "delay.filewritefailed", file: Path);
+
+                Volatile.Write(ref *(long*)(disk + OffSequence), -1L);
+                Buffer.MemoryCopy(s + OffSequence + 8, disk + OffSequence + 8, _stride - 8, _stride - 8);
+            }
+        }
+
+        Volatile.Write(ref *(long*)(disk + OffSequence), seq);
+        Interlocked.Increment(ref _spilled);
+
+        if (Interlocked.Exchange(ref _spillSaid, 1) == 0)
+            ActivityLog.Shared.Info(LogSource.TidalLock,
+                $"DELAY  frames are leaving RAM still held - the delay has grown past the " +
+                $"{Describe(TimeSpan.FromSeconds(_ramSlots / (double)Math.Max(1, FrameRate)))} held in memory - " +
+                $"so they are written to disk {Disk} and read back from there.",
+                @event: "delay.spilling", file: Path);
+    }
+
+    private static unsafe long AvailablePhysical()
+    {
+        var status = new MemoryStatusEx { Length = (uint)sizeof(MemoryStatusEx) };
+        return GlobalMemoryStatusEx(ref status) ? (long)status.AvailPhys : 0;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MemoryStatusEx
+    {
+        public uint Length;
+        public uint MemoryLoad;
+        public ulong TotalPhys;
+        public ulong AvailPhys;
+        public ulong TotalPageFile;
+        public ulong AvailPageFile;
+        public ulong TotalVirtual;
+        public ulong AvailVirtual;
+        public ulong AvailExtendedVirtual;
+    }
+
+    private const uint MemCommit = 0x1000;
+    private const uint MemReserve = 0x2000;
+    private const uint MemRelease = 0x8000;
+    private const uint PageReadWrite = 0x04;
+    private const uint QuotaLimitsHardWsMinDisable = 0x2;
+    private const uint QuotaLimitsHardWsMaxDisable = 0x8;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx status);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern unsafe void* VirtualAlloc(void* address, nuint size, uint type, uint protect);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern unsafe bool VirtualFree(void* address, nuint size, uint type);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern unsafe bool VirtualLock(void* address, nuint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessWorkingSetSize(IntPtr process, out nuint min, out nuint max);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetProcessWorkingSetSizeEx(IntPtr process, nuint min, nuint max, uint flags);
+
     // ------------------------------------------------------------------ reading
 
     /// <summary>
@@ -924,17 +1934,193 @@ public sealed class DelayLine : IDelayLine, IDisposable
         long written = Volatile.Read(ref _written);
         if (sequence >= written) return DelayReadResult.NotYetWritten;
         if (sequence < written - SlotCount) return DelayReadResult.Lapped;
-        if (sequence < Volatile.Read(ref _releasedThrough)) return DelayReadResult.Lapped;
+
+        if (_direct) return TryReadDirect(sequence, into);
+
+        bool inMemory = _ram is not null && sequence >= written - _ramSlots;
+        if (!inMemory && sequence < Volatile.Read(ref _releasedThrough)) return DelayReadResult.Lapped;
 
         NoteReader(written - sequence);
 
-        byte* slot = SlotAt(sequence);
+        if (inMemory)
+        {
+            if (CopySlot(RamSlotAt(sequence), sequence, into) == DelayReadResult.Ok) return DelayReadResult.Ok;
 
+            // It left memory while being read. The writer decides a frame before writing over it,
+            // so if anything wanted it, it is in the file by now.
+            if (sequence < Volatile.Read(ref _releasedThrough)) return DelayReadResult.Lapped;
+        }
+
+        if (_overflow is { } overflow)
+            return sequence < OldestHeld ? DelayReadResult.Lapped : overflow.TryRead(sequence, into);
+
+        return CopySlot(SlotAt(sequence), sequence, into);
+    }
+
+    /// <summary>Direct: from the read-ahead when it has the frame, otherwise straight off the disk.</summary>
+    private unsafe DelayReadResult TryReadDirect(long sequence, DelayFrameBuffer into)
+    {
+        if (sequence < Volatile.Read(ref _releasedThrough)) return DelayReadResult.Lapped;
+
+        if (Volatile.Read(ref _readAhead) is { } ahead && ahead.TryCopy(sequence, into)) return DelayReadResult.Ok;
+
+        lock (_directReadLock)
+        {
+            if (Volatile.Read(ref _disposed) != 0 || _directRead is null) return DelayReadResult.EndOfLine;
+            if (!ReadDirect(sequence, _directRead, (int)_stride)) return DelayReadResult.Lapped;
+
+            return CopySlot(_directRead, sequence, into);
+        }
+    }
+
+    /// <summary>
+    /// Reads frame <paramref name="sequence"/>'s slot - the first <paramref name="bytes"/> of it - off
+    /// the disk into <paramref name="buffer"/>, sector-aligned memory. True only for a whole, good copy.
+    ///
+    /// <b>Torn reads.</b> The writer starts writing over a slot when the count of frames written
+    /// reaches that frame plus the ring's length, and counts the frame it wrote only once the write
+    /// has returned. So a read is good only when that count is short of the frame plus the ring's
+    /// length both before and after it: then nothing was writing the slot while it was read. The
+    /// sequence in the copy's header then has to be the one asked for, and marked written - a slot
+    /// never written, or given back to the disk, reads as zeros.
+    /// </summary>
+    private unsafe bool ReadDirect(long sequence, byte* buffer, int bytes)
+    {
+        long written = Volatile.Read(ref _written);
+        if (sequence >= written || written - sequence >= SlotCount) return false;
+        if (sequence < Volatile.Read(ref _releasedThrough)) return false;
+
+        int got = RandomAccess.Read(_file.SafeFileHandle, new Span<byte>(buffer, bytes),
+                                    FileHeaderBytes + sequence % SlotCount * _stride);
+
+        if (got < bytes) return false;
+
+        Interlocked.MemoryBarrier();
+
+        if (Volatile.Read(ref _written) - sequence >= SlotCount) return false;
+        if (sequence < Volatile.Read(ref _releasedThrough)) return false;
+
+        return *(long*)(buffer + OffSequence) == sequence && (*(int*)(buffer + OffFlags) & FlagWritten) != 0;
+    }
+
+    /// <summary>How far ahead of a transmitter a direct line reads into memory of its own.</summary>
+    private const int ReadAheadSeconds = 3;
+
+    /// <summary>
+    /// A direct line's read-ahead: the next few seconds after where the transmitter is, read off the
+    /// disk on a thread of its own into memory the line owns, so the transmitter's reads are memory
+    /// copies and a moment's wait on the disk is absorbed here rather than seen on air. About 300 MB
+    /// at 1080p25, taken only once a transmitter reads.
+    ///
+    /// A buffer's frame is published only once whole, and unpublished before it is read over, so a
+    /// copy out of it is checked against that before and after (see <see cref="TryCopy"/>).
+    /// </summary>
+    private sealed unsafe class ReadAhead : IDisposable
+    {
+        private readonly DelayLine _line;
+        private readonly int _count;
+        private readonly byte* _buffers;
+        private readonly long[] _held;
+        private readonly AutoResetEvent _wake = new(false);
+        private readonly Thread _thread;
+        private long _from = -1;
+        private volatile bool _stop;
+
+        public ReadAhead(DelayLine line, int count)
+        {
+            _line = line;
+            _count = count;
+            _buffers = (byte*)NativeMemory.AlignedAlloc((nuint)(count * line._stride), DirectAlignment);
+            _held = Enumerable.Repeat(-1L, count).ToArray();
+
+            _thread = new Thread(Loop)
+            {
+                IsBackground = true,
+                Name = "tidal delay read-ahead",
+                Priority = ThreadPriority.AboveNormal,
+            };
+
+            _thread.Start();
+        }
+
+        public long Bytes => (long)_count * _line._stride;
+
+        /// <summary>The transmitter is at <paramref name="sequence"/>: keep the frames from there on in memory.</summary>
+        public void From(long sequence)
+        {
+            Volatile.Write(ref _from, sequence);
+            _wake.Set();
+        }
+
+        public bool TryCopy(long sequence, DelayFrameBuffer into)
+        {
+            int i = (int)(sequence % _count);
+            if (Volatile.Read(ref _held[i]) != sequence) return false;
+
+            DelayReadResult copied = _line.CopySlot(_buffers + i * _line._stride, sequence, into);
+
+            // Unpublished before any read over it begins: still published now means the copy was whole.
+            Interlocked.MemoryBarrier();
+            return copied == DelayReadResult.Ok && Volatile.Read(ref _held[i]) == sequence;
+        }
+
+        private void Loop()
+        {
+            while (!_stop)
+            {
+                _wake.WaitOne(40);
+
+                long from = Volatile.Read(ref _from);
+                if (from < 0) continue;
+
+                for (long s = from; s < from + _count && !_stop; s++)
+                {
+                    // The transmitter has moved on: start again from where it is now.
+                    if (Volatile.Read(ref _from) != from) break;
+                    if (s >= _line.FramesWritten) break;
+
+                    int i = (int)(s % _count);
+                    if (Volatile.Read(ref _held[i]) == s) continue;
+
+                    Volatile.Write(ref _held[i], -1);
+
+                    try
+                    {
+                        if (_line.ReadDirect(s, _buffers + i * _line._stride, (int)_line._stride))
+                            Volatile.Write(ref _held[i], s);
+                    }
+                    catch (Exception ex) when (ex is IOException or ObjectDisposedException or UnauthorizedAccessException)
+                    {
+                        // The transmitter's own read reports it, and this tries again on the next pass.
+                    }
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            _stop = true;
+            _wake.Set();
+            if (_thread.IsAlive) _thread.Join(TimeSpan.FromSeconds(5));
+            NativeMemory.AlignedFree(_buffers);
+            _wake.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Copies frame <paramref name="sequence"/> out of a slot, in memory or in the file, checking
+    /// the slot's sequence before and after so a frame written over mid-copy is never handed on.
+    /// </summary>
+    internal unsafe DelayReadResult CopySlot(byte* slot, long sequence, DelayFrameBuffer into)
+    {
         if (Volatile.Read(ref *(long*)(slot + OffSequence)) != sequence) return DelayReadResult.Lapped;
+
+        int flags = *(int*)(slot + OffFlags);
+        if ((flags & FlagWritten) == 0) return DelayReadResult.Lapped;
 
         int videoBytes = Math.Min(*(int*)(slot + OffVideoBytes), FrameBytes);
         int audioBytes = Math.Min(*(int*)(slot + OffAudioBytes), _audioCapacity);
-        bool audioReal = (*(int*)(slot + OffFlags) & FlagAudioReal) != 0;
+        bool audioReal = (flags & FlagAudioReal) != 0;
         long recordingFrame = *(long*)(slot + OffRecordingFrame);
 
         fixed (byte* dst = into.Video)
@@ -983,6 +2169,127 @@ public sealed class DelayLine : IDelayLine, IDisposable
         Volatile.Write(ref _readerSeenAt, now);
     }
 
+    // ------------------------------------------------------------------ reading ahead
+
+    /// <summary>How far ahead of a transmitter its frames are brought back into memory.</summary>
+    private const int PrefetchSeconds = 2;
+
+    private long _prefetchedThrough = -1;
+    private int _prefetching;
+
+    /// <summary>
+    /// Brings the next couple of seconds after <paramref name="sequence"/> back into memory, in
+    /// the background, so the transmitter's reads find them there.
+    ///
+    /// <b>Why.</b> A transmitter a delay behind reads frames whose pages were taken out of the
+    /// working set long ago, to keep the ring's memory down (see <see cref="TrimBehind"/>). Each
+    /// read then faults its four or five megabytes back in, page by page - from the standby cache
+    /// when it is lucky, and from the disk when anything else has wanted the memory meanwhile.
+    /// The transmitter does that on its own thread, between pushes, and a read that waits on the
+    /// disk longer than the card's queue lasts is a frame the card repeats on air and a frame the
+    /// pacer skips afterwards to catch up: the flicker and the drops. Asked for here as one large
+    /// read, ahead of time, the pages are resident before the transmitter gets to them.
+    ///
+    /// Never blocks the caller: at most one read-ahead is in flight, on the pool, and it is asked
+    /// for again once the transmitter is a second into what was last brought in. Nothing trims the
+    /// pages ahead of a reader; they go again a margin behind it, as before.
+    /// </summary>
+    public void PrefetchAhead(long sequence)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
+        // Direct: the line's own read-ahead, not the system's cache.
+        if (_direct)
+        {
+            ReadAhead? reader = Volatile.Read(ref _readAhead);
+
+            if (reader is null)
+            {
+                lock (_readAheadLock)
+                {
+                    if (Volatile.Read(ref _disposed) != 0) return;
+                    reader = _readAhead ??= new ReadAhead(this, Math.Max(8, Math.Max(1, FrameRate) * ReadAheadSeconds));
+                }
+            }
+
+            reader.From(sequence);
+            return;
+        }
+
+        // Compressed, or about to be: decoded ahead from where the transmitter is.
+        if (_overflow is { } overflow)
+        {
+            if (sequence < Volatile.Read(ref _written) - _ramSlots + (long)Math.Max(1, FrameRate) * SpillLeadSeconds)
+                overflow.Want(sequence);
+            return;
+        }
+
+        // In RAM: nothing to bring in.
+        if (_ramSlots > 0 && sequence >= Volatile.Read(ref _written) - _ramSlots) return;
+
+        long ahead = (long)Math.Max(1, FrameRate) * PrefetchSeconds;
+
+        // Still well inside what the last read-ahead covered.
+        if (sequence + ahead / 2 < Volatile.Read(ref _prefetchedThrough)) return;
+        if (Interlocked.CompareExchange(ref _prefetching, 1, 0) != 0) return;
+
+        long upTo = sequence + ahead;
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                Prefetch(sequence, upTo);
+                Volatile.Write(ref _prefetchedThrough, upTo);
+            }
+            catch
+            {
+                // A hint, nothing more: the read itself still faults the pages in if this did not.
+            }
+            finally
+            {
+                Volatile.Write(ref _prefetching, 0);
+            }
+        });
+    }
+
+    private unsafe void Prefetch(long from, long upTo)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
+        long written = Volatile.Read(ref _written);
+
+        from = Math.Max(Math.Max(from, written - SlotCount), Volatile.Read(ref _releasedThrough));
+        upTo = Math.Min(upTo, _ramSlots > 0 ? written - _ramSlots : written);     // only what is on disk
+        if (upTo <= from) return;
+
+        long count = upTo - from;
+        long first = from % SlotCount;
+        long toEnd = Math.Min(count, SlotCount - first);
+
+        MemoryRange* ranges = stackalloc MemoryRange[2];
+        ranges[0] = new MemoryRange(_base + FileHeaderBytes + first * _stride, (nuint)(toEnd * _stride));
+
+        int n = 1;
+        if (count > toEnd)
+            ranges[n++] = new MemoryRange(_base + FileHeaderBytes, (nuint)((count - toEnd) * _stride));
+
+        PrefetchVirtualMemory(GetCurrentProcess(), (nuint)n, ranges, 0);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly unsafe struct MemoryRange(void* address, nuint bytes)
+    {
+        public readonly void* Address = address;
+        public readonly nuint Bytes = bytes;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern unsafe bool PrefetchVirtualMemory(IntPtr process, nuint count, MemoryRange* ranges, uint flags);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
     public DelayFrameBuffer NewBuffer() => new(FrameBytes, _audioCapacity);
 
     /// <summary>
@@ -995,11 +2302,35 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
         long written = Volatile.Read(ref _written);
         if (sequence >= written || sequence < written - SlotCount) return -1;
+
+        // Direct: the slot's first sector off the disk, which holds its header.
+        if (_direct)
+        {
+            lock (_directReadLock)
+            {
+                if (Volatile.Read(ref _disposed) != 0 || _directRead is null) return -1;
+                return ReadDirect(sequence, _directRead, DirectAlignment)
+                    ? *(long*)(_directRead + OffRecordingFrame)
+                    : -1;
+            }
+        }
+
+        if (_ram is not null && sequence >= written - _ramSlots)
+        {
+            long inMemory = RecordingFrameIn(RamSlotAt(sequence), sequence);
+            if (inMemory >= 0) return inMemory;
+        }
+
+        if (_overflow is { } overflow) return overflow.RecordingFrameAt(sequence);
+
         if (sequence < Volatile.Read(ref _releasedThrough)) return -1;
+        return RecordingFrameIn(SlotAt(sequence), sequence);
+    }
 
-        byte* slot = SlotAt(sequence);
-
+    private static unsafe long RecordingFrameIn(byte* slot, long sequence)
+    {
         if (Volatile.Read(ref *(long*)(slot + OffSequence)) != sequence) return -1;
+        if ((*(int*)(slot + OffFlags) & FlagWritten) == 0) return -1;
         long recordingFrame = *(long*)(slot + OffRecordingFrame);
 
         Interlocked.MemoryBarrier();
@@ -1076,6 +2407,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
         _gauge.Dispose();
         _heldGauge.Dispose();
         _dirtyGauge.Dispose();
+        _ramGauge.Dispose();
 
         // The flusher works on the mapping, so it stops first. A chunk is a second of frames;
         // this waits for the one in hand and no more.
@@ -1087,25 +2419,61 @@ public sealed class DelayLine : IDelayLine, IDisposable
         if (_writer is { IsAlive: true }) _writer.Join(TimeSpan.FromSeconds(5));
         _queue?.Dispose();
 
+        // Stopped first, because its thread can be waiting on the encoder; closed once that is out of it.
+        _overflow?.Stop();
+        _overflowThread?.Join(TimeSpan.FromSeconds(10));
+        _overflow?.Dispose();
+
+        CloseMemoryRing();
+
+        if (_direct)
+        {
+            lock (_readAheadLock)
+            {
+                _readAhead?.Dispose();
+                _readAhead = null;
+            }
+
+            // Under the read lock, so a read still in hand finishes before its buffer goes.
+            lock (_directReadLock)
+            {
+                if (_directRead is not null) NativeMemory.AlignedFree(_directRead);
+                if (_directWrite is not null) NativeMemory.AlignedFree(_directWrite);
+                _directRead = null;
+                _directWrite = null;
+            }
+        }
+
         if (_base is not null)
         {
             // Before the view: releasing them the other way round leaks the whole mapping.
-            _view.SafeMemoryMappedViewHandle.ReleasePointer();
+            _view!.SafeMemoryMappedViewHandle.ReleasePointer();
             _base = null;
         }
 
-        // The view's handle closed by hand, because disposing the accessor first flushes all of it:
-        // every frame in the ring written to disk, for a file deleted three lines down. Measured at
-        // 37 s and 5.9 GB on the system disk for a ring of 4 GB, and a ready line is ten times that.
-        _view.SafeMemoryMappedViewHandle.Dispose();
+        if (_view is not null)
+        {
+            // The view's handle closed by hand, because disposing the accessor first flushes all of
+            // it: every frame in the ring written to disk, for a file deleted three lines down.
+            // Measured at 37 s and 5.9 GB on the system disk for a ring of 4 GB, and a ready line is
+            // ten times that.
+            _view.SafeMemoryMappedViewHandle.Dispose();
 
-        // Which then complains that the handle it wanted to flush is closed.
-        try { _view.Dispose(); } catch (ObjectDisposedException) { }
+            // Which then complains that the handle it wanted to flush is closed.
+            try { _view.Dispose(); } catch (ObjectDisposedException) { }
+        }
 
-        _mmf.Dispose();
+        _mmf?.Dispose();
         _file.Dispose();
 
         try { File.Delete(Path); } catch { /* the sweep will get it */ }
+
+        try { Closed?.Invoke(this); }
+        catch (Exception ex)
+        {
+            ActivityLog.Shared.Warn(LogSource.TidalLock, $"After the delay line closed: {ex.Message}",
+                                    @event: "delay.closedfailed", file: Path);
+        }
     }
 
     private static string Describe(long bytes) => bytes >= 1L << 30

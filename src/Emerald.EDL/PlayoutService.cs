@@ -1093,11 +1093,73 @@ public sealed class PlayoutService : IDisposable
             Right = new short[samplesPerFrame];
             Silence = new short[samplesPerFrame];
 
+            // Which files lack the stream this track asks for, worked out now while the message
+            // loads rather than on a roll inside the play loop. A message's files are probed
+            // when the EDL is built, so these are mostly cache hits.
+            _missing = new TimeSpan?[_files.Count];
+            if (_streamIndex >= 0) FindMissingStreams(ffmpegPath, frameRate);
+
             _source = _files.Count > 0
-                ? AudioSource.Open(ffmpegPath, _files[0], frameRate, _streamIndex)
+                ? OpenFile(0)
                 : AudioSource.Silent(frameRate);
 
             if (_files.Count > 0) Announce(_files[0], "LOAD");
+        }
+
+        /// <summary>
+        /// For each file without an audio stream at <see cref="_streamIndex"/>, how long its
+        /// picture runs; null where the file has the stream, or where it could not be probed
+        /// (in which case ffmpeg is tried as before and explains itself if it fails).
+        /// </summary>
+        private readonly TimeSpan?[] _missing;
+
+        /// <summary>Files already said to be missing this track, so a looping bed says it once.</summary>
+        private readonly HashSet<int> _missingSaid = new();
+
+        private void FindMissingStreams(string ffmpegPath, int frameRate)
+        {
+            string? ffprobe = MediaProbe.LocateFfprobe(ffmpegPath);
+            if (ffprobe is null) return;
+
+            for (int i = 0; i < _files.Count; i++)
+            {
+                MediaInfo? info;
+                try { info = MediaProbe.Probe(ffprobe, _files[i], frameRate); }
+                catch { info = null; }
+
+                if (info is null || _streamIndex < info.Audio.Count) continue;
+
+                TimeSpan length = info.PictureDuration ?? info.Duration;
+                if (length > TimeSpan.Zero) _missing[i] = length;
+            }
+        }
+
+        /// <summary>
+        /// The source for one file of the track. A file that has fewer audio streams than the
+        /// track needs - a message mixing a four-track file with a stereo one - is silence on
+        /// this track for the file's length, said once as a warning. Before, ffmpeg was asked
+        /// for the stream anyway, refused, and the track skipped straight to the next file's
+        /// audio: the wrong sound under this file's picture, and an error on every roll.
+        /// </summary>
+        private AudioSource OpenFile(int index)
+        {
+            if (_missing[index] is { } length)
+            {
+                if (_missingSaid.Add(index))
+                {
+                    ActivityLog.Shared.Warn(LogSource.Playout,
+                        $"{Path.GetFileName(_files[index])} has no audio stream {_streamIndex + 1} - " +
+                        $"AUDIO {_track + 1} \"{Label}\" is silent on ch {_track * 2 + 1}-{_track * 2 + 2} " +
+                        $"for this file ({length:hh\\:mm\\:ss}).",
+                        @event: "playout.audiomissing",
+                        correlation: _entryId,
+                        file: _files[index]);
+                }
+
+                return AudioSource.SilentFor(_frameRate, length);
+            }
+
+            return AudioSource.Open(_ffmpegPath, _files[index], _frameRate, _streamIndex);
         }
 
         /// <summary>
@@ -1157,7 +1219,7 @@ public sealed class PlayoutService : IDisposable
             AudioSource spent = _source;
 
             _index = (_index + 1) % _files.Count;
-            _source = AudioSource.Open(_ffmpegPath, _files[_index], _frameRate, _streamIndex);
+            _source = OpenFile(_index);
             _position = 0;
 
             // Said on every roll, not only the first: a bed that wraps three times during a

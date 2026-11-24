@@ -47,7 +47,7 @@ Who drives what:
 | Window | Owns or drives | Shared state it writes |
 |---|---|---|
 | `ShellWindow` | `SdiCapture`, `RxPreview`, `AudioMonitor`, the rings | `TidalLock`, `LiveAir`, `PipelineState` |
-| `PlaybackWindow` | `DelayTransmitter`, its own `RxPreview`, an idle `PlayoutService` | `TidalLock` |
+| `PlaybackWindow` | `LiveAirTransmitter` (tidal lock, armed through `LiveAir` with owner `Playback`), its own `RxPreview`, an idle `PlayoutService` | `LiveAir` |
 | `EdlWindow` | `PlayoutService`, its own `SdiCapture` | `PipelineState` |
 | `IngestControllerWindow` | `IngestSchedulerService`, one `SdiCapture` per job, `ingest.db` | None |
 | `LiveEditWindow` | `LiveAirTransmitter`, players, `MediaLibrary` | `LiveAir` |
