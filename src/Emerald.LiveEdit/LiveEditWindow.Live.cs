@@ -681,7 +681,9 @@ public partial class LiveEditWindow
     /// <summary>The most the delay may become: the delay gone live with, plus the room made for inserts.</summary>
     private long? DelayCapacityFrames() =>
         LiveAir.Shared.Active || LiveAir.Shared.State == LiveAirState.Armed
-            ? (long)Math.Round((LiveAir.Shared.Delay + LiveAir.Shared.Headroom).TotalSeconds * _rate)
+            ? Math.Min((long)Math.Round((LiveAir.Shared.Delay + LiveAir.Shared.Headroom).TotalSeconds * _rate),
+                       // Memory is taken as inserts need it, so what there is room for changes with what is free.
+                       LiveAir.Shared.Line is DelayLine line ? line.RoomFrames : long.MaxValue)
             : null;
 
     private void ShowDelay()
@@ -719,7 +721,7 @@ public partial class LiveEditWindow
               (DelayCapacityFrames() is { } most
                   ? $"It can grow to {new Timecode(most, _rate)}: room for {InsertRoomText(most - delay - _rate)} more of inserts." +
                     (LiveAir.Shared.Line is DelayLine { Compressed: > 0 } line && now > line.MemoryRoomFrames
-                        ? " It is past what memory holds, so the recording is going to air through DNxHD." : "")
+                        ? $" Inserts have made it longer, so the recording is going to air through DNxHD, using {line.GrownBytes / 1e9:F1} GB more memory." : "")
                   : "")
             : "The playback deck's tidal lock delay. That transmission does not play this timeline's inserts or cuts.";
         DelayText.Visibility = Visibility.Visible;

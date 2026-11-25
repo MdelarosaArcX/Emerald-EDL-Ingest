@@ -7,7 +7,7 @@ namespace Emerald.Video.Tests;
 /// <summary>
 /// Inserts past the end of memory: frames compressed as they leave it, and decoded again for air.
 ///
-/// At the real raster, because DNxHD has no small one, so these take about a gigabyte and some seconds.
+/// At the real raster, because DNxHD has no small one, so these take a gigabyte or two and some seconds.
 /// On their own (<see cref="ProcessWideCollection"/>), and nothing without ffmpeg.
 /// </summary>
 [Collection(ProcessWideCollection.Name)]
@@ -21,10 +21,14 @@ public sealed class DelayOverflowTests : IDisposable
     {
         Directory.CreateDirectory(_folder);
         DelayLine.MemoryReserve = 0;
+        DelayOverflow.Reserve = 0;
+        DelayOverflow.Floor = 0;
     }
 
     public void Dispose()
     {
+        DelayOverflow.Reserve = 0;
+        DelayOverflow.Floor = 0;
         try { Directory.Delete(_folder, recursive: true); } catch (IOException) { }
     }
 
@@ -159,6 +163,199 @@ public sealed class DelayOverflowTests : IDisposable
         Assert.Equal(0, line.Spilled);
         Assert.True(line.Compressed > 500, $"{line.Compressed} compressed");
         Assert.True(late == 0, $"{late} frames were later than the card could hide, {waits} waits in all");
+    }
+
+    /// <summary>Runs the line at the recorder's pace, <paramref name="behind"/> frames back, for so many frames from where it is.</summary>
+    private static void Run(DelayLine line, DelayHold hold, long behind, int frames, byte[] picture, int msPerFrame = 20)
+    {
+        var clock = Stopwatch.StartNew();
+
+        for (int n = 0; n < frames; n++)
+        {
+            line.Write(picture, Hd.FrameBytes, null, 0, false);
+
+            long at = Math.Max(0, line.FramesWritten - behind);
+            hold.Move(at);
+            line.PrefetchAhead(at);
+
+            long due = (long)(n + 1) * msPerFrame;
+            if (due > clock.ElapsedMilliseconds) Thread.Sleep((int)(due - clock.ElapsedMilliseconds));
+        }
+    }
+
+    /// <summary>
+    /// The point of it: memory rises by what the insert adds - a second of it about 16 MB - holds steady while the
+    /// delay is that long, is more for a longer one, and is given back when the delay is short again.
+    /// </summary>
+    [Fact]
+    public void Memory_rises_with_the_length_of_the_insert_and_comes_back()
+    {
+        using DelayLine? line = Open();
+        if (line is null) return;
+
+        Assert.True(line.WaitForOverflow(TimeSpan.FromSeconds(20)));
+
+        byte[] picture = Picture(5);
+        double second = DelayOverflow.StrideFor(Hd) * 25.0;
+        Assert.InRange(second / 1e6, 15, 17);
+
+        using DelayHold hold = line.Hold(0);
+
+        // The delay alone, for longer than memory: nothing taken.
+        Run(line, hold, 4 * 25, 400, picture);
+        Assert.Equal(0, line.GrownBytes);
+
+        // Held back as if by an insert, to 20 s behind with 12 in memory, and then kept there.
+        for (long behind = 4 * 25; behind < 20 * 25; behind += 25) Run(line, hold, behind, 25, picture);
+        Run(line, hold, 20 * 25, 200, picture);
+        double ten = line.GrownBytes / second;
+        Run(line, hold, 20 * 25, 200, picture);
+        double still = line.GrownBytes / second;
+
+        Assert.InRange(ten, 8, 17);
+        Assert.InRange(still, ten - 2, ten + 2);
+
+        // Another ten seconds.
+        for (long behind = 20 * 25; behind < 30 * 25; behind += 25) Run(line, hold, behind, 25, picture);
+        Run(line, hold, 30 * 25, 100, picture);
+        Assert.InRange(line.GrownBytes / second, ten + 7, ten + 13);
+
+        // Back to the delay alone.
+        Run(line, hold, 4 * 25, 100, picture);
+        Assert.Equal(0, line.GrownBytes);
+        Assert.Equal(0, line.CompressedLost);
+    }
+
+    /// <summary>The delay and its guard exactly, as it is held on air, with the pacer's half second of drift: nothing is compressed.</summary>
+    [Fact]
+    public void The_memory_kept_for_a_delay_is_enough_for_it()
+    {
+        if (Ffmpeg.Locate() is not { } ffmpeg) return;
+
+        Assert.True(DelayLine.CanGrow(ffmpeg, Hd, TimeSpan.FromSeconds(20)));
+
+        TimeSpan delay = TimeSpan.FromSeconds(4);
+        using DelayLine line = DelayLine.Create(_folder, Hd, delay, TimeSpan.FromSeconds(56), DelayLine.MemoryFor(delay),
+                                                required: delay, ffmpeg: ffmpeg);
+
+        Assert.Equal((4 + 7) * 25, line.MemorySlots);
+        Assert.True(line.WaitForOverflow(TimeSpan.FromSeconds(20)));
+
+        using DelayHold hold = line.Hold(0);
+        Run(line, hold, 4 * 25 + 12 + 2, 900, Picture(9), msPerFrame: 10);
+
+        Assert.Equal(0, line.Compressed);
+        Assert.Equal(0, line.GrownBytes);
+    }
+
+    /// <summary>
+    /// A soak, only when asked for (EMERALD_OVERFLOW_SOAK=1; 9 minutes, 6 GB): two minutes of delay grown by five of inserts, at
+    /// the recorder's pace with pictures of noise, reading every frame as air does.
+    /// </summary>
+    [Fact]
+    public void Soak_five_minutes_of_inserts_at_the_recorders_pace()
+    {
+        if (Environment.GetEnvironmentVariable("EMERALD_OVERFLOW_SOAK") != "1" || Ffmpeg.Locate() is not { } ffmpeg) return;
+
+        // The ring in memory is kept small, so it all fits beside the five minutes; what is measured is the rest.
+        using DelayLine line = DelayLine.Create(_folder, Hd, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(360), TimeSpan.FromSeconds(12),
+                                                required: TimeSpan.FromSeconds(4), ffmpeg: ffmpeg);
+        Assert.True(line.WaitForOverflow(TimeSpan.FromSeconds(20)));
+
+        // Noise, with the frame's number where it survives: a block of one level along the top.
+        var random = new Random(1);
+        var noise = new byte[8][];
+        for (int i = 0; i < noise.Length; i++) random.NextBytes(noise[i] = new byte[Hd.FrameBytes]);
+
+        void Mark(byte[] p, long n)
+        {
+            for (int i = 0; i < 1920 * 2 * 32; i += 2) { p[i] = 128; p[i + 1] = Level(n); }
+        }
+
+        double Read(byte[] p)
+        {
+            long sum = 0; int n = 0;
+            for (int i = 1920 * 2 * 8 + 1; i < 1920 * 2 * 24; i += 202, n++) sum += p[i | 1];
+            return sum / (double)n;
+        }
+
+        using DelayHold hold = line.Hold(0);
+        DelayFrameBuffer buffer = line.NewBuffer();
+        const int rate = 25, behind = 300 * rate, total = 520 * rate;
+        long late = 0, worst = 0, read = 0, slowWrites = 0, peak = 0;
+        var clock = Stopwatch.StartNew();
+
+        for (int n = 0; n < total; n++)
+        {
+            byte[] p = noise[n % noise.Length];
+            Mark(p, n);
+
+            var writing = Stopwatch.StartNew();
+            line.Write(p, Hd.FrameBytes, Sound(n % 250), 7680, true, recordingFrame: n);
+            if (writing.ElapsedMilliseconds > 40) slowWrites++;
+
+            long at = n + 1 - behind;
+            hold.Move(Math.Max(0, at));
+            line.PrefetchAhead(Math.Max(0, at));
+            peak = Math.Max(peak, line.GrownBytes);
+
+            if (at >= 0)
+            {
+                var waited = Stopwatch.StartNew();
+                DelayReadResult result;
+                while ((result = line.TryRead(at, buffer)) == DelayReadResult.NotReady && waited.ElapsedMilliseconds < 3000) Thread.Sleep(1);
+
+                worst = Math.Max(worst, waited.ElapsedMilliseconds);
+                if (waited.ElapsedMilliseconds > OverflowWait.QuietMs) late++;
+
+                Assert.True(result == DelayReadResult.Ok, $"frame {at}: {result}, {line.CompressedLost} lost");
+                Assert.InRange(Read(buffer.Video), Level(at) - 4, Level(at) + 4);
+                Assert.Equal(at, buffer.RecordingFrame);
+                read++;
+            }
+
+            long due = (long)(n + 1) * 1000 / rate;
+            if (due > clock.ElapsedMilliseconds) Thread.Sleep((int)(due - clock.ElapsedMilliseconds));
+        }
+
+        string said = $"read {read}, late {late}, worst wait {worst} ms, writes over 40 ms {slowWrites}, lost {line.CompressedLost}, " +
+                      $"peak {peak / 1e9:F2} GB, {clock.Elapsed.TotalSeconds - total / (double)rate:F1} s behind the clock";
+
+        if (Environment.GetEnvironmentVariable("EMERALD_OVERFLOW_SOAK_REPORT") is { Length: > 0 } report) File.WriteAllText(report, said);
+
+        Assert.True(late == 0 && line.CompressedLost == 0, said);
+    }
+
+    /// <summary>Little free memory: the room is what is kept for the delay, so an insert is refused before it is placed.</summary>
+    [Fact]
+    public void With_no_memory_to_spare_there_is_no_room_for_inserts()
+    {
+        using DelayLine? line = Open();
+        if (line is null) return;
+
+        Assert.True(line.WaitForOverflow(TimeSpan.FromSeconds(20)));
+        DelayOverflow.Reserve = long.MaxValue / 4;
+        Assert.Equal(line.MemoryRoomFrames, line.RoomFrames);
+    }
+
+    /// <summary>Memory gone after an insert was let in: frames are lost and said to be, and nothing falls over.</summary>
+    [Fact]
+    public void Memory_running_out_part_way_loses_frames_and_nothing_else()
+    {
+        using DelayLine? line = Open();
+        if (line is null) return;
+
+        Assert.True(line.WaitForOverflow(TimeSpan.FromSeconds(20)));
+        DelayOverflow.Floor = long.MaxValue / 4;
+
+        using DelayHold hold = line.Hold(0);
+        Run(line, hold, 1000, 420, Picture(4), msPerFrame: 15);
+        Thread.Sleep(500);
+
+        Assert.Equal(0, line.GrownBytes);
+        Assert.True(line.CompressedLost > 0);
+        Assert.Equal(DelayReadResult.Missing, line.TryRead(60, line.NewBuffer()));
+        Assert.Null(line.Fault);
     }
 
     /// <summary>Nothing is compressed for a delay that fits in memory, and no ffmpeg runs for it.</summary>

@@ -338,8 +338,8 @@ public sealed class DelayLineTests : IDisposable
     public void A_reader_running_behind_a_writer_in_memory_never_sees_a_torn_frame()
     {
         using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10),
-                                                TimeSpan.FromSeconds(7));
-        Assert.Equal(175, line.MemorySlots);
+                                                TimeSpan.FromSeconds(8));
+        Assert.Equal(200, line.MemorySlots);
         NeverTorn(line);
     }
 
@@ -927,8 +927,8 @@ public sealed class DelayLineTests : IDisposable
         Assert.False(line.IsDirect);
         Assert.Equal(300, line.MemorySlots);
 
-        // As far back as a transmitter may be: five seconds short of the end of memory.
-        Assert.Equal(300 - 125, line.RoomFrames);
+        // As far back as a transmitter may be: seven seconds short of the end of memory.
+        Assert.Equal(300 - 175, line.RoomFrames);
     }
 
     /// <summary>Memory that cannot hold the delay and its guard is not used at all: the disk is.</summary>

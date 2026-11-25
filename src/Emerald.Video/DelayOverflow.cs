@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
@@ -7,24 +8,20 @@ using Emerald.Core;
 namespace Emerald.Video;
 
 /// <summary>
-/// Where a delay held in RAM puts the frames that leave it still wanted: DNxHD, in a file.
+/// Where a delay held in RAM puts the frames that leave it still wanted: DNxHD, in memory taken as it is
+/// needed and given back as air goes past.
 ///
-/// <b>Why.</b> An insert makes the delay longer for the rest of the transmission, and raw frames are
-/// 104 MB/s: memory runs out after seconds of inserts, and this plant's delay drive cannot take that
-/// rate each way for hours (measured at about 80). DNxHD 145 - what the masters already are - is a
-/// seventh of it. So the delay proper stays raw, in memory, and is what goes to air untouched; only
-/// what an insert pushes past the end of memory is compressed, once, and decoded again for air.
+/// <b>Why.</b> An insert makes the delay longer for the rest of the transmission. Raw, that is 104 MB for
+/// every second of it. DNxHD 145 - what the masters already are - is about 16, so the delay proper stays
+/// raw and is what goes to air untouched, and only what an insert adds to it is compressed, once, and
+/// decoded again for air. A thirty-second insert takes half a gigabyte; five minutes, about five. None of
+/// it touches the disk, which on this plant cannot be relied on.
 ///
 /// <b>Frames are matched by order, and checked.</b> Both directions are an ffmpeg with a pipe at each
 /// end. Every DNxHD frame of a given kind is the same size, and starts with the same five bytes, so
 /// what comes out of the encoder is cut into frames by size and each is checked; the decoder gives
 /// one picture for each frame put in. <see cref="Probe"/> proves both on this machine, with this
 /// ffmpeg, before any of it is relied on.
-///
-/// <b>The disk may stall.</b> This drive does, for ten seconds at a time. Half a minute of compressed
-/// frames is kept in memory on the way to the disk and read from there if wanted before it gets there,
-/// and twenty seconds are read ahead of the transmitter on the way back. About a gigabyte in all,
-/// taken only once an insert needs it.
 ///
 /// <b>Nothing here may hold up the recorder.</b> Frames are handed over by a thread of the line's own.
 /// If it falls behind, the frame leaving memory is lost from the delay - a held picture when air
@@ -39,52 +36,50 @@ internal sealed unsafe class DelayOverflow : IDisposable
     private const int Alignment = 4096;
     private const int HeaderBytes = 64;
 
-    // Compressed slot header: sequence, audio bytes, flags, recording frame.
+    // Stored frame header: sequence, audio bytes, flags, recording frame.
     private const int OffSequence = 0;
     private const int OffAudioBytes = 8;
     private const int OffFlags = 12;
     private const int OffRecordingFrame = 16;
 
-    private const int WriteCacheSeconds = 30;
-    private const int ReadAheadSeconds = 20;
-    private const int DecodeAheadSeconds = 2;
-
-    /// <summary>The raw DNxHD parser sees the end of a frame in the start of the next: a frame or two must follow.</summary>
-    private const int DecoderLag = 3;
-
+    private const int DecodeAheadSeconds = 1;
     private const long IdleMs = 5000;
-    private const long SpareDiskBytes = 10L * 1024 * 1024 * 1024;
 
-    private const FileOptions NoBuffering = (FileOptions)0x20000000;
+    /// <summary>Free memory an insert must leave: the level the low-memory warning is at. Tests lower it.</summary>
+    internal static long Reserve { get; set; } = LowMemoryWatch.LowBytes;
+
+    /// <summary>Below this nothing more is taken, whatever was promised: the machine is about to page.</summary>
+    internal static long Floor { get; set; } = LowMemoryWatch.CriticalBytes;
 
     private static readonly byte[] Magic = { 0x00, 0x00, 0x02, 0x80, 0x01 };
 
     private readonly DelayLine _line;
     private readonly string _ffmpeg;
     private readonly CaptureFormat _format;
-    private readonly long _slots;
     private readonly int _audioCapacity;
     private readonly int _rawStride;
     private readonly int _stride;
-    private readonly FileStream _file;
+    private readonly int _chunkFrames;
     private readonly string _path;
 
     private volatile bool _stop;
     private volatile bool _faulted;
 
-    // By ring slot: which frame is waiting for the encoder, which is on disk, and its recording frame.
-    private readonly long[] _pending;
-    private readonly long[] _stored;
-    private readonly long[] _recording;
+    /// <summary>A second of compressed frames, in memory of its own.</summary>
+    private sealed class Chunk
+    {
+        public byte* Data;
+        public long[] Seq = Array.Empty<long>();
+    }
+
+    // The store. Everything under the lock is short: a frame copied in or out, a chunk taken or given back.
+    private readonly object _storeLock = new();
+    private readonly Dictionary<long, Chunk> _chunks = new();
+    private readonly HashSet<long> _pending = new();
+    private long _bytes, _peakBytes;
+
     private long _lastSubmitted = -1;
     private long _lastSubmitMs;
-
-    private byte* _cache;
-    private readonly int _cacheCount;
-    private readonly long[] _cacheSeq;
-    private readonly long[] _cacheOnDisk;
-    private readonly BlockingCollection<long> _toDisk = new();
-    private Thread? _diskWriter;
 
     private Coder? _encoder;
     private long _encoderRetryAt;
@@ -92,13 +87,10 @@ internal sealed unsafe class DelayOverflow : IDisposable
 
     private long _want = -1;
     private long _wantMs;
-    private byte* _ahead;
-    private readonly int _aheadCount;
-    private readonly long[] _aheadSeq;
     private byte* _decoded;
+    private readonly object _decodedLock = new();
     private readonly int _decodedCount;
     private readonly long[] _decodedSeq;
-    private Thread? _fetcher;
     private Thread? _feeder;
     private readonly object _readStart = new();
 
@@ -112,89 +104,66 @@ internal sealed unsafe class DelayOverflow : IDisposable
     /// <summary>Frames that should be here and are not: air holds the picture before for each.</summary>
     public long Missing => Interlocked.Read(ref _missing);
 
+    /// <summary>Memory taken just now for compressed frames. Nothing while no insert needs any.</summary>
+    public long Bytes => Interlocked.Read(ref _bytes);
+
     /// <summary>Something went wrong that will not mend itself; what is already held can still be read.</summary>
     public bool Faulted => _faulted;
 
     public static bool Supports(CaptureFormat format) =>
-        format.Width == 1920 && format.Height == 1080 && format.FrameBytes == 1920 * 1080 * 2 && !IsInterlaced(format);
-
-    private static bool IsInterlaced(CaptureFormat format) => format.IsInterlaced;
+        format.Width == 1920 && format.Height == 1080 && format.FrameBytes == 1920 * 1080 * 2 && !format.IsInterlaced;
 
     public static int StrideFor(CaptureFormat format) =>
         (HeaderBytes + DnxFrameBytes + DelayLine.AudioCapacityFor(format.FrameRate) + Alignment - 1) / Alignment * Alignment;
 
-    /// <summary>Free disk wanted before an overflow of this many slots is offered.</summary>
-    public static long DiskFor(CaptureFormat format, long slots) => slots * StrideFor(format) + SpareDiskBytes;
+    /// <summary>
+    /// Frames this could hold in all, with the memory there is now: what it has, and what could be taken and
+    /// still leave <see cref="Reserve"/>.
+    /// </summary>
+    public long RoomFrames => (Bytes + Math.Max(0, DelayLine.AvailablePhysical() - Reserve)) / _stride;
 
-    public DelayOverflow(DelayLine line, string path, string ffmpeg, CaptureFormat format, long slots, long rawStride)
+    public DelayOverflow(DelayLine line, string path, string ffmpeg, CaptureFormat format, long rawStride)
     {
         _line = line;
         _path = path;
         _ffmpeg = ffmpeg;
         _format = format;
-        _slots = slots;
         _audioCapacity = DelayLine.AudioCapacityFor(format.FrameRate);
         _rawStride = (int)rawStride;
         _stride = StrideFor(format);
+        _chunkFrames = Math.Max(1, format.FrameRate);
+        _decodedCount = _chunkFrames * DecodeAheadSeconds + 8;
+        _decodedSeq = new long[_decodedCount];
+        Array.Fill(_decodedSeq, -1L);
 
-        _pending = Filled(slots);
-        _stored = Filled(slots);
-        _recording = Filled(slots);
-
-        int rate = Math.Max(1, format.FrameRate);
-        _cacheCount = rate * WriteCacheSeconds;
-        _cacheSeq = Filled(_cacheCount);
-        _cacheOnDisk = Filled(_cacheCount);
-        _aheadCount = rate * ReadAheadSeconds;
-        _aheadSeq = Filled(_aheadCount);
-        _decodedCount = rate * DecodeAheadSeconds + 8;
-        _decodedSeq = Filled(_decodedCount);
-
-        // Straight to the disk, as the direct ring is: whole sectors, past the Windows cache. Sparse,
-        // so a line that never overflows takes nothing.
-        _file = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read, 0,
-                               FileOptions.WriteThrough | NoBuffering);
-
-        try
-        {
-            DelayLine.SetSparse(_file);
-            _file.SetLength(slots * _stride);
-        }
-        catch
-        {
-            _file.Dispose();
-            try { File.Delete(path); } catch (IOException) { }
-            throw;
-        }
-
-        _gauge = MemoryGauges.Register("Delay", $"overflow buffers ({Path.GetFileName(path)})", () =>
-            (_cache is null ? 0L : (long)_cacheCount * _stride) +
-            (_ahead is null ? 0L : (long)_aheadCount * _stride) +
-            (_decoded is null ? 0L : (long)_decodedCount * _rawStride));
-    }
-
-    private static long[] Filled(long count)
-    {
-        var a = new long[count];
-        Array.Fill(a, -1L);
-        return a;
+        _gauge = MemoryGauges.Register("Delay", $"inserts held compressed ({Path.GetFileName(path)})",
+            () => Bytes + (_decoded is null ? 0L : (long)_decodedCount * _rawStride));
     }
 
     // ------------------------------------------------------------------ what is held
 
-    private int RingSlot(long seq) => (int)(seq % _slots);
+    /// <summary>The stored frame, or null. Under the store lock, and good only while it is held.</summary>
+    private byte* Find(long seq)
+    {
+        if (seq < 0 || !_chunks.TryGetValue(seq / _chunkFrames, out Chunk? chunk)) return null;
 
-    private bool Has(long seq) =>
-        Volatile.Read(ref _pending[RingSlot(seq)]) == seq ||
-        Volatile.Read(ref _cacheSeq[(int)(seq % _cacheCount)]) == seq ||
-        Volatile.Read(ref _stored[RingSlot(seq)]) == seq;
+        int i = (int)(seq % _chunkFrames);
+        return chunk.Seq[i] == seq ? chunk.Data + (long)i * _stride : null;
+    }
+
+    private bool Has(long seq)
+    {
+        lock (_storeLock) return _pending.Contains(seq) || Find(seq) is not null;
+    }
 
     /// <summary>Which frame of the recording <paramref name="seq"/> is, or -1 when it is not held here.</summary>
     public long RecordingFrameAt(long seq)
     {
-        if (!Has(seq)) return -1;
-        long frame = Volatile.Read(ref _recording[RingSlot(seq)]);
-        return Has(seq) ? frame : -1;
+        lock (_storeLock)
+        {
+            byte* held = Find(seq);
+            return held is null ? -1 : *(long*)(held + OffRecordingFrame);
+        }
     }
 
     /// <summary>
@@ -203,16 +172,19 @@ internal sealed unsafe class DelayOverflow : IDisposable
     /// </summary>
     public DelayReadResult TryRead(long seq, DelayFrameBuffer into)
     {
-        byte* decoded = _decoded;
         int i = (int)(seq % _decodedCount);
 
-        if (decoded is not null && Volatile.Read(ref _decodedSeq[i]) == seq)
+        // Held while it copies, so the buffers are not given back under it. Nothing else waits on it.
+        lock (_decodedLock)
         {
-            DelayReadResult copied = _line.CopySlot(decoded + (long)i * _rawStride, seq, into);
+            if (_decoded is not null && Volatile.Read(ref _decodedSeq[i]) == seq)
+            {
+                DelayReadResult copied = _line.CopySlot(_decoded + (long)i * _rawStride, seq, into);
 
-            // Unpublished before it is decoded over: still published means the copy was whole.
-            Interlocked.MemoryBarrier();
-            if (copied == DelayReadResult.Ok && Volatile.Read(ref _decodedSeq[i]) == seq) return DelayReadResult.Ok;
+                // Unpublished before it is decoded over: still published means the copy was whole.
+                Interlocked.MemoryBarrier();
+                if (copied == DelayReadResult.Ok && Volatile.Read(ref _decodedSeq[i]) == seq) return DelayReadResult.Ok;
+            }
         }
 
         return Has(seq) || seq > Volatile.Read(ref _lastSubmitted) ? DelayReadResult.NotReady : DelayReadResult.Missing;
@@ -234,21 +206,19 @@ internal sealed unsafe class DelayOverflow : IDisposable
             return;
         }
 
-        EnsureWriteSide();
+        if (Interlocked.Exchange(ref _saidStarted, 1) == 0)
+            ActivityLog.Shared.Info(LogSource.TidalLock,
+                "DELAY  an insert has made the delay longer than the memory kept for it, so the part it added is compressed " +
+                "(DNxHD 145) in memory taken as it is needed. The recording goes to air through that from here on.",
+                @event: "delay.overflow", file: _path);
 
-        int slot = RingSlot(seq);
-        int audioBytes = Math.Min(*(int*)(raw + DelayLine.OffAudioBytes), _audioCapacity);
+        int audioBytes = Math.Clamp(*(int*)(raw + DelayLine.OffAudioBytes), 0, _audioCapacity);
         var sound = new byte[audioBytes];
-
-        if (audioBytes > 0)
-            fixed (byte* dst = sound)
-                Buffer.MemoryCopy(raw + DelayLine.SlotHeaderBytes + _format.FrameBytes, dst, audioBytes, audioBytes);
+        Marshal.Copy((nint)(raw + DelayLine.SlotHeaderBytes + _format.FrameBytes), sound, 0, audioBytes);
 
         var meta = new Meta(seq, *(long*)(raw + DelayLine.OffRecordingFrame), *(int*)(raw + DelayLine.OffFlags), sound);
 
-        Volatile.Write(ref _stored[slot], -1);
-        Volatile.Write(ref _recording[slot], meta.RecordingFrame);
-        Volatile.Write(ref _pending[slot], seq);
+        lock (_storeLock) _pending.Add(seq);
         Volatile.Write(ref _lastSubmitted, seq);
         Volatile.Write(ref _lastSubmitMs, Environment.TickCount64);
 
@@ -258,11 +228,10 @@ internal sealed unsafe class DelayOverflow : IDisposable
             Lose(seq);
     }
 
-    /// <summary>A frame the line could not hand over in time. Air holds the picture before it.</summary>
-    public void Lose(long seq)
+    /// <summary>A frame that will not be here. Air holds the picture before it.</summary>
+    public void Lose(long seq, string why = "The machine is too busy, or ffmpeg has stopped.")
     {
-        int slot = RingSlot(seq);
-        Interlocked.CompareExchange(ref _pending[slot], -1, seq);
+        lock (_storeLock) _pending.Remove(seq);
 
         if (seq > Volatile.Read(ref _lastSubmitted)) Volatile.Write(ref _lastSubmitted, seq);
 
@@ -273,14 +242,31 @@ internal sealed unsafe class DelayOverflow : IDisposable
         Interlocked.Exchange(ref _missingSaidMs, now);
 
         ActivityLog.Shared.Warn(LogSource.TidalLock,
-            $"DELAY  a frame could not be compressed in time ({missing} so far); air will hold the picture before it. " +
-            "The machine is too busy, or ffmpeg has stopped.",
+            $"DELAY  a frame of the delay was lost ({missing} so far); air will hold the picture before it. {why}",
             @event: "delay.overflowlost", file: _path);
     }
 
-    /// <summary>Nothing has been wanted for a while: the encoder and decoder are closed until it is.</summary>
-    public void CloseIfIdle()
+    /// <summary>
+    /// Gives back the memory of frames before <paramref name="floor"/>, which nothing will read again, and
+    /// closes the encoder when nothing has been compressed for a while. From the line's overflow thread.
+    /// </summary>
+    public void Tidy(long floor)
     {
+        lock (_storeLock)
+        {
+            List<long>? gone = null;
+
+            foreach ((long key, Chunk chunk) in _chunks)
+                if ((key + 1) * _chunkFrames <= floor)
+                {
+                    (gone ??= new List<long>()).Add(key);
+                    Free(chunk);
+                }
+
+            if (gone is not null)
+                foreach (long key in gone) _chunks.Remove(key);
+        }
+
         long now = Environment.TickCount64;
 
         lock (_encoderLock)
@@ -290,28 +276,63 @@ internal sealed unsafe class DelayOverflow : IDisposable
                 encoder.FinishInput();
 
                 ActivityLog.Shared.Info(LogSource.TidalLock,
-                    $"DELAY  nothing more is leaving memory; compression has stopped. {Encoded:N0} frames were compressed, {Missing:N0} lost.",
+                    $"DELAY  nothing more needs compressing. {Encoded:N0} frames were, {Missing:N0} lost; at most " +
+                    $"{Interlocked.Read(ref _peakBytes) / (double)(1L << 30):F2} GB of memory was taken for it.",
                     @event: "delay.overflowdone", file: _path);
 
                 Volatile.Write(ref _saidStarted, 0);
+                Interlocked.Exchange(ref _peakBytes, 0);
             }
     }
 
-    private void EnsureWriteSide()
+    private void Free(Chunk chunk)
     {
-        if (_diskWriter is null)
-        {
-            _cache = (byte*)NativeMemory.AlignedAlloc((nuint)((long)_cacheCount * _stride), Alignment);
+        NativeMemory.AlignedFree(chunk.Data);
+        chunk.Data = null;
+        Interlocked.Add(ref _bytes, -(long)_chunkFrames * _stride);
+    }
 
-            _diskWriter = new Thread(WriteDisk) { IsBackground = true, Name = "tidal overflow disk" };
-            _diskWriter.Start();
+    /// <summary>Puts a compressed frame in the store, taking a second's memory for it if there is none yet.</summary>
+    private bool Store(Meta meta, byte[] coded)
+    {
+        lock (_storeLock)
+        {
+            if (_stop) return false;
+
+            long key = meta.Seq / _chunkFrames;
+
+            if (!_chunks.TryGetValue(key, out Chunk? chunk))
+            {
+                long size = (long)_chunkFrames * _stride;
+                if (DelayLine.AvailablePhysical() - size < Floor) return false;
+
+                byte* data;
+                try { data = (byte*)NativeMemory.AlignedAlloc((nuint)size, Alignment); }
+                catch (OutOfMemoryException) { return false; }
+
+                chunk = new Chunk { Data = data, Seq = new long[_chunkFrames] };
+                Array.Fill(chunk.Seq, -1L);
+                _chunks[key] = chunk;
+
+                long bytes = Interlocked.Add(ref _bytes, size);
+                if (bytes > Interlocked.Read(ref _peakBytes)) Interlocked.Exchange(ref _peakBytes, bytes);
+            }
+
+            int i = (int)(meta.Seq % _chunkFrames);
+            byte* slot = chunk.Data + (long)i * _stride;
+
+            *(long*)(slot + OffSequence) = meta.Seq;
+            *(int*)(slot + OffAudioBytes) = meta.Sound.Length;
+            *(int*)(slot + OffFlags) = meta.Flags;
+            *(long*)(slot + OffRecordingFrame) = meta.RecordingFrame;
+            Marshal.Copy(coded, 0, (nint)(slot + HeaderBytes), DnxFrameBytes);
+            Marshal.Copy(meta.Sound, 0, (nint)(slot + HeaderBytes + DnxFrameBytes), meta.Sound.Length);
+
+            chunk.Seq[i] = meta.Seq;
+            _pending.Remove(meta.Seq);
         }
 
-        if (Interlocked.Exchange(ref _saidStarted, 1) == 0)
-            ActivityLog.Shared.Info(LogSource.TidalLock,
-                "DELAY  the delay has grown past what memory holds, so frames further back are compressed (DNxHD 145) to " +
-                $"{DelayLine.DescribeDisk(_path)} and decoded for air. The picture goes through that compression from here on.",
-                @event: "delay.overflow", file: _path);
+        return true;
     }
 
     private Coder? Encoder()
@@ -350,28 +371,17 @@ internal sealed unsafe class DelayOverflow : IDisposable
             $"DELAY  the delay's {which} stopped{(why.Length > 0 ? $" ({why})" : "")}; starting it again.",
             @event: "delay.overflowrestart", file: _path);
 
-    /// <summary>One compressed frame out of the encoder, into the write cache. On the encoder's thread.</summary>
+    /// <summary>One compressed frame out of the encoder, into the store. On the encoder's thread.</summary>
     private bool Encoding(Meta meta, Stream output)
     {
-        int i = (int)(meta.Seq % _cacheCount);
+        byte[] coded = ArrayPool<byte>.Shared.Rent(DnxFrameBytes);
 
-        // The frame there half a minute ago, still not on disk: the disk is that far behind. Waiting
-        // here holds up the encoder, and through it the line's overflow thread - never the recorder.
-        while (!_stop && !_faulted && Volatile.Read(ref _cacheSeq[i]) is >= 0 and var old &&
-               Volatile.Read(ref _cacheOnDisk[i]) != old)
-            Thread.Sleep(20);
+        try
+        {
+            fixed (byte* p = coded)
+                if (!ReadWhole(output, p, DnxFrameBytes)) return false;
 
-        if (_stop || _faulted) return false;
-
-        byte* slot = _cache + (long)i * _stride;
-        Volatile.Write(ref _cacheSeq[i], -1);
-        Volatile.Write(ref _cacheOnDisk[i], -1);
-        Interlocked.MemoryBarrier();
-
-        if (!ReadWhole(output, slot + HeaderBytes, DnxFrameBytes)) return false;
-
-        for (int b = 0; b < Magic.Length; b++)
-            if (slot[HeaderBytes + b] != Magic[b])
+            if (!coded.AsSpan(0, Magic.Length).SequenceEqual(Magic))
             {
                 ActivityLog.Shared.Error(LogSource.TidalLock,
                     "DELAY  the encoder's output did not line up with its frames, so it is not trusted. Inserts past what " +
@@ -381,63 +391,23 @@ internal sealed unsafe class DelayOverflow : IDisposable
                 return false;
             }
 
-        *(long*)(slot + OffSequence) = meta.Seq;
-        *(int*)(slot + OffAudioBytes) = meta.Sound.Length;
-        *(int*)(slot + OffFlags) = meta.Flags;
-        *(long*)(slot + OffRecordingFrame) = meta.RecordingFrame;
-        Marshal.Copy(meta.Sound, 0, (nint)(slot + HeaderBytes + DnxFrameBytes), meta.Sound.Length);
+            if (Store(meta, coded)) Interlocked.Increment(ref _encoded);
+            else if (!_stop) Lose(meta.Seq, "There is no more memory to hold it in: close other programs.");
 
-        Volatile.Write(ref _cacheSeq[i], meta.Seq);
-        Interlocked.CompareExchange(ref _pending[RingSlot(meta.Seq)], -1, meta.Seq);
-        Interlocked.Increment(ref _encoded);
-
-        try { _toDisk.Add(meta.Seq); }
-        catch (InvalidOperationException) { return false; }
-
-        return true;
+            return !_stop;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(coded);
+        }
     }
 
     /// <summary>Frames handed to an encoder that stopped before giving them back.</summary>
     private void Abandoned(Meta meta)
     {
-        if (!_stop && Volatile.Read(ref _pending[RingSlot(meta.Seq)]) == meta.Seq) Lose(meta.Seq);
-    }
-
-    private void WriteDisk()
-    {
-        bool said = false;
-
-        try
-        {
-            foreach (long seq in _toDisk.GetConsumingEnumerable())
-            {
-                int i = (int)(seq % _cacheCount);
-
-                try
-                {
-                    RandomAccess.Write(_file.SafeFileHandle, new ReadOnlySpan<byte>(_cache + (long)i * _stride, _stride),
-                                       (long)RingSlot(seq) * _stride);
-                    Volatile.Write(ref _stored[RingSlot(seq)], seq);
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException)
-                {
-                    if (_stop) return;
-
-                    _faulted = true;
-
-                    if (!said)
-                        ActivityLog.Shared.Error(LogSource.TidalLock,
-                            $"DELAY  compressed frames could not be written to {DelayLine.DescribeDisk(_path)}: {ex.Message}",
-                            @event: "delay.overflowfault", file: _path);
-                    said = true;
-                }
-                finally
-                {
-                    Volatile.Write(ref _cacheOnDisk[i], seq);
-                }
-            }
-        }
-        catch (ObjectDisposedException) { }
+        bool waiting;
+        lock (_storeLock) waiting = _pending.Contains(meta.Seq);
+        if (waiting && !_stop) Lose(meta.Seq);
     }
 
     // ------------------------------------------------------------------ out
@@ -456,12 +426,6 @@ internal sealed unsafe class DelayOverflow : IDisposable
         {
             if (_feeder is not null || _stop) return;
 
-            _ahead = (byte*)NativeMemory.AlignedAlloc((nuint)((long)_aheadCount * _stride), Alignment);
-            _decoded = (byte*)NativeMemory.AlignedAlloc((nuint)((long)_decodedCount * _rawStride), Alignment);
-
-            _fetcher = new Thread(Fetch) { IsBackground = true, Name = "tidal overflow read-ahead" };
-            _fetcher.Start();
-
             _feeder = new Thread(Feed) { IsBackground = true, Name = "tidal overflow decode", Priority = ThreadPriority.AboveNormal };
             _feeder.Start();
         }
@@ -469,84 +433,24 @@ internal sealed unsafe class DelayOverflow : IDisposable
 
     private bool Wanted => Environment.TickCount64 - Volatile.Read(ref _wantMs) < IdleMs;
 
-    /// <summary>Compressed frames from the transmitter's place on, into memory, well before it needs them.</summary>
-    private void Fetch()
-    {
-        while (!_stop)
-        {
-            long from = Volatile.Read(ref _want);
-            bool idle = true;
-
-            if (Wanted)
-                for (long s = from; s < from + _aheadCount && !_stop; s++)
-                {
-                    long now = Volatile.Read(ref _want);
-                    if (now < from || now > s) break;                         // moved: start again from there
-
-                    int i = (int)(s % _aheadCount);
-                    if (Volatile.Read(ref _aheadSeq[i]) == s) continue;
-                    if (s > Volatile.Read(ref _lastSubmitted)) break;         // not here yet
-
-                    if (!Has(s) || Volatile.Read(ref _pending[RingSlot(s)]) == s) continue;
-
-                    Volatile.Write(ref _aheadSeq[i], -1);
-                    Interlocked.MemoryBarrier();
-
-                    if (ReadCompressed(s, _ahead + (long)i * _stride))
-                    {
-                        Volatile.Write(ref _aheadSeq[i], s);
-                        idle = false;
-                    }
-                }
-
-            if (idle) Thread.Sleep(15);
-        }
-    }
-
-    /// <summary>One compressed frame: from the write cache if it is still there, otherwise off the disk.</summary>
-    private bool ReadCompressed(long seq, byte* into)
-    {
-        int c = (int)(seq % _cacheCount);
-
-        if (_cache is not null && Volatile.Read(ref _cacheSeq[c]) == seq)
-        {
-            Buffer.MemoryCopy(_cache + (long)c * _stride, into, _stride, _stride);
-            Interlocked.MemoryBarrier();
-            if (Volatile.Read(ref _cacheSeq[c]) == seq) return true;
-        }
-
-        int slot = RingSlot(seq);
-        if (Volatile.Read(ref _stored[slot]) != seq) return false;
-
-        try
-        {
-            if (RandomAccess.Read(_file.SafeFileHandle, new Span<byte>(into, _stride), (long)slot * _stride) < _stride)
-                return false;
-        }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException or UnauthorizedAccessException)
-        {
-            return false;
-        }
-
-        Interlocked.MemoryBarrier();
-        return Volatile.Read(ref _stored[slot]) == seq && *(long*)(into + OffSequence) == seq;
-    }
-
-    /// <summary>Keeps the decoder a couple of seconds ahead of the transmitter.</summary>
+    /// <summary>Keeps the decoder a second ahead of the transmitter.</summary>
     private void Feed()
     {
         Coder? decoder = null;
         long next = -1, retryAt = 0;
+        var coded = new byte[DnxFrameBytes];
 
         while (!_stop)
         {
             long want = Volatile.Read(ref _want);
 
+            // Nobody reading: the decoder closed, and its buffers given back.
             if (!Wanted)
             {
                 decoder?.Dispose();
                 decoder = null;
                 next = -1;
+                FreeDecoded();
                 Thread.Sleep(50);
                 continue;
             }
@@ -570,9 +474,24 @@ internal sealed unsafe class DelayOverflow : IDisposable
                 continue;
             }
 
-            int i = (int)(next % _aheadCount);
+            Meta meta = default;
+            bool found = false;
 
-            if (Volatile.Read(ref _aheadSeq[i]) != next)
+            lock (_storeLock)
+            {
+                byte* slot = Find(next);
+
+                if (slot is not null)
+                {
+                    var sound = new byte[Math.Clamp(*(int*)(slot + OffAudioBytes), 0, _audioCapacity)];
+                    Marshal.Copy((nint)(slot + HeaderBytes + DnxFrameBytes), sound, 0, sound.Length);
+                    Marshal.Copy((nint)(slot + HeaderBytes), coded, 0, DnxFrameBytes);
+                    meta = new Meta(next, *(long*)(slot + OffRecordingFrame), *(int*)(slot + OffFlags), sound);
+                    found = true;
+                }
+            }
+
+            if (!found)
             {
                 // Never coming: go on to the next. On its way: wait for it.
                 if (next <= Volatile.Read(ref _lastSubmitted) && !Has(next)) next++;
@@ -582,6 +501,10 @@ internal sealed unsafe class DelayOverflow : IDisposable
 
             if (decoder is null)
             {
+                lock (_decodedLock)
+                    if (_decoded is null)
+                        _decoded = (byte*)NativeMemory.AlignedAlloc((nuint)((long)_decodedCount * _rawStride), Alignment);
+
                 try { decoder = Coder.Start(_ffmpeg, DecoderArguments(_format), "overflow decoder", Decoding, _ => { }); }
                 catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
                 {
@@ -591,33 +514,27 @@ internal sealed unsafe class DelayOverflow : IDisposable
                 }
             }
 
-            byte* slot = _ahead + (long)i * _stride;
-            var sound = new byte[Math.Clamp(*(int*)(slot + OffAudioBytes), 0, _audioCapacity)];
-            Marshal.Copy((nint)(slot + HeaderBytes + DnxFrameBytes), sound, 0, sound.Length);
-            var meta = new Meta(next, *(long*)(slot + OffRecordingFrame), *(int*)(slot + OffFlags), sound);
-
-            // The fetcher could have moved on and be reading another frame over this one.
-            if (Volatile.Read(ref _aheadSeq[i]) != next) continue;
-
-            decoder.Put(meta, slot + HeaderBytes, DnxFrameBytes);
-
-            // The same, after: what the decoder was given may then be two frames' halves. It cannot be
-            // taken back, so start it again.
-            if (Volatile.Read(ref _aheadSeq[i]) != next)
-            {
-                decoder.Dispose();
-                decoder = null;
-                next = -1;
-                continue;
-            }
-
+            fixed (byte* p = coded) decoder.Put(meta, p, DnxFrameBytes);
             next++;
         }
 
         decoder?.Dispose();
+        FreeDecoded();
     }
 
-    /// <summary>One decoded picture out of the decoder. On its thread.</summary>
+    private void FreeDecoded()
+    {
+        lock (_decodedLock)
+        {
+            if (_decoded is null) return;
+
+            Array.Fill(_decodedSeq, -1L);
+            NativeMemory.AlignedFree(_decoded);
+            _decoded = null;
+        }
+    }
+
+    /// <summary>One decoded picture out of the decoder. On its thread, which is joined before its buffers are freed.</summary>
     private bool Decoding(Meta meta, Stream output)
     {
         int i = (int)(meta.Seq % _decodedCount);
@@ -814,7 +731,9 @@ internal sealed unsafe class DelayOverflow : IDisposable
             _alive = false;
             Kill();
 
-            if (Thread.CurrentThread != _reader && _reader.IsAlive) _reader.Join(TimeSpan.FromSeconds(3));
+            // It is in a read of a process that has just been ended, so this is moments - and its buffers
+            // are given back after, so it has to have gone.
+            if (Thread.CurrentThread != _reader && _reader.IsAlive) _reader.Join();
 
             try { _in.Dispose(); } catch (IOException) { }
             _process.Dispose();
@@ -952,25 +871,13 @@ internal sealed unsafe class DelayOverflow : IDisposable
     {
         Stop();
         _gauge.Dispose();
+        _feeder?.Join(TimeSpan.FromSeconds(10));
 
-        _feeder?.Join(TimeSpan.FromSeconds(5));
-        _fetcher?.Join(TimeSpan.FromSeconds(15));
-
-        try { _toDisk.CompleteAdding(); } catch (ObjectDisposedException) { }
-        bool written = _diskWriter is null || _diskWriter.Join(TimeSpan.FromSeconds(15));
-
-        _file.Dispose();
-        try { File.Delete(_path); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
-
-        // Left to the process to give back if a thread is still in it: a leak is better than a crash.
-        if (written && _cache is not null) NativeMemory.AlignedFree(_cache);
-        if (_fetcher is null or { IsAlive: false })
+        lock (_storeLock)
         {
-            if (_feeder is null or { IsAlive: false })
-            {
-                if (_ahead is not null) NativeMemory.AlignedFree(_ahead);
-                if (_decoded is not null) NativeMemory.AlignedFree(_decoded);
-            }
+            foreach (Chunk chunk in _chunks.Values) Free(chunk);
+            _chunks.Clear();
+            _pending.Clear();
         }
     }
 }

@@ -85,9 +85,8 @@ public sealed class DelayFrameBuffer
 /// memory for its delay. When it does not, the ring is the file, and the log says so.
 ///
 /// <b>Inserts.</b> An insert makes the delay longer for the rest of the transmission, not only while
-/// it plays. Past the end of RAM the frames it holds back are compressed (DelayOverflow), a seventh of the
-/// size, so the drive can take them; without that, an insert that would not fit is refused
-/// (<see cref="RoomFrames"/>).
+/// it plays. What it adds is compressed (DelayOverflow), a seventh of the size, in memory taken as it is
+/// needed and given back; without that, an insert that would not fit is refused (<see cref="RoomFrames"/>).
 ///
 /// <b>Why it trims what it has written.</b> Left to decide, the operating system keeps all of it:
 /// a ready line nothing is reading sat at 41 GB of working set, for frames nobody may ever ask
@@ -364,10 +363,39 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// insert it has grown by. Held in RAM, as far as memory reaches without a frame being written
     /// out; on disk, the ring's length less its guard.
     /// </summary>
-    public long RoomFrames =>
-        _ramSlots > 0 && _ramSlots < SlotCount && !OverflowReady
-            ? MemoryRoomFrames
-            : Math.Max(0, SlotCount - GuardFramesFor(FrameRate));
+    public long RoomFrames
+    {
+        get
+        {
+            long ring = Math.Max(0, SlotCount - GuardFramesFor(FrameRate));
+
+            if (_ramSlots <= 0 || _ramSlots >= SlotCount) return ring;
+            if (!OverflowReady) return MemoryRoomFrames;
+
+            // What is kept raw, and as much again as memory could hold compressed just now.
+            return Math.Min(ring, MemoryRoomFrames + _overflow!.RoomFrames);
+        }
+    }
+
+    /// <summary>Memory to ask for so that a delay of this much is held with nothing to spare: the delay and the guard.</summary>
+    public static TimeSpan MemoryFor(TimeSpan delay) => delay + TimeSpan.FromSeconds(MemoryGuardSeconds);
+
+    /// <summary>
+    /// Whether a line of this format can grow past the memory kept for it (see DelayOverflow), trying it out
+    /// the first time, which is well under a second. If not, it needs its insert room in memory from the start.
+    /// </summary>
+    public static bool CanGrow(string? ffmpeg, CaptureFormat format, TimeSpan most)
+    {
+        if (ffmpeg is null || !DelayOverflow.Supports(format)) return false;
+
+        Task<string?> probe = DelayOverflow.Probe(ffmpeg, format);
+
+        try { return probe.Wait(most) && probe.Result is null; }
+        catch (AggregateException) { return false; }
+    }
+
+    /// <summary>Memory taken just now for what inserts have added to the delay.</summary>
+    public long GrownBytes => _overflow?.Bytes ?? 0;
 
     /// <summary>
     /// How far behind the recorder a transmitter may be with every frame still raw and in memory - as far
@@ -416,34 +444,15 @@ public sealed class DelayLine : IDelayLine, IDisposable
             return;
         }
 
-        string folder = System.IO.Path.GetDirectoryName(Path) ?? ".";
-        long free = FreeBytes(folder);
-
-        if (free >= 0 && free < DelayOverflow.DiskFor(Format, SlotCount))
-        {
-            NoOverflow($"it needs {Describe(DelayOverflow.DiskFor(Format, SlotCount))} free on {Disk}, and {Describe(free)} is");
-            return;
-        }
-
-        try
-        {
-            string path = System.IO.Path.Combine(folder, System.IO.Path.GetFileNameWithoutExtension(Path) + "-over.ring");
-            _overflow = new DelayOverflow(this, path, ffmpeg, Format, SlotCount, _stride);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            NoOverflow(ex.Message);
-            return;
-        }
-
+        _overflow = new DelayOverflow(this, Path, ffmpeg, Format, _stride);
         _overflowProbe = DelayOverflow.Probe(ffmpeg, Format);
         _overflowProbe.ContinueWith(t =>
         {
             if (t.Result is { } why) NoOverflow(why);
             else
                 ActivityLog.Shared.Info(LogSource.TidalLock,
-                    $"DELAY  inserts may grow the delay to {Describe(TimeSpan.FromSeconds(RoomFrames / (double)Math.Max(1, FrameRate)))}: past the " +
-                    $"{Describe(TimeSpan.FromSeconds(MemoryRoomFrames / (double)Math.Max(1, FrameRate)))} memory holds, it is compressed (DNxHD) to {Disk}.",
+                    $"DELAY  inserts may grow the delay to {Describe(TimeSpan.FromSeconds(RoomFrames / (double)Math.Max(1, FrameRate)))}, taking about " +
+                    $"{DelayOverflow.StrideFor(Format) * (double)FrameRate / 1e6:F0} MB of memory for each second they add.",
                     @event: "delay.overflowready", file: Path);
         }, TaskScheduler.Default);
 
@@ -505,7 +514,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
                     else if (lose) _overflow!.Lose(seq);
                 }
 
-                _overflow!.CloseIfIdle();
+                _overflow!.Tidy(KeepFloor(Volatile.Read(ref _written)));
             }
         }
         catch (Exception ex)
@@ -1694,7 +1703,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
         ActivityLog.Shared.Info(LogSource.TidalLock,
             $"DELAY  the newest {Describe(held)} of the ring is held in RAM ({Describe(slots * _stride)})" +
             (slots < wanted
-                ? $", of the {Describe(TimeSpan.FromSeconds(wanted / (double)rate))} asked for - all that memory can spare"
+                ? $", of the {Describe(TimeSpan.FromSeconds(wanted / (double)rate))} asked for - all that memory could spare"
                 : "") +
             $". {Describe(Math.Max(0, AvailablePhysical()))} of memory was free.",
             @event: "delay.memory", file: Path);
@@ -1871,7 +1880,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
                 @event: "delay.spilling", file: Path);
     }
 
-    private static unsafe long AvailablePhysical()
+    internal static unsafe long AvailablePhysical()
     {
         var status = new MemoryStatusEx { Length = (uint)sizeof(MemoryStatusEx) };
         return GlobalMemoryStatusEx(ref status) ? (long)status.AvailPhys : 0;

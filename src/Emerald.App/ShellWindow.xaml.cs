@@ -1319,7 +1319,7 @@ public partial class ShellWindow : Window
         try
         {
             _delayLine = DelayLine.Create(App.TidalLockRingFolder(_settings), format, TidalLock.Shared.Delay,
-                                          TimeSpan.Zero, DelayInMemory(TidalLock.Shared.Delay, TimeSpan.Zero));
+                                          TimeSpan.Zero, TidalLock.Shared.Delay + TimeSpan.FromSeconds(10));
         }
         catch (DelayLineException ex)
         {
@@ -1447,13 +1447,13 @@ public partial class ShellWindow : Window
         {
             try
             {
-                // In RAM: what a transmitter could start from, and as much insert room as memory allows.
-                // Only the first has to fit - the line's whole length is the delay and every insert.
+                // In RAM: what a transmitter could start from. The line's whole length is the delay and
+                // every insert, and is not.
                 TimeSpan keep = TimeSpan.FromSeconds(ReadyKeepFrames(1));
                 if (keep > size) keep = size;
 
                 _readyLine = DelayLine.Create(App.TidalLockRingFolder(_settings), format, size, TimeSpan.Zero,
-                                              DelayInMemory(keep, TimeSpan.FromSeconds(Math.Max(0, _settings.LiveHeadroomSeconds))),
+                                              DelayInMemory(keep, TimeSpan.FromSeconds(Math.Max(0, _settings.LiveHeadroomSeconds)), format),
                                               required: keep, ffmpeg: Ffmpeg.Locate(_settings.FfmpegPath));
                 break;
             }
@@ -1504,12 +1504,14 @@ public partial class ShellWindow : Window
     }
 
     /// <summary>
-    /// How much of a line to ask for in RAM: the delay, the insert room it may grow into, and ten seconds
-    /// more. DelayLine gives what memory can spare - about 147 s of 1080p25 on 32 GB. What inserts push past
-    /// that is compressed; if it cannot be, the insert room is cut to match (FitRoom).
+    /// How much of a line to ask for in RAM: the delay and its guard, 12.4 GB for 120 s of 1080p25, since raw
+    /// frames are 104 MB a second. What inserts add is taken as they need it, compressed (see DelayOverflow).
+    /// Where it cannot be, the insert room has to be asked for up front, as much as memory can spare.
     /// </summary>
-    private static TimeSpan DelayInMemory(TimeSpan delay, TimeSpan headroom) =>
-        delay + headroom + TimeSpan.FromSeconds(10);
+    private TimeSpan DelayInMemory(TimeSpan delay, TimeSpan headroom, CaptureFormat format) =>
+        DelayLine.CanGrow(Ffmpeg.Locate(_settings.FfmpegPath), format, TimeSpan.FromSeconds(4))
+            ? DelayLine.MemoryFor(delay)
+            : delay + headroom + TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// Cuts Go Live's insert room to what its line really has, so Live Edit refuses an insert that would
@@ -1729,7 +1731,7 @@ public partial class ShellWindow : Window
         {
             line = DelayLine.Create(App.TidalLockRingFolder(_settings), format,
                                     LiveAir.Shared.Delay, LiveAir.Shared.Headroom,
-                                    DelayInMemory(LiveAir.Shared.Delay, LiveAir.Shared.Headroom),
+                                    DelayInMemory(LiveAir.Shared.Delay, LiveAir.Shared.Headroom, format),
                                     required: LiveAir.Shared.Delay, ffmpeg: Ffmpeg.Locate(_settings.FfmpegPath));
         }
         catch (DelayLineException ex)

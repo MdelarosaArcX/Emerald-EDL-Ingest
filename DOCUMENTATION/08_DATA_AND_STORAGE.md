@@ -257,10 +257,19 @@ The EDL window's own capture folder box is unchanged: one folder, `high` and `lo
 
 **The delay is held in RAM, and on disk only when RAM cannot hold it** (`DelayLine.Create`, decided once as the line opens; a delay on air is never moved).
 
-- **In RAM**, when memory can hold the delay and a 5 s guard. The line asks for the delay, the insert room and 10 s more, and gets what free physical memory can spare after a 6 GB reserve (`delay.memory` says how much). 1080p25 is 104.5 MB/s: about 13 GB for 120 s, about 41 GB for 120 s and 300 s of inserts. The RAM is locked where Windows allows it (`delay.memoryunlocked` if not). Nothing goes to the disk. The file is still made, sparse and empty, and its drive needs 4 GB free.
+- **In RAM**, when memory can hold the delay and a 7 s guard, leaving 6 GB free. Raw 1080p25 is 104.5 MB/s, so 120 s is 12.4 GB; that and no more is taken (`delay.memory`). The RAM is locked where Windows allows it (`delay.memoryunlocked` if not). Nothing goes to the disk. The file is still made, sparse and empty, and its drive needs 4 GB free.
 - **On disk** (`DelayLine.IsDirect`, `delay.ondisk`), in the delay path (`tidalLockRingFolder`), when memory cannot hold the delay or another line has it. Read and written directly, past the Windows cache, with a 3 s write queue and 3 s read ahead of the transmitter. A drive that stalls for longer than that loses frames.
 
-**Insert room is what RAM holds** (`DelayLine.RoomFrames`). An insert makes the delay longer for the rest of the transmission. Past the end of RAM, every later frame would be written to the disk and read back, so Go Live's insert room is cut to fit (`delay.insertroom`), Live Edit refuses an insert that does not fit, and the transmitter does not play one placed before going live (`liveair.cue.refused`). On 32 GB a 120 s delay leaves about 20 s in all, and a 60 s delay about 80 s. 64 GB holds 120 s and the full 300 s.
+**Inserts take memory as they need it** (`DelayOverflow`). An insert makes the delay longer for the rest of the transmission. The part it adds is compressed to DNxHD 145 as it leaves the raw ring, kept in memory taken a second at a time (about 16 MB for each second of insert), decoded a second ahead of air, and given back when air has passed it or the transmission ends. The delay itself stays raw and untouched until an insert is placed; from then on the recording goes to air through that one compression.
+
+| Inserts in all | Extra memory, about |
+|---|---|
+| none | nothing |
+| 34 s | 0.7 GB |
+| 1:49 | 1.9 GB |
+| 5 min | 5 GB |
+
+(Plus about 0.1 GB of decoded frames, and two ffmpeg processes, while any is in use.) An insert is refused when taking it would leave less than 3 GB free (`DelayLine.RoomFrames`, asked as the insert is placed and again as air reaches it: `liveair.cue.refused`). If memory runs out regardless, below 1.5 GB free, frames are lost rather than the machine made to page (`delay.overflowlost`), and air holds the picture before each. The encoder and decoder are tried out as the recording starts; where they do not work (`delay.overflowoff`), the line asks for its insert room in memory up front, as before, and longer inserts are refused.
 
 **Measured on this plant** (`delay.dropped` totals and `resource_disk`, delay on D:, a Crucial BX500 500 GB):
 

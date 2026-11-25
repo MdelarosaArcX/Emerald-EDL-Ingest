@@ -396,7 +396,7 @@ These work in the go-to box. The Place and Bookmarks boxes use the same rules, b
 | Board | Boards that have a TX port |
 | TX ports | Tick the ports to send on. A port another transmission holds is greyed out, with its user named. |
 | Delay | No delay, 30 s, 1, 2, 5 or 10 min, **from first segment**, or **when first segment is ready**. The last two settle the delay from how much is recorded when the deck hands over. |
-| Insert room | How much the delay may grow from inserts: none to 30 min. This is what is asked for. The delay is held in RAM, so what you get is cut to what memory can hold: about 20 s behind a 120 s delay on 32 GB. The log says so (`delay.insertroom`) and the delay readout's tooltip shows what is left. |
+| Insert room | How much the delay may grow from inserts: none to 30 min. Nothing is taken for it until an insert is placed; each second of insert then takes about 16 MB of memory for the rest of the show. The delay readout's tooltip shows the room left and the memory in use. |
 | Summary | The delay, the most it can grow to, about how much disk the buffer needs, and the ports |
 | **Cancel** / **Go Live** | Go Live needs a board and at least one port, and saves these choices for next time |
 
@@ -487,7 +487,7 @@ The lower list is Live Edit's part of the application log. **Clear** empties thi
 | Message | What to do |
 |---|---|
 | `NO EDIT ZONE - ...` | Work further ahead of the on-air mark. |
-| `That insert is ... long and there is room for ...` | Remove an insert air has not reached yet, use Overlay or Replace instead, or go live again with a shorter delay. Deleting a scene makes no room: it goes out as black for its own length. |
+| `That insert is ... long and there is room for ...` | Either the insert room chosen is used up, or taking it would leave less than 3 GB of memory free. Close other programs, remove an insert air has not reached yet, use Overlay or Replace instead, or go live again with a shorter delay. Deleting a scene makes no room: it goes out as black for its own length. |
 | `The inserts on the timeline would make the delay ...` | Inserts placed before Go Live add up to more than there is room for. The ones that do not fit are not played (REFUSED in the logs window) and the recording carries on. |
 | `PLAYBACK REFUSED THE EDL - version ...` | Undo the change. See B1 under [Known issues](#known-issues). |
 | `Click the audio lane to pick up a piece of sound first` | Click the AUDIO lane, then adjust. |
