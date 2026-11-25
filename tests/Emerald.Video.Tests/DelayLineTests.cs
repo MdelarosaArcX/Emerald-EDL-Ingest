@@ -216,6 +216,43 @@ public sealed class DelayLineTests : IDisposable
         Assert.Equal(audio, buffer.Audio.AsSpan(0, bytes).ToArray());
     }
 
+    /// <summary>Every pair an SDI signal carries, with a few samples more than a frame, and how many there were.</summary>
+    [Theory]
+    [InlineData(2)]
+    [InlineData(8)]
+    [InlineData(16)]
+    public void Every_recorded_channel_goes_through_whole(int channels)
+    {
+        using DelayLine line = Open();
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        var audio = new byte[(48000 / Tiny.FrameRate + 2) * channels * 2];
+        for (int i = 0; i < audio.Length; i++) audio[i] = (byte)(i % 251);
+
+        byte[] frame = Pattern(line.FrameBytes, 0);
+        line.Write(frame, frame.Length, audio, audio.Length, audioReal: true, audioChannels: channels);
+
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(0, buffer));
+        Assert.Equal(channels, buffer.AudioChannels);
+        Assert.Equal(channels, line.AudioChannels);
+        Assert.True(buffer.AudioWasReal);
+        Assert.Equal(audio, buffer.Audio.AsSpan(0, buffer.AudioBytes).ToArray());
+    }
+
+    [Fact]
+    public void Sound_that_does_not_fit_is_cut_between_samples()
+    {
+        using DelayLine line = Open();
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        var audio = new byte[DelayLine.AudioCapacityFor(Tiny.FrameRate) * 2 / 12 * 12];
+        byte[] frame = Pattern(line.FrameBytes, 0);
+        line.Write(frame, frame.Length, audio, audio.Length, true, audioChannels: 6);
+
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(0, buffer));
+        Assert.Equal(0, buffer.AudioBytes % 12);
+    }
+
     [Fact]
     public void Audio_longer_than_the_slot_is_clamped_rather_than_overrunning()
     {

@@ -327,6 +327,8 @@ public partial class App : Application
         // recording disk every time Live Edit shows them.
         Emerald.Media.Waveform.CacheFolder = System.IO.Path.Combine(
             Database is null ? AppSettings.DefaultDataFolder : System.IO.Path.GetDirectoryName(Database.Path)!, "peaks");
+        Emerald.Media.TrackCopy.Folder = System.IO.Path.Combine(
+            System.IO.Path.GetDirectoryName(Emerald.Media.Waveform.CacheFolder)!, "tracks");
         _ = Task.Run(() => Emerald.Media.Waveform.SweepCache(Math.Max(30, Settings.LogRetentionDays)));
 
         DispatcherUnhandledException += (_, e) =>

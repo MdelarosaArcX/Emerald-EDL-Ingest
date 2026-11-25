@@ -185,7 +185,8 @@ public partial class LiveEditWindow
         try
         {
             tx = new LiveAirTransmitter(air.BoardIndex, air.Ports, line, air.Delay, ffmpeg, LiveAir.Shared.CuesForAir,
-                                        () => LiveAir.Shared.AudioEdits);
+                                        () => LiveAir.Shared.AudioEdits,
+                                        () => LiveAir.Shared.AudioSwitches);
         }
         catch (DelayLineException ex)
         {
@@ -281,10 +282,11 @@ public partial class LiveEditWindow
     /// a new version, as a conform when an edit has reached the no edit zone. Called on every edit,
     /// undo and redo. <paramref name="why"/> goes into the log.
     /// </summary>
-    private void PushCues(string why = "timeline changed")
+    /// <returns>False when playback refused it.</returns>
+    private bool PushCues(string why = "timeline changed")
     {
         _edl.Sync(EdlEdits(), why);
-        SendEdl(EdlSubmissionKind.Update, why);
+        return SendEdl(EdlSubmissionKind.Update, why);
     }
 
     // ------------------------------------------------------------------ the EDL and its log
@@ -293,22 +295,31 @@ public partial class LiveEditWindow
     private readonly EdlLedger _edl = new(EdlLogger.Shared);
 
     /// <summary>
+    /// What the recording on air counts from and at what rate - known already, or found out now:
+    /// the transmitter may be the playback deck's, or this window opened after it started.
+    /// </summary>
+    private bool KnowsLive()
+    {
+        _liveStartedAt ??= LiveAir.Shared.RecordingStartedAt ?? PipelineState.Shared.RecordingStartedAt;
+
+        if (LiveAir.Shared.Line is { FrameRate: > 0 } line) _liveRate = line.FrameRate;
+
+        return _liveStartedAt is not null;
+    }
+
+    /// <summary>
     /// Sends the EDL as it stands to playback, if Live Edit is live: the cues in the recording's
     /// own frames, which is the number every frame in the delay carries.
     /// </summary>
-    private void SendEdl(EdlSubmissionKind kind, string why)
+    /// <returns>False when playback refused it; true when it took it, or there is nothing on air to.</returns>
+    private bool SendEdl(EdlSubmissionKind kind, string why)
     {
         // Only once there is a transmitter to pick it up: armed and waiting for the recorder
         // there is none, and a revision sent then would be reported unacknowledged. Going live
         // sends the EDL as the transmitter starts.
-        if (!LiveAir.Shared.Active) return;
+        if (!LiveAir.Shared.Active) return true;
 
-        _liveStartedAt ??= LiveAir.Shared.RecordingStartedAt ?? PipelineState.Shared.RecordingStartedAt;
-
-        // Also when the transmitter is the playback deck's, or this window opened after it started.
-        if (LiveAir.Shared.Line is { FrameRate: > 0 } line) _liveRate = line.FrameRate;
-
-        if (_liveStartedAt is null) return;
+        if (!KnowsLive()) return true;
 
         var cues = new List<LiveCue>();
 
@@ -332,13 +343,26 @@ public partial class LiveEditWindow
             .Select(e => new AudioEdit(DayToRecording(e.StartFrame), ToRecording(e.Frames), e.GainDb))
             .ToList();
 
-        EdlReceipt receipt = _edl.Send(LiveAir.Shared, kind, cues, levels, ConformZone(), DateTime.UtcNow, why);
+        IReadOnlyList<AudioSwitch> tracks = _audioSwitches
+            .Select(s => new AudioSwitch(DayToRecording(s.StartFrame), s.Track))
+            .ToList();
 
-        if (!receipt.Taken && receipt.Verdict is not (EdlVerdict.NotLive or EdlVerdict.Stale))
+        // What has aired stays as air has it; what is wanted here holds from the first frame that
+        // can still be changed.
+        if (LiveAir.Shared.CommittedFrame is { } committed)
+            tracks = AudioSwitches.From(committed + AudioLead, LiveAir.Shared.AudioSwitches, tracks);
+
+        EdlReceipt receipt = _edl.Send(LiveAir.Shared, kind, cues, levels, ConformZone(), DateTime.UtcNow, why, tracks);
+
+        bool refused = !receipt.Taken && receipt.Verdict is not (EdlVerdict.NotLive or EdlVerdict.Stale);
+
+        if (refused)
             Refuse($"PLAYBACK REFUSED THE EDL - version {receipt.Version}: {receipt.Reason} " +
                    $"Air stays on version {_edl.AcknowledgedVersion}. Undo the change, or edit further ahead.");
 
         ShowEdlState();
+
+        return !refused;
     }
 
     /// <summary>

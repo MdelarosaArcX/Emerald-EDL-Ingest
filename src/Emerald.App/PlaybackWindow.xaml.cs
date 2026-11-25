@@ -765,7 +765,8 @@ public partial class PlaybackWindow : Window
             // from LiveAir every frame, so an edit made in Live Edit reaches air while this runs.
             _delayTx = new LiveAirTransmitter(lockState.BoardIndex, ports, line, lockState.Delay,
                                               _playout!.FfmpegPath!, LiveAir.Shared.CuesForAir,
-                                              () => LiveAir.Shared.AudioEdits);
+                                              () => LiveAir.Shared.AudioEdits,
+                                              () => LiveAir.Shared.AudioSwitches);
         }
         catch (DelayLineException ex)
         {

@@ -53,7 +53,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="286"/>
+            <RowDefinition x:Name="TimelineRow" Height="286"/>
         </Grid.RowDefinitions>
 
         <!-- In the spacer column, filling it, so the whole gap between the two is the handle
@@ -722,7 +722,7 @@
                     <RowDefinition x:Name="IngestRow" Height="0"/>
                     <RowDefinition Height="*"/>
                     <RowDefinition x:Name="IngestAudioRow" Height="0"/>
-                    <RowDefinition Height="*"/>
+                    <RowDefinition x:Name="AudioRow" Height="*"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
@@ -778,16 +778,21 @@
                      The recording's own sound, under its picture. C cuts it at the playhead; a
                      click picks up the piece of the segment under it, between cuts (or the marked
                      range), which [ and ] make quieter and louder. Delete Scene takes the sound
-                     out with the picture. -->
+                     out with the picture.
+
+                     A recording with several sound tracks has a lane for each inside this one. A
+                     click on a lane's name, or a double click in it, chooses that track and asks
+                     whether it plays instantly or from a timecode. -->
                 <Canvas x:Name="AudioCanvas" Grid.Row="4" ClipToBounds="True"
                         Background="#0E1512"
                         SizeChanged="Timeline_SizeChanged"
                         MouseLeftButtonDown="Audio_Click"
+                        MouseRightButtonDown="Audio_RightClick"
                         MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
                         MouseLeave="Pan_Leave"
-                        ToolTip="The recording's sound. Click a segment to pick up its sound; C cuts at the playhead; [ ] level. Delete Scene takes out the sound with the picture."/>
+                        ToolTip="The recording's sound, a lane for each track. Click a lane's name, or double-click in it, to choose which plays. Right-click a change to take it off. Click a segment to pick up its sound; C cuts at the playhead; [ ] level. Delete Scene takes out the sound with the picture."/>
 
-                <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Left"
+                <StackPanel x:Name="AudioButtons" Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Left"
                             VerticalAlignment="Top" Margin="48,3,0,0">
                     <Button Content="&#9986; Cut" Style="{StaticResource GhostButton}" Height="20"
                             Padding="6,0" FontSize="10" Click="CutAudio_Click"

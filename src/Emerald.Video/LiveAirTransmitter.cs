@@ -40,6 +40,8 @@ public sealed class LiveAirTransmitter : IDisposable
     private readonly string _ffmpegPath;
     private readonly Func<IReadOnlyList<LiveCue>> _cues;
     private readonly Func<IReadOnlyList<AudioEdit>> _audioEdits;
+    private readonly Func<IReadOnlyList<AudioSwitch>> _audioSwitches;
+    private readonly RecordingSound _sound = new();
 
     private Thread? _worker;
     private CancellationTokenSource? _cts;
@@ -66,9 +68,11 @@ public sealed class LiveAirTransmitter : IDisposable
     /// Read every frame for the levels set on the recording's own sound. Not the cues' media:
     /// that plays at its own level.
     /// </param>
+    /// <param name="audioSwitches">Read every frame for which of the recording's sound tracks plays.</param>
     public LiveAirTransmitter(uint boardIndex, IReadOnlyList<int> txChannels, DelayLine line, TimeSpan delay,
                               string ffmpegPath, Func<IReadOnlyList<LiveCue>> cues,
-                              Func<IReadOnlyList<AudioEdit>>? audioEdits = null)
+                              Func<IReadOnlyList<AudioEdit>>? audioEdits = null,
+                              Func<IReadOnlyList<AudioSwitch>>? audioSwitches = null)
     {
         if (txChannels.Count == 0)
             throw new DelayLineException("No TX port was chosen to go live on.");
@@ -83,6 +87,7 @@ public sealed class LiveAirTransmitter : IDisposable
         _ffmpegPath = ffmpegPath;
         _cues = cues;
         _audioEdits = audioEdits ?? (() => Array.Empty<AudioEdit>());
+        _audioSwitches = audioSwitches ?? (() => Array.Empty<AudioSwitch>());
         // Its own delay, not the line's size - the capture deck's line can hold far more.
         _target = (long)Math.Ceiling(Math.Max(0, delay.TotalSeconds) * _format.FrameRate);
 
@@ -689,59 +694,18 @@ public sealed class LiveAirTransmitter : IDisposable
 
     // ------------------------------------------------------------------ audio
 
-    private short[] _left = Array.Empty<short>();
-    private short[] _right = Array.Empty<short>();
-    private readonly List<short[]> _channels = new(2) { Array.Empty<short>(), Array.Empty<short>() };
-
-    /// <summary>The level the last frame ended at, so the next one starts from it.</summary>
-    private double _gain = 1;
-
     /// <summary>
-    /// The recording's stereo, split into the two mono channels the card embeds, at whatever level
-    /// Live Edit has set on this frame.
-    ///
-    /// A change of level is ramped across the frame rather than made at its first sample: a step
-    /// from full to nothing between two samples is a click on air.
+    /// A recording frame with the sound of the track chosen for it, at the level set on it.
+    /// See <see cref="RecordingSound"/>.
     /// </summary>
-    private bool PushWithAudio(ISdiOutput output, DelayFrameBuffer frame)
-    {
-        int samples = frame.AudioBytes / 4;
+    private bool PushWithAudio(ISdiOutput output, DelayFrameBuffer frame) =>
+        _sound.Frame(frame.Audio, frame.AudioBytes, frame.AudioChannels, Track(frame), Level(frame)) is { } channels
+            ? output.PushFrame(frame.Video, channels)
+            : output.PushFrame(frame.Video);
 
-        double from = _gain;
-        double to = AudioEdits.Linear(AudioEdits.GainDbAt(frame.RecordingFrame, _audioEdits()));
-        _gain = to;
+    private int Track(DelayFrameBuffer frame) => AudioSwitches.TrackAt(frame.RecordingFrame, _audioSwitches());
 
-        if (samples <= 0) return output.PushFrame(frame.Video);
-
-        if (_left.Length != samples)
-        {
-            _left = new short[samples];
-            _right = new short[samples];
-            _channels[0] = _left;
-            _channels[1] = _right;
-        }
-
-        byte[] audio = frame.Audio;
-
-        for (int i = 0; i < samples; i++)
-        {
-            int o = i * 4;
-            _left[i] = (short)(audio[o] | (audio[o + 1] << 8));
-            _right[i] = (short)(audio[o + 2] | (audio[o + 3] << 8));
-        }
-
-        if (from != 1 || to != 1)
-        {
-            for (int i = 0; i < samples; i++)
-            {
-                double gain = from + (to - from) * (i + 1) / samples;
-                _left[i] = (short)Math.Clamp(Math.Round(_left[i] * gain), short.MinValue, short.MaxValue);
-                _right[i] = (short)Math.Clamp(Math.Round(_right[i] * gain), short.MinValue, short.MaxValue);
-            }
-        }
-
-        return output.PushFrame(frame.Video, _channels);
-    }
+    private double Level(DelayFrameBuffer frame) => AudioEdits.GainDbAt(frame.RecordingFrame, _audioEdits());
 
     /// <summary>
     /// A frame of a deleted scene: black picture, and silence on every channel for the same frame's
@@ -752,7 +716,7 @@ public sealed class LiveAirTransmitter : IDisposable
     {
         Array.Clear(left);
         Array.Clear(right);
-        _gain = 0;
+        _sound.Silenced();
 
         return output.PushFrame(black, channels);
     }
@@ -777,18 +741,7 @@ public sealed class LiveAirTransmitter : IDisposable
 
         if (under is not { } frame) return;
 
-        int samples = Math.Min(left.Length, frame.AudioBytes / 4);
-        byte[] audio = frame.Audio;
-
-        for (int i = 0; i < samples; i++)
-        {
-            int o = i * 4;
-            left[i] = (short)(audio[o] | (audio[o + 1] << 8));
-            right[i] = (short)(audio[o + 2] | (audio[o + 3] << 8));
-        }
-
-        double gain = AudioEdits.Linear(AudioEdits.GainDbAt(frame.RecordingFrame, _audioEdits()));
-        if (gain != 1) Scale(left, right, samples, gain);
+        RecordingSound.Read(frame.Audio, frame.AudioBytes, frame.AudioChannels, Track(frame), Level(frame), left, right);
     }
 
     private static void Scale(short[] left, short[] right, int samples, double gain)

@@ -47,6 +47,10 @@ public sealed class DelayFrameBuffer
     public byte[] Audio { get; }
     public int VideoBytes { get; internal set; }
     public int AudioBytes { get; internal set; }
+
+    /// <summary>Channels interleaved in <see cref="Audio"/>: two for every pair the recording carries.</summary>
+    public int AudioChannels { get; internal set; } = 2;
+
     public long Sequence { get; internal set; } = -1;
 
     /// <summary>
@@ -120,6 +124,15 @@ public sealed class DelayLine : IDelayLine, IDisposable
     // reads as zeros - sequence 0 - and without this would pass for frame 0.
     private const int FlagWritten = 2;
 
+    // How many channels the sound has, in the flags: it travels with them through the compressed
+    // part of the delay as well. Nothing there is stereo.
+    private const int ChannelsShift = 8;
+
+    private static int FlagsFor(bool audioReal, int channels) =>
+        (audioReal ? FlagAudioReal : 0) | FlagWritten | (Math.Clamp(channels, 0, MaxAudioChannels) << ChannelsShift);
+
+    private static int ChannelsIn(int flags) => (flags >> ChannelsShift & 0xFF) is var channels and > 0 ? channels : 2;
+
     // What stays in the working set: seconds behind the writer. A reader within NearReaderSeconds
     // of the writer keeps its distance and a margin resident too, so it never walks into pages
     // trimmed just ahead of it.
@@ -157,13 +170,28 @@ public sealed class DelayLine : IDelayLine, IDisposable
     // to ride out a stalled transmitter, short enough that a scrub does not hold them for good.
     private const long ReaderLapseMs = 2000;
 
+    /// <summary>The most channels a frame's sound can have: the eight pairs an SDI signal carries.</summary>
+    public const int MaxAudioChannels = 16;
+
     /// <summary>
-    /// Four frames of stereo headroom. The SDK returns whatever audio the slot carried, which
-    /// is near but not always equal to one frame's worth, so the room is generous and the
-    /// actual length is recorded per slot rather than assumed.
+    /// A frame of sound on every channel an SDI signal carries, and 64 samples over. The SDK returns
+    /// whatever audio the slot carried, which is near but not always equal to one frame's worth, so
+    /// the actual length is recorded per slot rather than assumed.
+    ///
+    /// It was four frames of stereo, which four recorded pairs filled to the byte: one sample more,
+    /// or a fifth pair, and the end of every frame's sound was cut off.
     /// </summary>
     public static int AudioCapacityFor(int frameRate) =>
-        48000 / Math.Max(1, frameRate) * 2 * 2 * 4;
+        (48000 / Math.Max(1, frameRate) + 64) * 2 * MaxAudioChannels;
+
+    /// <summary>As much of a frame's sound as a slot takes, in whole samples of every channel.</summary>
+    private int KeptAudio(byte[]? audio, int audioBytes, int channels)
+    {
+        if (audio is null || audioBytes <= 0) return 0;
+
+        int kept = Math.Min(audioBytes, _audioCapacity);
+        return kept < audioBytes ? kept - kept % (2 * (channels > 0 ? channels : 2)) : kept;
+    }
 
     /// <summary>
     /// Bytes per slot, rounded up to a page. The alignment is not cosmetic: it keeps the
@@ -562,6 +590,10 @@ public sealed class DelayLine : IDelayLine, IDisposable
     {
         lock (_holdsLock) _holds.Remove(hold);
     }
+
+    /// <summary>Channels of sound in the last frame written, two for every pair; zero before any.</summary>
+    public int AudioChannels => Volatile.Read(ref _audioChannels);
+    private int _audioChannels;
 
     /// <summary>Set when a write failed. The line seals itself rather than failing the recording.</summary>
     public string? Fault { get; private set; }
@@ -974,7 +1006,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// the line's own count stands in, which is right only for a line opened as the recording rolled.
     /// </param>
     public unsafe void Write(byte[] video, int videoBytes, byte[]? audio, int audioBytes, bool audioReal,
-                             long recordingFrame = -1)
+                             long recordingFrame = -1, int audioChannels = 0)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
 
@@ -982,9 +1014,11 @@ public sealed class DelayLine : IDelayLine, IDisposable
         {
             long seq = _written;
 
+            Volatile.Write(ref _audioChannels, audioChannels);
+
             if (_direct)
             {
-                WriteDirect(seq, video, videoBytes, audio, audioBytes, audioReal, recordingFrame);
+                WriteDirect(seq, video, videoBytes, audio, audioBytes, audioReal, recordingFrame, audioChannels);
                 return;
             }
 
@@ -1003,10 +1037,10 @@ public sealed class DelayLine : IDelayLine, IDisposable
             Volatile.Write(ref *(long*)(slot + OffSequence), -1L);
 
             int keptVideo = Math.Min(videoBytes, FrameBytes);
-            int keptAudio = audio is not null && audioBytes > 0 ? Math.Min(audioBytes, _audioCapacity) : 0;
+            int keptAudio = KeptAudio(audio, audioBytes, audioChannels);
             long frameOfRecording = recordingFrame >= 0 ? recordingFrame : seq;
 
-            if (_ram is not null || !WriteSlotThroughFile(seq, video, keptVideo, audio, keptAudio, audioReal, frameOfRecording))
+            if (_ram is not null || !WriteSlotThroughFile(seq, video, keptVideo, audio, keptAudio, audioReal, frameOfRecording, audioChannels))
             {
                 // The file write was refused: straight into the mapping, as it always was.
                 fixed (byte* src = video)
@@ -1018,7 +1052,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
                 *(int*)(slot + OffVideoBytes) = keptVideo;
                 *(int*)(slot + OffAudioBytes) = keptAudio;
-                *(int*)(slot + OffFlags) = (audioReal ? FlagAudioReal : 0) | FlagWritten;
+                *(int*)(slot + OffFlags) = FlagsFor(audioReal, audioChannels);
                 *(long*)(slot + OffRecordingFrame) = frameOfRecording;
             }
 
@@ -1045,17 +1079,17 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// <see cref="ReadDirect"/>), which a direct write cannot race with a mark in the file.
     /// </summary>
     private unsafe void WriteDirect(long seq, byte[] video, int videoBytes, byte[]? audio, int audioBytes,
-                                    bool audioReal, long recordingFrame)
+                                    bool audioReal, long recordingFrame, int audioChannels)
     {
         byte* s = _directWrite;
 
         int keptVideo = Math.Min(videoBytes, FrameBytes);
-        int keptAudio = audio is not null && audioBytes > 0 ? Math.Min(audioBytes, _audioCapacity) : 0;
+        int keptAudio = KeptAudio(audio, audioBytes, audioChannels);
 
         *(long*)(s + OffSequence) = seq;
         *(int*)(s + OffVideoBytes) = keptVideo;
         *(int*)(s + OffAudioBytes) = keptAudio;
-        *(int*)(s + OffFlags) = (audioReal ? FlagAudioReal : 0) | FlagWritten;
+        *(int*)(s + OffFlags) = FlagsFor(audioReal, audioChannels);
         *(long*)(s + OffRecordingFrame) = recordingFrame >= 0 ? recordingFrame : seq;
 
         fixed (byte* src = video)
@@ -1102,7 +1136,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// still marked -1 before and set after, through the mapping, so the torn-read rule is unchanged.
     /// </summary>
     private unsafe bool WriteSlotThroughFile(long seq, byte[] video, int videoBytes, byte[]? audio, int audioBytes,
-                                             bool audioReal, long recordingFrame)
+                                             bool audioReal, long recordingFrame, int audioChannels)
     {
         if (Volatile.Read(ref _fileWritesBroken) != 0) return false;
 
@@ -1113,7 +1147,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
             *(long*)(s + OffSequence) = -1L;
             *(int*)(s + OffVideoBytes) = videoBytes;
             *(int*)(s + OffAudioBytes) = audioBytes;
-            *(int*)(s + OffFlags) = (audioReal ? FlagAudioReal : 0) | FlagWritten;
+            *(int*)(s + OffFlags) = FlagsFor(audioReal, audioChannels);
             *(long*)(s + OffRecordingFrame) = recordingFrame;
         }
 
@@ -1540,7 +1574,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
                 try
                 {
                     Write(frame.Video, frame.VideoBytes, frame.Audio, frame.AudioBytes, frame.AudioReal,
-                          frame.Sequence);
+                          frame.Sequence, frame.AudioChannels);
                 }
                 finally
                 {
@@ -2155,6 +2189,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
 
         into.VideoBytes = videoBytes;
         into.AudioBytes = audioBytes;
+        into.AudioChannels = ChannelsIn(flags);
         into.AudioWasReal = audioReal;
         into.Sequence = sequence;
         into.RecordingFrame = recordingFrame;

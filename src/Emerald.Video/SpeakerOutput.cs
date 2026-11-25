@@ -116,14 +116,15 @@ public sealed class SpeakerOutput : IDisposable
     /// closed instance rather than throwing when there is no sound device — a machine in a
     /// rack often has none, and that must not stop a recording.
     /// </summary>
-    public static SpeakerOutput Open(int frameRate)
+    /// <param name="maxLatencyMs">How much may be queued. The default is for sound heard as it arrives, where it is the lip-sync error.</param>
+    public static SpeakerOutput Open(int frameRate, int maxLatencyMs = MaxLatencyMs)
     {
         var output = new SpeakerOutput();
-        output.Start(frameRate);
+        output.Start(frameRate, maxLatencyMs);
         return output;
     }
 
-    private void Start(int frameRate)
+    private void Start(int frameRate, int maxLatencyMs)
     {
         int rate = Math.Max(1, frameRate);
         int samplesPerFrame = SampleRate / rate;
@@ -132,7 +133,7 @@ public sealed class SpeakerOutput : IDisposable
         // Two frames at least, so one can be playing while the next is queued and an arriving
         // slot never finds the device empty. Above that, as many as fit in the latency budget -
         // at 50 fps a frame is 20 ms, so four of them are the same 80 ms as two at 25.
-        _maxQueued = Math.Clamp(MaxLatencyMs * rate / 1000, 2, BufferCount - 1);
+        _maxQueued = Math.Clamp(maxLatencyMs * rate / 1000, 2, BufferCount - 1);
 
         var format = new WaveFormat
         {

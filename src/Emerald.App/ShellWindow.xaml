@@ -527,7 +527,7 @@
                                                              GroupName="AudioPair"
                                                              IsChecked="{Binding Listening, Mode=TwoWay}"
                                                              Checked="AudioPair_Checked"
-                                                             ToolTip="{Binding ChannelLabel}"/>
+                                                             ToolTip="Hear these two channels on this PC. Every pair marked REC is in the recording."/>
 
                                                 <!-- In the file. Not the same as being on the
                                                      wire: the channel count is settled when the

@@ -290,6 +290,17 @@ public sealed class LiveAir : IEdlPlayback
         get { lock (_gate) return _audioEdits; }
     }
 
+    private IReadOnlyList<AudioSwitch> _audioSwitches = Array.Empty<AudioSwitch>();
+
+    /// <summary>
+    /// Which of the recording's sound tracks plays, in frames of the recording, from the same
+    /// revision as the cues.
+    /// </summary>
+    public IReadOnlyList<AudioSwitch> AudioSwitches
+    {
+        get { lock (_gate) return _audioSwitches; }
+    }
+
     // ------------------------------------------------------------------ the EDL handshake
 
     private long _acceptedVersion;
@@ -331,7 +342,9 @@ public sealed class LiveAir : IEdlPlayback
             {
                 long? changed = EdlDiff.EarliestChange(_cues, revision.Cues);
                 long? level = global::Emerald.Core.AudioEdits.FirstDifference(_audioEdits, revision.AudioEdits);
-                long first = Math.Min(changed ?? long.MaxValue, level ?? long.MaxValue);
+                long? track = global::Emerald.Core.AudioSwitches.FirstDifference(
+                    _audioSwitches, revision.AudioSwitches ?? Array.Empty<AudioSwitch>());
+                long first = Math.Min(Math.Min(changed ?? long.MaxValue, level ?? long.MaxValue), track ?? long.MaxValue);
 
                 if (first <= committed)
                     return new EdlReceipt(EdlVerdict.TooLate, revision.Version, revision.TransactionId,
@@ -341,6 +354,7 @@ public sealed class LiveAir : IEdlPlayback
 
             _cues = revision.Cues;
             _audioEdits = revision.AudioEdits;
+            _audioSwitches = revision.AudioSwitches ?? Array.Empty<AudioSwitch>();
             _acceptedVersion = revision.Version;
             _acceptedTransaction = revision.TransactionId;
 
@@ -359,6 +373,15 @@ public sealed class LiveAir : IEdlPlayback
             _appliedVersion = _acceptedVersion;
             return _cues;
         }
+    }
+
+    /// <summary>
+    /// The last recording frame that can no longer be changed, or null when nothing has gone out.
+    /// What a change asked for at once is placed after.
+    /// </summary>
+    public long? CommittedFrame
+    {
+        get { lock (_gate) return CommittedThrough(); }
     }
 
     /// <summary>
@@ -512,6 +535,7 @@ public sealed class LiveAir : IEdlPlayback
             RecordingStartedAt = null;
             _cues = Array.Empty<LiveCue>();
             _audioEdits = Array.Empty<AudioEdit>();
+            _audioSwitches = Array.Empty<AudioSwitch>();
             ClearPosition();
             Detail = reason;
         }

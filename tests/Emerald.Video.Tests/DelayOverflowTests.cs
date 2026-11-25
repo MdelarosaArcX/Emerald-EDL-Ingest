@@ -58,7 +58,10 @@ public sealed class DelayOverflowTests : IDisposable
         return sum / (double)n;
     }
 
-    private static byte[] Sound(long n) => Enumerable.Range(0, 1920 * 4).Select(i => (byte)((n * 31 + i) % 251)).ToArray();
+    /// <summary>Four pairs, which is what this plant records.</summary>
+    private const int Channels = 8;
+
+    private static byte[] Sound(long n) => Enumerable.Range(0, 1920 * 2 * Channels).Select(i => (byte)((n * 31 + i) % 251)).ToArray();
 
     /// <summary>Twelve seconds in memory - room for a 4 s delay - of a 60 s ring.</summary>
     private DelayLine? Open(string? ffmpeg = null)
@@ -125,7 +128,7 @@ public sealed class DelayOverflowTests : IDisposable
         for (int n = 0; n < total; n++)
         {
             byte[] sound = Sound(n);
-            line.Write(Picture(n, picture), Hd.FrameBytes, sound, sound.Length, audioReal: n % 2 == 0, recordingFrame: 5000 + n);
+            line.Write(Picture(n, picture), Hd.FrameBytes, sound, sound.Length, audioReal: n % 2 == 0, recordingFrame: 5000 + n, audioChannels: Channels);
 
             long at = n + 1 - behind;
             hold.Move(Math.Max(0, at));
@@ -147,6 +150,7 @@ public sealed class DelayOverflowTests : IDisposable
                 Assert.True(result == DelayReadResult.Ok, $"frame {at}: {result}, {line.CompressedLost} lost");
                 Assert.InRange(LevelOf(buffer.Video), Level(at) - 3, Level(at) + 3);
                 Assert.Equal(Sound(at), buffer.Audio.AsSpan(0, buffer.AudioBytes).ToArray());
+                Assert.Equal(Channels, buffer.AudioChannels);
                 Assert.Equal(at % 2 == 0, buffer.AudioWasReal);
                 Assert.Equal(5000 + at, buffer.RecordingFrame);
                 Assert.Equal(5000 + at, line.RecordingFrameAt(at));
@@ -291,7 +295,7 @@ public sealed class DelayOverflowTests : IDisposable
             Mark(p, n);
 
             var writing = Stopwatch.StartNew();
-            line.Write(p, Hd.FrameBytes, Sound(n % 250), 7680, true, recordingFrame: n);
+            line.Write(p, Hd.FrameBytes, Sound(n % 250), 1920 * 2 * Channels, true, recordingFrame: n, audioChannels: Channels);
             if (writing.ElapsedMilliseconds > 40) slowWrites++;
 
             long at = n + 1 - behind;

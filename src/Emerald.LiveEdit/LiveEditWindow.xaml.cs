@@ -424,6 +424,7 @@ public partial class LiveEditWindow : Window
             {
                 MemoryGauges.Register("LiveEdit", "segments on the timeline", () => _placed.Count, "count"),
                 MemoryGauges.Register("LiveEdit", "waveforms kept", () => _waves.Count, "count"),
+                MemoryGauges.Register("LiveEdit", "preview sound held", () => _preview?.Bytes ?? 0, "bytes"),
                 MemoryGauges.Register("LiveEdit", "items placed", () => _overlays.Count, "count"),
                 MemoryGauges.Register("LiveEdit", "media players with a file open", () => Volatile.Read(ref _playersOpen), "count"),
             };
@@ -1021,6 +1022,7 @@ public partial class LiveEditWindow : Window
         if (shift != 0)
         {
             _audioEdits = _audioEdits.Select(a => a with { StartFrame = a.StartFrame + shift }).ToList();
+            _audioSwitches = _audioSwitches.Select(s => s with { StartFrame = s.StartFrame + shift }).ToList();
 
             long[] cuts = _audioCuts.Select(c => c + shift).ToArray();
             _audioCuts.Clear();
@@ -1355,7 +1357,8 @@ public partial class LiveEditWindow : Window
         _wantOffset = want.OffsetOf(on.CapturedFrame);
 
         _seekedCaptured = on.CapturedFrame;
-        _seekedAt = DateTime.UtcNow;
+        _seekedAt = _seekSentAt = DateTime.UtcNow;
+        _playFloor = on.CapturedFrame;
 
         bool swapped = false;
 
@@ -1363,6 +1366,10 @@ public partial class LiveEditWindow : Window
         {
             _loaded = want;
             _open = false;
+
+            // Before the file is in the player, which may be playing: of several tracks it is the
+            // wrong one that would be heard.
+            ApplyLevel();
 
             swapped = Show(new Uri(want.Clip.Path));
             Player.SpeedRatio = 1;
@@ -1976,7 +1983,16 @@ public partial class LiveEditWindow : Window
         // frame, a verification retry, the end of a previous play. Re-applying costs nothing and
         // makes "space plays from the indicator" true by construction rather than by assuming
         // nothing interfered.
-        if (_open) ApplyOffset();
+        //
+        // A seek to the playhead, not the last seek's offset over again: that is where the operator
+        // last clicked, so pausing and playing on went back there every time.
+        if (_open && !_held)
+        {
+            Seek(_at);
+
+            // Parked where nothing plays any more - the end of the last segment, say.
+            if (_loaded is null && _onIngest is null && !_held) return;
+        }
 
         // Set here, from where this run actually begins: an out mark behind the playhead is not
         // something this run can reach, so it is not a stop point for it.
@@ -2059,6 +2075,8 @@ public partial class LiveEditWindow : Window
         ShowRecordingView();
         SettleHeld();
         ShowCountdown();
+        FollowTrack();
+        FollowSound();
         FollowAudioLevel();
         FollowIngestSound();
         FollowEdl();
@@ -2166,14 +2184,38 @@ public partial class LiveEditWindow : Window
             // instead of playing on. So the position is not believed until it has arrived.
             if (_seekedCaptured is { } wanted)
             {
-                if (Math.Abs(captured - wanted) > _rate / 2 && (DateTime.UtcNow - _seekedAt).TotalMilliseconds < 1500)
+                double waited = (DateTime.UtcNow - _seekedAt).TotalSeconds;
+                bool arrived = Math.Abs(captured - wanted) <= _rate / 2;
+
+                // At the top of the file and only as far in as it has had time to play: the position
+                // was dropped, as Windows does when it is set while a file is opening. Sent again,
+                // for longer than a landing is waited for: believed, it put the playhead back at the
+                // start of the segment.
+                bool dropped = !arrived && captured < wanted && Player.Position.TotalSeconds <= waited + 0.5;
+
+                if (dropped && waited < 5 && (DateTime.UtcNow - _seekSentAt).TotalMilliseconds > 400)
+                {
+                    _seekSentAt = DateTime.UtcNow;
+                    Player.Position = TimeSpan.FromSeconds((wanted - loaded.StartFrame) / (double)_rate);
+                }
+
+                if (!arrived && waited < (dropped ? 5 : 1.5))
                 {
                     DrawMarkers();
                     return;
                 }
 
+                // It landed somewhere else for good - media with few keyframes. The playhead is where
+                // the picture is.
+                if (!arrived) _playFloor = captured;
+
                 _seekedCaptured = null;
             }
+
+            // A player lands on the keyframe at or before where it was sent, so for up to half a second
+            // it reads behind that. The playhead waits there rather than going back: playing only goes
+            // forward.
+            captured = Math.Max(captured, _playFloor);
 
             List<IngestItem> items = PlayedItems();
 
@@ -2503,6 +2545,12 @@ public partial class LiveEditWindow : Window
     /// <summary>The frame of the recording the last seek asked the player for, until it reports being there.</summary>
     private long? _seekedCaptured;
 
+    /// <summary>The frame of the recording playing goes on from, and never back behind. Set by every seek.</summary>
+    private long _playFloor;
+
+    /// <summary>When the player was last told the position of the seek that is landing.</summary>
+    private DateTime _seekSentAt = DateTime.MinValue;
+
     /// <summary>The frame into an ingest item the last seek asked the player for, until it reports being there.</summary>
     private long? _seekedIngest;
     private DateTime _seekedAt = DateTime.MinValue;
@@ -2703,7 +2751,8 @@ public partial class LiveEditWindow : Window
         bool muted = MuteButton.IsChecked == true;
         double level = LevelSlider.Value;
 
-        Player.IsMuted = muted;
+        // Silent while the sound is played beside it (PlaysOwnSound).
+        Player.IsMuted = muted || PlaysOwnSound;
         // At the level set on the sound under the playhead, so the preview sounds as air will.
         Player.Volume = Math.Clamp(level * _previewGain, 0, 1);
 
@@ -4804,6 +4853,8 @@ public partial class LiveEditWindow : Window
         _standby.Stop();
         _standby.Close();
         StopIngestSound();
+        _preview?.Dispose();
+        _preview = null;
     }
 
     // ------------------------------------------------------------- the two media tabs
@@ -5667,7 +5718,13 @@ public partial class LiveEditWindow : Window
 
         try
         {
-            Monitor.Source = new Uri(path);
+            // Asked again when a copy of it has been made, unless something else is there by then.
+            string? shown = _monitoring;
+
+            if (MonitorPathOf(path, () => { if (_monitoring == shown) ShowInMonitor(path, caption, actual); }) is not { } playable)
+                return;
+
+            Monitor.Source = new Uri(playable);
 
             // Paused on the first frame rather than playing: a list selection is a question
             // about what a file is, and audio starting unbidden over a studio monitor is its

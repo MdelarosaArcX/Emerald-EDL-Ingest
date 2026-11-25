@@ -52,6 +52,9 @@ public partial class ShellWindow : Window
         public required string Details { get; init; }
         public required TimeSpan Duration { get; init; }
 
+        /// <summary>How many sound tracks it has.</summary>
+        public int Tracks { get; init; } = 1;
+
         private ImageSource? _thumbnail;
 
         public ImageSource? Thumbnail
@@ -778,6 +781,7 @@ public partial class ShellWindow : Window
             var items = clips.Select(c => new ClipItem
             {
                 Path = c.Path,
+                Tracks = c.Info?.Audio.Count ?? 1,
                 Display = c.Name,
                 Stamp = $"{c.Recorded:HH:mm:ss}  |  {c.DurationText}",
                 // The master's actual codec, read from the file rather than assumed — this is
@@ -887,7 +891,33 @@ public partial class ShellWindow : Window
         // still means letting it run for a moment, because a paused MediaElement presents no
         // frame it has not already played — so it is muted across the cue and stopped by
         // OnCueTick as soon as there is a picture.
-        Player.Source = new Uri(clip.Path);
+        //
+        // Of a clip with several sound tracks Windows plays the last, so it is played from a copy
+        // with CH 1-2 in it - see TrackCopy - which takes a moment the first time.
+        if (clip.Tracks > 1 && !TrackCopy.HasFailed(clip.Path, 0) && Ffmpeg.Locate(_settings.FfmpegPath) is { } ffmpeg)
+        {
+            if (TrackCopy.Known(clip.Path, 0) is { } copy)
+            {
+                Cue(copy);
+                return;
+            }
+
+            Player.Stop();
+            Player.Source = null;
+
+            TrackCopy.Request(ffmpeg, clip.Path, 0, () => Dispatcher.BeginInvoke(() =>
+            {
+                if (ReferenceEquals(ClipStrip.SelectedItem, clip)) Cue(TrackCopy.Known(clip.Path, 0) ?? clip.Path);
+            }));
+            return;
+        }
+
+        Cue(clip.Path);
+    }
+
+    private void Cue(string path)
+    {
+        Player.Source = new Uri(path);
         BeginCue();
     }
 
@@ -2638,7 +2668,7 @@ public partial class ShellWindow : Window
         bool inFile = _recording && row.Pair < _capture.PairsRecording;
 
         LogAudio(
-            $"SELECT {row.Name} ({row.ChannelLabel}) - " +
+            $"SELECT {row.Name} - " +
             (speakers ? "now on the speakers of this PC" : "selected; the speakers are off") +
             (row.Present ? "" : ", no signal on it") +
             (inFile ? ", and it is in the recording" : "") +
