@@ -1284,6 +1284,9 @@ public partial class LiveEditWindow : Window
 
     private void Seek(long dayFrame)
     {
+        LeaveJoin();
+        _playedOf = null;
+
         _at = Math.Clamp(dayFrame, 0, _dayFrames - 1);
 
         // Does an ingest placement cover this frame? If so it plays instead of the recording,
@@ -1488,11 +1491,16 @@ public partial class LiveEditWindow : Window
     /// which is better than starting again, and its MediaOpened then arrives as the screen's own
     /// and is handled as one.
     /// </summary>
-    private bool Show(Uri uri)
+    /// <param name="later">Let go of the one leaving in a moment, not now, where it would hold up the picture.</param>
+    private bool Show(Uri uri, bool later = false)
     {
         if (_standbyUri != uri || _standby.Source is null)
         {
             Player.Source = uri;
+
+            // Parked, it is opened by being told to pause: the first click in a new window showed nothing.
+            if (!_playing) Player.Pause();
+
             return false;
         }
 
@@ -1507,10 +1515,7 @@ public partial class LiveEditWindow : Window
         leaving.Opacity = 0;
 
         // Out of sight first, then stopped - so the stop's black frame is never on screen.
-        leaving.Stop();
-        leaving.Source = null;
-        leaving.IsMuted = true;
-        leaving.SpeedRatio = 1;
+        if (!later) Release(leaving);
 
         _swappedAt = _standbyOffset;
         _standbyUri = null;
@@ -1520,6 +1525,7 @@ public partial class LiveEditWindow : Window
         _seekRetries = 0;
 
         ApplyLevel();
+        if (later) ReleaseLater(leaving);
 
         return true;
     }
@@ -1590,11 +1596,12 @@ public partial class LiveEditWindow : Window
         if (_standbyUri == want.Uri)
         {
             // Already there. Moved only if the frame wanted on the far side changed.
-            if (_standbyReady && _standbyOffset != want.Offset) Park(want.Offset);
+            if (_standbyReady && _standbyOffset != want.Offset) { _rolling = false; Park(want.Offset); }
             else _standbyOffset = want.Offset;
             return;
         }
 
+        _rolling = false;
         _standbyUri = want.Uri;
         _standbyOffset = want.Offset;
         _standbyReady = false;
@@ -1602,6 +1609,10 @@ public partial class LiveEditWindow : Window
         _standby.IsMuted = true;
         _standby.SpeedRatio = 1;
         _standby.Source = want.Uri;
+
+        // Windows opens nothing until it is told to play or pause. Without this the first file held
+        // ready in a window's life was not, and the first join was a black screen while it opened.
+        _standby.Pause();
     }
 
     /// <summary>
@@ -1631,6 +1642,10 @@ public partial class LiveEditWindow : Window
         {
             cuts.Add(IngestTimeline.RulerFrameOf(loaded.StartFrame, items));
             cuts.Add(IngestTimeline.RulerFrameOf(loaded.EndFrame, items));
+
+            // A capture that dropped a frame leaves one or two between its files, with nothing to open.
+            if (NextSegmentFrom(loaded.EndFrame) is { } after && after.StartFrame > loaded.EndFrame)
+                cuts.Add(IngestTimeline.RulerFrameOf(after.StartFrame, items));
         }
 
         IEnumerable<long> ahead = direction > 0
@@ -1684,6 +1699,7 @@ public partial class LiveEditWindow : Window
     /// <summary>Lets go of whatever the standby holds - a jump elsewhere, a new day, a failure.</summary>
     private void DropStandby()
     {
+        _rolling = false;
         _standby.Stop();
         _standby.Source = null;
         _standbyUri = null;
@@ -1855,6 +1871,9 @@ public partial class LiveEditWindow : Window
         }
 
         if (_loaded is not { } ended) { Pause(); return; }
+
+        // Going over the join the way it always does, for the rare time it was not done before the end.
+        if (EndedIntoNext()) return;
 
         // The end of one segment is the start of the next, mapped onto the ruler so an insert
         // before it does not send the playhead to the wrong place.
@@ -2047,6 +2066,7 @@ public partial class LiveEditWindow : Window
 
         Player.Pause();
         _playing = false;
+        LeaveJoin();
         _stopAt = null;
         PlayButton.Content = "▶";
 
@@ -2176,7 +2196,7 @@ public partial class LiveEditWindow : Window
         {
             // Through the mapping, so an insert before the playhead is accounted for: the
             // player's position is in captured frames and the ruler is not.
-            long captured = loaded.StartFrame + (long)Math.Round(Player.Position.TotalSeconds * _rate);
+            long captured = loaded.StartFrame + (long)Math.Round(PlayedSeconds() * _rate);
 
             // Just after a seek the player still reports where it was for a moment. Read as the
             // playhead, that put it back where it had come from - at a deleted scene, back in
@@ -2268,8 +2288,11 @@ public partial class LiveEditWindow : Window
 
         if (_chasing) { Chase(); AutoSync(); }
 
-        // The next cut, opened before the playhead gets there.
+        // The next cut, opened before the playhead gets there, and the next segment set going.
         if (_playing) PreloadNext();
+
+        FollowJoin();
+        KeepMoving();
     }
 
     /// <summary>The view start the last redraw was built for, so the scroll can be paced.</summary>
@@ -4847,6 +4870,7 @@ public partial class LiveEditWindow : Window
         SaveBookmarks();
 
         StopMonitor();
+        LeaveJoin();
 
         Player.Stop();
         Player.Close();

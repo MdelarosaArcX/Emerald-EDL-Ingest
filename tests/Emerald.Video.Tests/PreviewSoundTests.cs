@@ -138,6 +138,95 @@ public sealed class PreviewSoundTests : IDisposable
         Assert.InRange(sound.Bytes, 1, 8L * 2 * 48000 * 16);
     }
 
+    /// <summary>One recording cut into segments on keyframes with the sound running on, as the recorder does it.</summary>
+    private string[] Segments(string ffmpeg, int seconds)
+    {
+        string whole = Media(ffmpeg, seconds);
+        Run(ffmpeg, "-v", "error", "-y", "-i", whole, "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", "8",
+            "-reset_timestamps", "1", Path.Combine(_temp, "part%d.mp4"));
+        return Directory.GetFiles(_temp, "part*.mp4").OrderBy(p => p, StringComparer.Ordinal).ToArray();
+    }
+
+    private static long Pictures(string ffmpeg, string path) =>
+        Run(ffmpeg, "-v", "error", "-i", path, "-map", "0:v", "-f", "rawvideo", "-pix_fmt", "gray", "-s", "2x2", "-").Length / 4;
+
+    private static void TakeWhole(SoundFeed feed, PreviewMoment now, double ahead)
+    {
+        var waited = Stopwatch.StartNew();
+        while (!feed.Take(now, ahead, 1920))
+        {
+            feed.Forget();
+            Assert.True(waited.Elapsed.TotalSeconds < 20, "the sound was never read");
+            Thread.Sleep(5);
+        }
+    }
+
+    [Theory]
+    [InlineData(-0.12)]
+    [InlineData(0)]
+    [InlineData(0.12)]
+    public void The_sound_runs_on_from_one_segment_into_the_next(double pictureLate)
+    {
+        if (Ffmpeg.Locate() is not { } ffmpeg) return;
+
+        string[] parts = Segments(ffmpeg, 20);
+        Assert.True(parts.Length >= 2);
+        long frames = Pictures(ffmpeg, parts[0]);
+
+        using var source = new SegmentSound(ffmpeg);
+        var feed = new SoundFeed(source);
+        var next = new PreviewNext(parts[1], 4, 1000 + frames);
+        var one = new PreviewMoment(parts[0], 4, 1000, frames, 25, 0, 0, [], [], 1, next);
+        var two = new PreviewMoment(parts[1], 4, 1000 + frames, Pictures(ffmpeg, parts[1]), 25, 0, 0, [], [], 1, null);
+
+        source.Want(parts[1], 4, 0);
+        double from = frames / 25.0 - 2;
+
+        // The 220 Hz of the first pair, two seconds either side of the join, with the picture changing
+        // over when the player gets round to it.
+        var heard = new List<short>();
+        long lastFrame = 0;
+
+        for (int i = 0; i < 100; i++)
+        {
+            double at = from + i * 0.04;
+            TakeWhole(feed, at < frames / 25.0 + pictureLate ? one with { Position = at } : two with { Position = at - frames / 25.0 }, 0.12);
+
+            if (i > 0) Assert.False(feed.Moved, $"moved at {at:F2} s");
+            Assert.True(feed.Frame >= lastFrame && feed.Frame <= lastFrame + 2 || i == 0);
+            lastFrame = feed.Frame;
+
+            for (int s = 0; s < 1920; s++) heard.Add(BitConverter.ToInt16(feed.Buffer, s * 16));
+        }
+
+        // Never quiet for longer than a tone's own zero crossings.
+        int quiet = 0, longest = 0;
+        foreach (short s in heard)
+        {
+            quiet = Math.Abs((int)s) < 400 ? quiet + 1 : 0;
+            longest = Math.Max(longest, quiet);
+        }
+
+        Assert.True(longest < 12 * 48, $"silent for {longest / 48.0:F1} ms");
+
+        // And in step with itself: the tone's phase after the join is where it was going before it.
+        double Phase(int start)
+        {
+            double re = 0, im = 0;
+            for (int i = 0; i < 24000; i++)
+            {
+                double a = 2 * Math.PI * 220 * (start + i) / 48000;
+                re += heard[start + i] * Math.Cos(a);
+                im -= heard[start + i] * Math.Sin(a);
+            }
+            return Math.Atan2(im, re);
+        }
+
+        double turn = Math.IEEERemainder(Phase(heard.Count - 24000 - 4800) - Phase(4800), 2 * Math.PI);
+        double ms = turn / (2 * Math.PI * 220) * 1000;
+        Assert.True(Math.Abs(ms) < 0.3, $"out by {ms:F2} ms over the join");
+    }
+
     [Fact]
     public void The_sound_is_left_alone_while_the_picture_only_wanders()
     {

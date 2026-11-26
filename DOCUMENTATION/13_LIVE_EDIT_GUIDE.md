@@ -196,6 +196,8 @@ The track plays until the next change on the timeline, marked by a green line an
 
 On air, the chosen pair goes out on CH 1-2, cross-faded over one frame. A track the recording does not carry plays the first one instead. A track added to the recording's files, such as music, is shown but cannot be chosen: it is not in the delay. While a placed item with its own sound is on air, an instant change starts when the item ends.
 
+From one segment into the next, the preview plays without a break: the next file is opened eight seconds ahead, set going just before this one ends, and put on screen at the join, while the sound runs on from one file into the other. A preview that stands still is told to play again and logged as `liveedit.stoodstill`.
+
 In the preview, the picture plays straight through a change of track and only the sound changes. The sound of a recording with several tracks is played by Emerald itself (`PreviewSound`), because Windows would play the last track whatever was chosen. After a click far from where you were, it may be silent for a moment while it is read. The small previews play CH 1-2, from a copy kept in the data folder's `tracks` folder (the newest 12).
 
 ### Use bookmarks

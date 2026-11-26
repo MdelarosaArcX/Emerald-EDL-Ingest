@@ -111,6 +111,47 @@ public sealed class SegmentSound : IDisposable
         return true;
     }
 
+    /// <summary>How many samples a file's sound has, once the piece it ends in has been read.</summary>
+    public long? Length(string path, int tracks)
+    {
+        long full = PieceSamples * tracks * 4;
+
+        lock (_gate)
+        {
+            (long Index, long Bytes)? last = null;
+
+            foreach (var (key, piece) in _pieces)
+                if (key.Path == path && key.Tracks == tracks && piece.Samples is { } s && s.Length < full &&
+                    (last is null || key.Index < last.Value.Index))
+                    last = (key.Index, s.Length);
+
+            return last is { } end ? end.Index * PieceSamples + end.Bytes / (tracks * 4) : null;
+        }
+    }
+
+    /// <summary>
+    /// How far into a file its sound starts, in samples: a segment begins on a frame of picture, and
+    /// the sound packets do not, so it can be some milliseconds in. Null until its start has been read.
+    /// </summary>
+    public long? Lead(string path, int tracks)
+    {
+        lock (_gate)
+        {
+            if (!_pieces.TryGetValue((path, tracks, 0), out Piece? first)) return null;
+            if (first.Samples is not { } samples) return first.Failed ? 0 : null;
+
+            const int most = 2048;
+            int width = tracks * 4, zero = 0;
+
+            while (zero < most && (zero + 1) * width <= samples.Length &&
+                   samples.AsSpan(zero * width, width).IndexOfAnyExcept((byte)0) < 0)
+                zero++;
+
+            // Silence rather than a late start.
+            return zero < most ? zero : 0;
+        }
+    }
+
     private Piece Find(string path, int tracks, long index)
     {
         var key = (path, tracks, index);

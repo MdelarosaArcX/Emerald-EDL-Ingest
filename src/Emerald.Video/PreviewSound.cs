@@ -8,11 +8,18 @@ namespace Emerald.Video;
 /// <param name="Position">How far into the file the picture is, in seconds, at <paramref name="At"/>.</param>
 /// <param name="At">A <see cref="Stopwatch"/> timestamp.</param>
 /// <param name="Volume">The window's own level, 0 to 1. Nought is silence.</param>
-/// <param name="Next">The file that follows, once it is near, so its sound is in memory before it is reached.</param>
+/// <param name="Frames">How many pictures the file has.</param>
+/// <param name="Next">
+/// The file that plays straight on from this one, once it is near. Its sound follows this one's with
+/// nothing between, whichever moment the picture changes over.
+/// </param>
 public sealed record PreviewMoment(
-    string Path, int Tracks, long StartFrame, int Rate, double Position, long At,
+    string Path, int Tracks, long StartFrame, long Frames, int Rate, double Position, long At,
     IReadOnlyList<AudioSwitch> Switches, IReadOnlyList<AudioEdit> Edits, double Volume,
-    (string Path, int Tracks)? Next);
+    PreviewNext? Next);
+
+/// <summary>The segment after the one playing, and the captured frame it begins at.</summary>
+public sealed record PreviewNext(string Path, int Tracks, long StartFrame);
 
 /// <summary>
 /// Where the sound should be read from to be heard with the picture. The picture is the clock: the
@@ -56,10 +63,135 @@ public sealed class SoundCursor
 
     public void Advance(int samples) => Sample += samples;
 
+    /// <summary>Counted from another file's start, the sound itself running on: nothing has moved.</summary>
+    public void Rebase(long sample) => Sample = sample;
+
     public void Forget()
     {
         Sample = null;
         _average = 0;
+    }
+}
+
+/// <summary>
+/// Frames of sound out of one recorded file after another. At the end of a file the next one's sound
+/// follows its last sample in the same frame, so nothing is heard at a join - the picture may change
+/// over a moment before or after, and the sound does not wait for it.
+///
+/// Without a sound card, so it can be tested.
+/// </summary>
+public sealed class SoundFeed
+{
+    /// <summary>A length further out than this from the picture's is not believed.</summary>
+    private const long LengthSlack = SegmentSound.SampleRate / 4;
+
+    private readonly SegmentSound _source;
+    private readonly SoundCursor _cursor = new();
+    private byte[] _rest = Array.Empty<byte>();
+    private string? _path;
+    private int _tracks;
+    private long _start;
+
+    public SoundFeed(SegmentSound source) => _source = source;
+
+    /// <summary>Whether anything has been given since <see cref="Forget"/>.</summary>
+    public bool Started => _cursor.Sample is not null;
+
+    /// <summary>The samples of the last frame given.</summary>
+    public byte[] Buffer { get; private set; } = Array.Empty<byte>();
+
+    public int Channels => _tracks * 2;
+
+    /// <summary>The captured frame the last frame given is on.</summary>
+    public long Frame { get; private set; }
+
+    /// <summary>The last frame given does not follow the one before.</summary>
+    public bool Moved { get; private set; }
+
+    public void Forget() => _cursor.Forget();
+
+    /// <summary>
+    /// The next frame of sound, to be heard <paramref name="ahead"/> seconds after
+    /// <paramref name="now"/> was said. False while it is being read.
+    /// </summary>
+    public bool Take(PreviewMoment now, double ahead, int samples)
+    {
+        double wanted = now.StartFrame / (double)now.Rate + now.Position + ahead;
+
+        if (_path != now.Path && _path != now.Next?.Path) _cursor.Forget();
+
+        Moved = !Started || _cursor.Follow(wanted - _start / (double)now.Rate);
+
+        if (Moved)
+        {
+            (_path, _tracks, _start) = now.Next is { } over && wanted >= over.StartFrame / (double)now.Rate
+                ? (over.Path, over.Tracks, over.StartFrame)
+                : (now.Path, now.Tracks, now.StartFrame);
+
+            _cursor.Forget();
+            _cursor.Follow(wanted - _start / (double)now.Rate);
+        }
+
+        int bytes = samples * _tracks * 4;
+        if (Buffer.Length < bytes) Buffer = new byte[bytes];
+
+        long at = _cursor.Sample!.Value;
+        Frame = _start + Math.Max(0, at + samples / 2) / samples;
+
+        if (now.Next is { } next && _path == now.Path && next.Path != now.Path)
+        {
+            long length = LengthOf(now, samples);
+
+            if (at + samples > length)
+            {
+                if (_source.Lead(next.Path, next.Tracks) is not { } lead)
+                {
+                    _source.Want(next.Path, next.Tracks, 0);
+                    return false;
+                }
+
+                // Of as many tracks, the frame is the end of one and the start of the other. Of
+                // another number it is a different recording, and changes over between two frames.
+                int head = (int)Math.Clamp(length - at, 0, samples);
+
+                if (next.Tracks == _tracks || head == 0)
+                {
+                    int rest = samples - head;
+                    if (_rest.Length < samples * next.Tracks * 4) _rest = new byte[samples * next.Tracks * 4];
+
+                    if (head > 0 && !_source.Read(now.Path, _tracks, at, head, Buffer)) return false;
+                    if (!_source.Read(next.Path, next.Tracks, lead, rest, _rest)) return false;
+
+                    (_path, _tracks, _start) = (next.Path, next.Tracks, next.StartFrame);
+                    if (Buffer.Length < samples * _tracks * 4) Buffer = new byte[samples * _tracks * 4];
+
+                    System.Buffer.BlockCopy(_rest, 0, Buffer, head * _tracks * 4, rest * _tracks * 4);
+
+                    _cursor.Rebase(lead + rest);
+                    return true;
+                }
+            }
+        }
+
+        if (!_source.Read(_path!, _tracks, at, samples, Buffer)) return false;
+
+        _cursor.Advance(samples);
+        if (now.Next is { } soon) _source.Want(soon.Path, soon.Tracks, 0);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Where a file's sound ends: where it really does, which is some milliseconds past its last
+    /// picture - the next file's starts that much in. By the pictures when that is not known.
+    /// </summary>
+    private long LengthOf(PreviewMoment now, int samples)
+    {
+        long pictures = now.Frames * samples;
+
+        return _source.Length(now.Path, now.Tracks) is { } length && Math.Abs(length - pictures) < LengthSlack
+            ? length
+            : pictures;
     }
 }
 
@@ -128,10 +260,8 @@ public sealed class PreviewSound : IDisposable
     {
         SpeakerOutput? speaker = null;
         var sound = new RecordingSound();
-        var cursor = new SoundCursor();
-        string? path = null;
+        var feed = new SoundFeed(_source);
         int rate = 0;
-        byte[] buffer = Array.Empty<byte>();
 
         try
         {
@@ -142,10 +272,10 @@ public sealed class PreviewSound : IDisposable
 
                 if (now is null || age > StaleSeconds)
                 {
-                    if (cursor.Sample is not null)
+                    if (feed.Started)
                     {
                         speaker?.Flush();
-                        cursor.Forget();
+                        feed.Forget();
                         sound.Silenced();
                     }
 
@@ -161,16 +291,7 @@ public sealed class PreviewSound : IDisposable
                     Problem = speaker.Problem;
                 }
 
-                if (path != now.Path)
-                {
-                    path = now.Path;
-                    cursor.Forget();
-                }
-
                 int samples = SegmentSound.SampleRate / now.Rate;
-                int channels = now.Tracks * 2;
-                if (buffer.Length < samples * channels * 2) buffer = new byte[samples * channels * 2];
-
                 int queued = speaker.LatencyMs;
 
                 // Full: the card plays a frame before there is room for another.
@@ -180,36 +301,29 @@ public sealed class PreviewSound : IDisposable
                     continue;
                 }
 
-                if (cursor.Follow(now.Position + age + queued / 1000.0))
-                {
-                    sound.Silenced();
-                    Interlocked.Increment(ref _moved);
-                }
-
-                long at = cursor.Sample!.Value;
-
-                if (!_source.Read(now.Path, now.Tracks, at, samples, buffer))
+                if (!feed.Take(now, age + queued / 1000.0, samples))
                 {
                     // Being read. Found again from the picture when it is there.
                     Interlocked.Increment(ref _waited);
-                    cursor.Forget();
+                    feed.Forget();
                     sound.Silenced();
                     _wake.WaitOne(10);
                     continue;
                 }
 
-                long frame = now.StartFrame + Math.Max(0, at + samples / 2) / samples;
-                int track = AudioSwitches.TrackAt(frame, now.Switches);
+                if (feed.Moved)
+                {
+                    sound.Silenced();
+                    Interlocked.Increment(ref _moved);
+                }
 
-                double level = AudioEdits.GainDbAt(frame, now.Edits) +
+                int track = AudioSwitches.TrackAt(feed.Frame, now.Switches);
+
+                double level = AudioEdits.GainDbAt(feed.Frame, now.Edits) +
                                (now.Volume <= 0.0001 ? double.NegativeInfinity : 20 * Math.Log10(now.Volume));
 
-                if (sound.Frame(buffer, samples * channels * 2, channels, track, level) is { } pair)
+                if (sound.Frame(feed.Buffer, samples * feed.Channels * 2, feed.Channels, track, level) is { } pair)
                     speaker.Push(pair[0], pair[1], samples);
-
-                cursor.Advance(samples);
-
-                if (now.Next is { } next) _source.Want(next.Path, next.Tracks, 0);
             }
         }
         finally

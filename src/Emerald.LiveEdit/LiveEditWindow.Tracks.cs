@@ -312,14 +312,15 @@ public partial class LiveEditWindow
         bool silent = MuteButton.IsChecked == true || SoundOverRecordingAt(_at) is not null ||
                       _overlays.Any(o => o.IsBlank && HoldsOnRuler(o, _at));
 
-        (string, int)? next = segment.EndFrame - CapturedOf(_at) < 8L * _rate &&
-                              NextSegmentFrom(segment.EndFrame) is { Pending: false } following && TracksOf(following) > 1
-            ? (following.Clip.Path, TracksOf(following))
+        // The segment that plays straight on from this one: its sound runs on from this one's end.
+        PreviewNext? next = segment.EndFrame - CapturedOf(_at) < PreloadSeconds * (long)_rate &&
+                            StraightOn() is { } following && TracksOf(following) > 1
+            ? new PreviewNext(following.Clip.Path, TracksOf(following), following.StartFrame)
             : null;
 
         _preview.Play(new PreviewMoment(
-            segment.Clip.Path, tracks, segment.StartFrame, _rate,
-            Player.Position.TotalSeconds, System.Diagnostics.Stopwatch.GetTimestamp(),
+            segment.Clip.Path, tracks, segment.StartFrame, segment.Frames, _rate,
+            PlayedSeconds(), System.Diagnostics.Stopwatch.GetTimestamp(),
             _audioSwitches, _audioEdits, silent ? 0 : LevelSlider.Value, next));
 
         if (_preview.Problem is { } problem && !_soundProblemSaid)
