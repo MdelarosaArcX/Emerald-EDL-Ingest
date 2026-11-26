@@ -160,15 +160,22 @@ public sealed class RangeExportWritesTests
 
             Assert.Equal(2, parts.Count);
 
+            // Into a recording's folder on the ingest media path.
+            string folder = IngestLibrary.FolderFor(Path.Combine(store, "ingest"), "2026-11-21_10-00-00");
+            var fractions = new List<double>();
+
             ExportResult result = RangeExport.Write(
-                ffmpeg!, store, "an-export", "metadata about it", parts, 25, "mp4");
+                ffmpeg!, folder, "an-export", "metadata about it", parts, 25, "mp4",
+                progress: p => { lock (fractions) fractions.Add(p.Fraction); });
 
             Assert.True(result.Ok, result.Problem);
+            Assert.Equal("", result.Problem);
 
-            // The media itself, which is the whole point.
+            // The media itself, which is the whole point - in high\, what goes to air.
             Assert.True(File.Exists(result.Path), "the export wrote no media file");
             Assert.True(new FileInfo(result.Path).Length > 1024,
                         "the export wrote a media file with nothing in it");
+            Assert.Equal(IngestLibrary.HighOf(folder), Path.GetDirectoryName(result.Path));
 
             // And the sidecar beside it, not instead of it.
             string sidecar = Path.ChangeExtension(result.Path, ".json");
@@ -176,20 +183,28 @@ public sealed class RangeExportWritesTests
             Assert.True(File.Exists(sidecar), "the export wrote no sidecar");
             Assert.Contains("metadata about it", File.ReadAllText(sidecar));
 
-            // It lands in the ingest folder, which is what the Ingest Media tab lists.
-            Assert.Equal(RangeExport.FolderFor(store), Path.GetDirectoryName(result.Path));
-            Assert.Contains(result.Path, RangeExport.List(store, null).Select(c => c.Path));
+            // Its low-res copy in low\, which is what the Ingest tab lists and the timeline plays:
+            // quarter size, made to be scrubbed.
+            string low = Path.Combine(IngestLibrary.LowOf(folder), "an-export.mp4");
 
-            // The playable copy is the source's own raster, not a thumbnail.
-            //
-            // It was 640x360, which was sized for the list's thumbnail - and is what an ingest
-            // placement then showed on the main viewer, because the export itself is DNxHD and
-            // cannot be decoded here. A scaled-down copy is the picture in that case, so it is
-            // not scaled down.
-            string? playable = RangeExport.PreviewFor(result.Path);
+            Assert.True(File.Exists(low), "the export wrote no low-res copy");
+            Assert.Equal(low, RangeExport.PlayablePathFor(result.Path));
+            Assert.Equal(result.Path, IngestLibrary.MasterFor(low));
 
-            Assert.NotNull(playable);
-            Assert.Equal(Raster(ffmpeg!, result.Path), Raster(ffmpeg!, playable!));
+            string raster = Raster(ffmpeg!, low);
+            if (raster.Length > 0) Assert.Equal("960,540", raster);
+
+            // Listed in its folder, by the low-res.
+            IngestFolder listed = Assert.Single(IngestLibrary.Folders(Path.Combine(store, "ingest"), null));
+            Assert.Equal(low, Assert.Single(IngestLibrary.Clips(listed, null, 25)).Path);
+
+            // And it said how far it was, up to done.
+            lock (fractions)
+            {
+                Assert.NotEmpty(fractions);
+                Assert.Equal(1, fractions[^1]);
+                Assert.All(fractions, f => Assert.InRange(f, 0, 1));
+            }
         }
         finally
         {
@@ -217,12 +232,14 @@ public sealed class RangeExportWritesTests
 
             var parts = RangePlan.Parts(new[] { (a, 0L, 100L) }, 0, 50);
 
-            ExportResult first = RangeExport.Write(ffmpeg!, store, "same", "", parts, 25, "mp4");
+            string folder = IngestLibrary.FolderFor(Path.Combine(store, "ingest"), "2026-11-21_10-00-00");
+
+            ExportResult first = RangeExport.Write(ffmpeg!, folder, "same", "", parts, 25, "mp4");
             Assert.True(first.Ok, first.Problem);
 
             long was = new FileInfo(first.Path).Length;
 
-            ExportResult second = RangeExport.Write(ffmpeg!, store, "same", "", parts, 25, "mp4");
+            ExportResult second = RangeExport.Write(ffmpeg!, folder, "same", "", parts, 25, "mp4");
 
             // Whether it refuses or rewrites, what must not happen is a half-written file where a
             // good one was. Same content in, same size out.

@@ -157,6 +157,47 @@ public static class Waveform
         return peaks;
     }
 
+    /// <summary>
+    /// The peaks of each of a file's first <paramref name="tracks"/> sound tracks, read together in
+    /// one pass over the file. Null when it cannot be read at all.
+    /// </summary>
+    public static IReadOnlyList<WavePeaks>? Tracks(string ffmpegPath, string path, int tracks)
+    {
+        if (tracks <= 1) return Peaks(ffmpegPath, path) is { } one ? new[] { one } : null;
+        if (Key(path) is not { } key) return null;
+
+        // The first track's is the one a single-track read makes, so it shares its place.
+        string KeyOf(int track) => track == 0 ? key : $"{key}|a{track}";
+
+        var found = new List<WavePeaks>(tracks);
+
+        for (int i = 0; i < tracks; i++)
+        {
+            if (Read.TryGetValue(KeyOf(i), out WavePeaks? known)) { found.Add(known); continue; }
+            if (Cached(KeyOf(i)) is not { } cached) break;
+
+            Interlocked.Increment(ref _fromCache);
+            Read[KeyOf(i)] = cached;
+            found.Add(cached);
+        }
+
+        if (found.Count == tracks) return found;
+
+        if (ReadPeaks(ffmpegPath, path, tracks) is not { } fine) return null;
+
+        Interlocked.Increment(ref _decoded);
+
+        if (Read.Count >= ReadMost) Read.Clear();
+
+        for (int i = 0; i < tracks; i++)
+        {
+            if (fine[i].Length > 0) Keep(KeyOf(i), fine[i]);
+            Read[KeyOf(i)] = new WavePeaks(fine[i]);
+        }
+
+        return fine.Select(f => new WavePeaks(f)).ToList();
+    }
+
     /// <summary>The cache file for a file as it is now: its path, length and write time, hashed.</summary>
     private static string? CachePath(string key)
     {
@@ -223,7 +264,39 @@ public static class Waveform
         catch (UnauthorizedAccessException) { return null; }
     }
 
-    private static float[]? ReadPeaks(string ffmpegPath, string path)
+    private static float[]? ReadPeaks(string ffmpegPath, string path) => ReadPeaks(ffmpegPath, path, 1)?[0];
+
+    /// <summary>
+    /// What ffmpeg is asked for. Several tracks are each mixed to mono and laid side by side, one
+    /// channel a track, so however many there are the file is read once.
+    /// </summary>
+    private static IEnumerable<string> Arguments(string path, int tracks)
+    {
+        yield return "-v"; yield return "error"; yield return "-nostdin";
+        yield return "-i"; yield return path; yield return "-vn";
+
+        if (tracks == 1)
+        {
+            yield return "-ac"; yield return "1";
+            yield return "-ar"; yield return SampleRate.ToString();
+        }
+        else
+        {
+            var graph = new System.Text.StringBuilder();
+
+            for (int i = 0; i < tracks; i++)
+                graph.Append($"[0:a:{i}]aresample={SampleRate},aformat=channel_layouts=mono[m{i}];");
+            for (int i = 0; i < tracks; i++) graph.Append($"[m{i}]");
+
+            yield return "-filter_complex"; yield return $"{graph}amerge=inputs={tracks}[all]";
+            yield return "-map"; yield return "[all]";
+        }
+
+        yield return "-f"; yield return "s16le";
+        yield return "-acodec"; yield return "pcm_s16le"; yield return "-";
+    }
+
+    private static float[][]? ReadPeaks(string ffmpegPath, string path, int tracks)
     {
         try
         {
@@ -235,11 +308,7 @@ public static class Waveform
                 CreateNoWindow = true,
             };
 
-            foreach (string arg in new[]
-                     {
-                         "-v", "error", "-nostdin", "-i", path, "-vn", "-ac", "1",
-                         "-ar", SampleRate.ToString(), "-f", "s16le", "-acodec", "pcm_s16le", "-",
-                     })
+            foreach (string arg in Arguments(path, tracks))
                 info.ArgumentList.Add(arg);
 
             using Process? ffmpeg = Process.Start(info);
@@ -252,9 +321,11 @@ public static class Waveform
             _ = ffmpeg.StandardError.ReadToEndAsync();
 
             Stream pcm = ffmpeg.StandardOutput.BaseStream;
-            var peaks = new List<float>(1024);
-            var buffer = new byte[SamplesPerPeak * 2 * 64];
-            int held = 0, inPeak = 0, peak = 0;
+            List<float>[] peaks = Enumerable.Range(0, tracks).Select(_ => new List<float>(1024)).ToArray();
+            var peak = new int[tracks];
+            int step = 2 * tracks;
+            var buffer = new byte[SamplesPerPeak * step * 64];
+            int held = 0, inPeak = 0;
 
             while (true)
             {
@@ -262,31 +333,41 @@ public static class Waveform
                 if (read <= 0) break;
 
                 int bytes = held + read;
-                int whole = bytes & ~1;
+                int whole = bytes - bytes % step;
 
-                for (int o = 0; o < whole; o += 2)
+                for (int o = 0; o < whole; o += step)
                 {
-                    int sample = Math.Abs((int)(short)(buffer[o] | (buffer[o + 1] << 8)));
-                    if (sample > peak) peak = sample;
-
-                    if (++inPeak == SamplesPerPeak)
+                    for (int t = 0; t < tracks; t++)
                     {
-                        peaks.Add(peak / 32768f);
-                        inPeak = 0;
-                        peak = 0;
+                        int at = o + t * 2;
+                        int sample = Math.Abs((int)(short)(buffer[at] | (buffer[at + 1] << 8)));
+                        if (sample > peak[t]) peak[t] = sample;
                     }
+
+                    if (++inPeak == SamplesPerPeak) Take();
                 }
 
-                // An odd byte left over is the first half of the next sample.
+                // Bytes left over are the start of the next sample.
                 held = bytes - whole;
-                if (held > 0) buffer[0] = buffer[whole];
+                if (held > 0) Buffer.BlockCopy(buffer, whole, buffer, 0, held);
             }
 
-            if (inPeak > 0) peaks.Add(peak / 32768f);
+            if (inPeak > 0) Take();
 
             ffmpeg.WaitForExit(15000);
 
-            return peaks.ToArray();
+            return peaks.Select(p => p.ToArray()).ToArray();
+
+            void Take()
+            {
+                for (int t = 0; t < tracks; t++)
+                {
+                    peaks[t].Add(peak[t] / 32768f);
+                    peak[t] = 0;
+                }
+
+                inPeak = 0;
+            }
         }
         catch
         {

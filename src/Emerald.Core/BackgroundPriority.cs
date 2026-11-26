@@ -18,7 +18,20 @@ namespace Emerald.Core;
 public static class BackgroundPriority
 {
     /// <summary>Below-normal processor priority and very low disk priority. True if both were set.</summary>
-    public static bool Apply(Process process)
+    public static bool Apply(Process process) => Apply(process, VeryLowIo);
+
+    /// <summary>Disk priorities for <see cref="Apply(Process, int)"/>.</summary>
+    public const int VeryLowIo = 0, LowIo = 1;
+
+    /// <summary>
+    /// Below-normal processor priority and the given disk priority.
+    ///
+    /// Very low is for work nobody waits on - a waveform read. Something the operator is watching a
+    /// progress bar for - an export - takes low: still behind the recorder's writes, but not
+    /// starved by them. At very low, an export reading masters off the same disk the recorder was
+    /// writing crawled for as long as the recording ran.
+    /// </summary>
+    public static bool Apply(Process process, int ioPriority)
     {
         bool done = true;
 
@@ -30,8 +43,8 @@ public static class BackgroundPriority
 
         try
         {
-            int veryLow = 0;
-            done &= NtSetInformationProcess(process.Handle, ProcessIoPriority, ref veryLow, sizeof(int)) == 0;
+            int priority = Math.Clamp(ioPriority, VeryLowIo, LowIo);
+            done &= NtSetInformationProcess(process.Handle, ProcessIoPriority, ref priority, sizeof(int)) == 0;
         }
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception or
                                    EntryPointNotFoundException or DllNotFoundException)

@@ -23,6 +23,21 @@ public sealed class DelayLineTests : IDisposable
     {
         _folder = Path.Combine(Path.GetTempPath(), "emerald-delay-tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_folder);
+
+        // Test rings are a few megabytes: hold them in RAM whatever the machine has free.
+        DelayLine.MemoryReserve = 0;
+    }
+
+    /// <summary>A line on disk, read and written directly: what is opened when memory cannot hold the delay.</summary>
+    private DelayLine OpenDirect(TimeSpan delay, TimeSpan headroom = default)
+    {
+        DelayLine.MemoryReserve = long.MaxValue / 4;
+        DelayLine line = DelayLine.Create(_folder, Tiny, delay, headroom, TimeSpan.FromSeconds(12));
+        DelayLine.MemoryReserve = 0;
+
+        Assert.True(line.IsDirect);
+        Assert.Equal(0, line.MemorySlots);
+        return line;
     }
 
     private DelayLine Open(TimeSpan? delay = null) =>
@@ -201,6 +216,43 @@ public sealed class DelayLineTests : IDisposable
         Assert.Equal(audio, buffer.Audio.AsSpan(0, bytes).ToArray());
     }
 
+    /// <summary>Every pair an SDI signal carries, with a few samples more than a frame, and how many there were.</summary>
+    [Theory]
+    [InlineData(2)]
+    [InlineData(8)]
+    [InlineData(16)]
+    public void Every_recorded_channel_goes_through_whole(int channels)
+    {
+        using DelayLine line = Open();
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        var audio = new byte[(48000 / Tiny.FrameRate + 2) * channels * 2];
+        for (int i = 0; i < audio.Length; i++) audio[i] = (byte)(i % 251);
+
+        byte[] frame = Pattern(line.FrameBytes, 0);
+        line.Write(frame, frame.Length, audio, audio.Length, audioReal: true, audioChannels: channels);
+
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(0, buffer));
+        Assert.Equal(channels, buffer.AudioChannels);
+        Assert.Equal(channels, line.AudioChannels);
+        Assert.True(buffer.AudioWasReal);
+        Assert.Equal(audio, buffer.Audio.AsSpan(0, buffer.AudioBytes).ToArray());
+    }
+
+    [Fact]
+    public void Sound_that_does_not_fit_is_cut_between_samples()
+    {
+        using DelayLine line = Open();
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        var audio = new byte[DelayLine.AudioCapacityFor(Tiny.FrameRate) * 2 / 12 * 12];
+        byte[] frame = Pattern(line.FrameBytes, 0);
+        line.Write(frame, frame.Length, audio, audio.Length, true, audioChannels: 6);
+
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(0, buffer));
+        Assert.Equal(0, buffer.AudioBytes % 12);
+    }
+
     [Fact]
     public void Audio_longer_than_the_slot_is_clamped_rather_than_overrunning()
     {
@@ -315,6 +367,37 @@ public sealed class DelayLineTests : IDisposable
     public void A_reader_running_behind_a_writer_never_sees_a_torn_frame()
     {
         using DelayLine line = Open(TimeSpan.FromSeconds(1));
+        NeverTorn(line);
+    }
+
+    /// <summary>The same, with the newest frames held in RAM: the ring the transmitter reads on air.</summary>
+    [Fact]
+    public void A_reader_running_behind_a_writer_in_memory_never_sees_a_torn_frame()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10),
+                                                TimeSpan.FromSeconds(8));
+        Assert.Equal(200, line.MemorySlots);
+        NeverTorn(line);
+    }
+
+    /// <summary>The same on disk, read directly: a frame read while the writer comes round to its slot is never handed on.</summary>
+    [Fact]
+    public void A_reader_running_behind_a_writer_on_disk_never_sees_a_torn_frame()
+    {
+        using DelayLine line = OpenDirect(TimeSpan.FromSeconds(1));
+        NeverTorn(line);
+    }
+
+    /// <summary>And through the read-ahead, which copies frames off the disk ahead of the reader.</summary>
+    [Fact]
+    public void A_reader_through_the_read_ahead_never_sees_a_torn_frame()
+    {
+        using DelayLine line = OpenDirect(TimeSpan.FromSeconds(1));
+        NeverTorn(line, prefetch: true);
+    }
+
+    private static void NeverTorn(DelayLine line, bool prefetch = false)
+    {
         DelayFrameBuffer[] buffers = { line.NewBuffer(), line.NewBuffer() };
 
         const long total = 4000;
@@ -341,6 +424,7 @@ public sealed class DelayLineTests : IDisposable
         while (true)
         {
             DelayFrameBuffer into = buffers[turn];
+            if (prefetch) line.PrefetchAhead(read);
             DelayReadResult result = line.TryRead(read, into);
 
             if (result == DelayReadResult.EndOfLine) break;
@@ -596,6 +680,7 @@ public sealed class DelayLineTests : IDisposable
     public void A_line_gives_back_the_disk_it_is_not_keeping()
     {
         using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(28));
+        line.AlwaysRelease = true;
         DelayFrameBuffer buffer = line.NewBuffer();
         Assert.True(line.IsSparse);
 
@@ -627,6 +712,7 @@ public sealed class DelayLineTests : IDisposable
     public void A_hold_keeps_its_frames_until_it_is_let_go()
     {
         using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(28));
+        line.AlwaysRelease = true;
         DelayFrameBuffer buffer = line.NewBuffer();
         byte[] frame = Pattern(line.FrameBytes, 0);
 
@@ -657,6 +743,7 @@ public sealed class DelayLineTests : IDisposable
     public void A_ready_line_keeps_what_it_is_told_to()
     {
         using DelayLine line = Open(TimeSpan.FromSeconds(30));
+        line.AlwaysRelease = true;
         byte[] frame = Pattern(line.FrameBytes, 0);
 
         for (int i = 0; i < 600; i++) line.Write(frame, frame.Length, null, 0, false);
@@ -676,5 +763,369 @@ public sealed class DelayLineTests : IDisposable
         Thread.Sleep(600);
         Assert.Equal(450, line.ReleasedThrough);
         Assert.Equal(450, line.OldestHeld);
+    }
+
+    /// <summary>
+    /// On a volume with room to spare nothing is given back: punching holes in the ring and
+    /// filling them again is what backed the writer up until frames were dropped, and there
+    /// is no disk to save. Every frame the ring has not come round on stays readable.
+    /// </summary>
+    [Fact]
+    public void A_line_on_a_roomy_volume_gives_nothing_back()
+    {
+        // The premise: the test volume has the 20 GB margin free. Without it, the line rightly
+        // gives disk back and there is nothing here to show.
+        if (new DriveInfo(Path.GetPathRoot(Path.GetFullPath(_folder))!).AvailableFreeSpace < 21L * 1024 * 1024 * 1024)
+            return;
+
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(28));
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        for (int i = 0; i < 600; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false);
+        }
+
+        WaitFor(() => line.FlushedThrough >= 588);
+        Thread.Sleep(600);
+
+        Assert.Equal(0, line.ReleasedThrough);
+        Assert.Equal(0, line.OldestHeld);
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(10, buffer));
+        Assert.Equal(Pattern(line.FrameBytes, 10), buffer.Video);
+    }
+
+    // ------------------------------------------------------------------ held in memory
+
+    /// <summary>
+    /// A line holding its delay in RAM: the newest frames read back from memory, a frame that left
+    /// memory with nothing wanting it is gone as if lapped, and the disk is never written - the
+    /// file takes no more than its header. This is the on-air case: nothing on the disk at all.
+    /// </summary>
+    [Fact]
+    public void A_line_held_in_memory_reads_from_memory_and_leaves_the_disk_alone()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(26),
+                                                TimeSpan.FromSeconds(12));
+        DelayFrameBuffer buffer = line.NewBuffer();
+        Assert.Equal(300, line.MemorySlots);
+
+        for (int i = 0; i < 600; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false, recordingFrame: 1000 + i);
+        }
+
+        WaitFor(() => line.FlushedThrough >= 588);
+        Thread.Sleep(600);
+
+        foreach (long sequence in new long[] { 300, 450, 599 })
+        {
+            Assert.Equal(DelayReadResult.Ok, line.TryRead(sequence, buffer));
+            Assert.Equal(Pattern(line.FrameBytes, sequence), buffer.Video);
+            Assert.Equal(1000 + sequence, buffer.RecordingFrame);
+            Assert.Equal(1000 + sequence, line.RecordingFrameAt(sequence));
+        }
+
+        Assert.Equal(DelayReadResult.Lapped, line.TryRead(299, buffer));
+        Assert.Equal(DelayReadResult.Lapped, line.TryRead(0, buffer));
+        Assert.Equal(-1, line.RecordingFrameAt(0));
+        Assert.Equal(300, line.OldestHeld);
+        Assert.Equal(450, line.SequenceOf(1450));
+
+        Assert.Equal(0, line.Spilled);
+        Assert.InRange(Allocated(line.Path), 0, 128 * 1024);
+    }
+
+    /// <summary>
+    /// A transmitter held back - an insert playing - keeps its frames when they leave memory: they
+    /// are written to the file and read back from there, whole, while the newest stay in RAM.
+    /// </summary>
+    [Fact]
+    public void A_held_frame_leaving_memory_is_spilled_and_read_back_from_disk()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(26),
+                                                TimeSpan.FromSeconds(12));
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        using DelayHold hold = line.Hold(100);
+
+        for (int i = 0; i < 600; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false);
+        }
+
+        // Kept from two seconds short of the hold; everything before that left memory unwanted.
+        Assert.Equal(50, line.OldestHeld);
+        Assert.Equal(DelayReadResult.Lapped, line.TryRead(49, buffer));
+        Assert.InRange(line.Spilled, 250, 350);
+
+        foreach (long sequence in new long[] { 50, 100, 299, 300, 599 })
+        {
+            Assert.Equal(DelayReadResult.Ok, line.TryRead(sequence, buffer));
+            Assert.Equal(Pattern(line.FrameBytes, sequence), buffer.Video);
+        }
+    }
+
+    // ------------------------------------------------------------------ on disk, read directly
+
+    /// <summary>
+    /// On a drive with room, the delay is held on disk, read and written past the Windows cache:
+    /// every frame comes back whole with its sound and its place in the recording, through the
+    /// read-ahead as well as straight off the disk.
+    /// </summary>
+    [Fact]
+    public void A_line_on_disk_reads_back_what_was_written()
+    {
+        using DelayLine line = OpenDirect(TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(26));
+        DelayFrameBuffer buffer = line.NewBuffer();
+        byte[] sound = Enumerable.Range(0, 1920 * 4).Select(i => (byte)(i % 199)).ToArray();
+
+        for (int i = 0; i < 600; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, sound, sound.Length, audioReal: i % 2 == 0, recordingFrame: 1000 + i);
+        }
+
+        foreach (long sequence in new long[] { 0, 299, 450, 599 })
+        {
+            Assert.Equal(DelayReadResult.Ok, line.TryRead(sequence, buffer));
+            Assert.Equal(Pattern(line.FrameBytes, sequence), buffer.Video);
+            Assert.Equal(sound, buffer.Audio.AsSpan(0, buffer.AudioBytes).ToArray());
+            Assert.Equal(sequence % 2 == 0, buffer.AudioWasReal);
+            Assert.Equal(1000 + sequence, buffer.RecordingFrame);
+            Assert.Equal(1000 + sequence, line.RecordingFrameAt(sequence));
+        }
+
+        Assert.Equal(450, line.SequenceOf(1450));
+        Assert.Equal(DelayReadResult.NotYetWritten, line.TryRead(600, buffer));
+
+        // Through the read-ahead: asked for, given a moment, and read from memory.
+        line.PrefetchAhead(500);
+        Thread.Sleep(300);
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(520, buffer));
+        Assert.Equal(Pattern(line.FrameBytes, 520), buffer.Video);
+    }
+
+    /// <summary>Round the ring: a frame the writer has come back over is lapped, not handed on.</summary>
+    [Fact]
+    public void A_line_on_disk_that_has_come_round_turns_the_old_frame_away()
+    {
+        using DelayLine line = OpenDirect(TimeSpan.FromSeconds(1));
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        for (int i = 0; i < line.SlotCount + 10; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false);
+        }
+
+        Assert.Equal(DelayReadResult.Lapped, line.TryRead(5, buffer));
+        Assert.Equal(-1, line.RecordingFrameAt(5));
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(line.SlotCount + 5, buffer));
+        Assert.Equal(Pattern(line.FrameBytes, line.SlotCount + 5), buffer.Video);
+
+        line.Seal();
+        Assert.Equal(DelayReadResult.EndOfLine, line.TryRead(line.SlotCount + 10, buffer));
+    }
+
+    /// <summary>Given back to a drive running short, a frame on disk reads as gone, never as zeros.</summary>
+    [Fact]
+    public void A_line_on_disk_gives_back_what_it_is_not_keeping()
+    {
+        using DelayLine line = OpenDirect(TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(28));
+        line.AlwaysRelease = true;
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        for (int i = 0; i < 600; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false);
+        }
+
+        WaitFor(() => line.ReleasedThrough >= 500);
+        Assert.Equal(500, line.ReleasedThrough);
+        Assert.Equal(DelayReadResult.Lapped, line.TryRead(499, buffer));
+        Assert.Equal(DelayReadResult.Ok, line.TryRead(500, buffer));
+        Assert.Equal(Pattern(line.FrameBytes, 500), buffer.Video);
+    }
+
+    // ------------------------------------------------------------------ RAM or disk, and how far back
+
+    /// <summary>In RAM whenever the delay fits there, however much room the disk has.</summary>
+    [Fact]
+    public void A_delay_that_fits_in_memory_is_held_there()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(26),
+                                                TimeSpan.FromSeconds(12));
+
+        Assert.False(line.IsDirect);
+        Assert.Equal(300, line.MemorySlots);
+
+        // As far back as a transmitter may be: seven seconds short of the end of memory.
+        Assert.Equal(300 - 175, line.RoomFrames);
+    }
+
+    /// <summary>Memory that cannot hold the delay and its guard is not used at all: the disk is.</summary>
+    [Fact]
+    public void A_delay_that_does_not_fit_in_memory_goes_to_the_disk()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(26),
+                                                TimeSpan.FromSeconds(8));
+
+        Assert.True(line.IsDirect);
+        Assert.Equal(0, line.MemorySlots);
+        Assert.False(DelayLine.MemoryRingHeld);
+        Assert.Equal(line.SlotCount - 50, line.RoomFrames);
+    }
+
+    /// <summary>The ready line's length is the delay and every insert; only the delay has to fit.</summary>
+    [Fact]
+    public void A_long_line_needs_only_what_is_required_of_it_in_memory()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(60), TimeSpan.Zero,
+                                                TimeSpan.FromSeconds(12), required: TimeSpan.FromSeconds(4));
+
+        Assert.False(line.IsDirect);
+        Assert.Equal(300, line.MemorySlots);
+    }
+
+    /// <summary>
+    /// Writes round the line several times with a transmitter <paramref name="behind"/> frames back, at a pace
+    /// the flusher keeps ahead of: it decides a frame two seconds before it leaves memory, which is
+    /// the strict case. Flat out, the writer gets there first and decides late.
+    /// </summary>
+    private static void RunBehind(DelayLine line, long behind, int frames)
+    {
+        using DelayHold hold = line.Hold(0);
+        DelayFrameBuffer buffer = line.NewBuffer();
+
+        for (int i = 0; i < frames; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false);
+
+            long at = line.FramesWritten - behind;
+            hold.Move(Math.Max(0, at));
+            if (i % 10 == 9) Thread.Sleep(60);
+            if (at < 0 || i % 50 != 0) continue;
+
+            Assert.Equal(DelayReadResult.Ok, line.TryRead(at, buffer));
+            Assert.Equal(Pattern(line.FrameBytes, at), buffer.Video);
+        }
+
+        Thread.Sleep(600);
+    }
+
+    /// <summary>
+    /// As far back as it may be, for several times round: not one frame reaches the disk. This is
+    /// the whole of the delay with its insert room used up, on air.
+    /// </summary>
+    [Fact]
+    public void A_transmitter_as_far_back_as_the_line_allows_puts_nothing_on_the_disk()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(26),
+                                                TimeSpan.FromSeconds(12));
+
+        RunBehind(line, line.RoomFrames, 1000);
+
+        Assert.Equal(0, line.Spilled);
+        Assert.InRange(Allocated(line.Path), 0, 128 * 1024);
+    }
+
+    /// <summary>And two seconds further back does reach it, which is why it is not let.</summary>
+    [Fact]
+    public void A_transmitter_further_back_than_the_line_allows_is_written_out()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(26),
+                                                TimeSpan.FromSeconds(12));
+
+        RunBehind(line, line.RoomFrames + 50, 1000);
+
+        Assert.True(line.Spilled > 100, $"{line.Spilled} frames written out");
+    }
+
+    /// <summary>
+    /// A line with no insert room is all in memory, ring and all. A transmitter exactly a delay behind
+    /// is within it, and nothing is written out - there is nothing it could be read back for.
+    /// </summary>
+    [Fact]
+    public void A_line_with_no_insert_room_puts_nothing_on_the_disk()
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(4), TimeSpan.Zero,
+                                                TimeSpan.FromSeconds(14));
+
+        Assert.Equal(line.SlotCount, line.MemorySlots);
+        Assert.Equal(line.TargetFrames, line.RoomFrames);
+
+        RunBehind(line, line.TargetFrames, 800);
+
+        Assert.Equal(0, line.Spilled);
+        Assert.InRange(Allocated(line.Path), 0, 128 * 1024);
+    }
+
+    /// <summary>Told to keep more than memory holds, an idle line writes it all out; kept to its room, none of it.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void An_idle_line_keeps_to_its_room(bool clamped)
+    {
+        using DelayLine line = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(30), TimeSpan.Zero,
+                                                TimeSpan.FromSeconds(12), required: TimeSpan.FromSeconds(4));
+
+        line.KeepBehind(() => clamped ? Math.Min(600, line.RoomFrames) : 600);
+
+        for (int i = 0; i < 1500; i++)
+        {
+            byte[] frame = Pattern(line.FrameBytes, i);
+            line.Write(frame, frame.Length, null, 0, false);
+        }
+
+        Thread.Sleep(600);
+
+        if (clamped) Assert.Equal(0, line.Spilled);
+        else Assert.True(line.Spilled > 500, $"{line.Spilled} frames written out");
+    }
+
+    /// <summary>
+    /// One line holds its delay in RAM at a time. A second, opened while the first holds it, runs
+    /// from disk - still a working delay - and once the first has closed, says so, and the next
+    /// line opened gets the RAM.
+    /// </summary>
+    [Fact]
+    public void Only_one_line_holds_its_delay_in_memory()
+    {
+        DelayLine first = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(1), TimeSpan.Zero, TimeSpan.FromSeconds(3));
+        bool closed = false;
+        first.Closed += _ => closed = true;
+
+        Assert.True(first.MemorySlots > 0);
+        Assert.True(DelayLine.MemoryRingHeld);
+
+        using (DelayLine second = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(1), TimeSpan.Zero,
+                                                   TimeSpan.FromSeconds(3)))
+        {
+            Assert.Equal(0, second.MemorySlots);
+            Assert.True(second.IsDirect);
+
+            DelayFrameBuffer buffer = second.NewBuffer();
+            for (int i = 0; i < 40; i++)
+            {
+                byte[] frame = Pattern(second.FrameBytes, i);
+                second.Write(frame, frame.Length, null, 0, false);
+            }
+
+            Assert.Equal(DelayReadResult.Ok, second.TryRead(20, buffer));
+            Assert.Equal(Pattern(second.FrameBytes, 20), buffer.Video);
+        }
+
+        first.Release();
+        Assert.True(closed);
+        Assert.False(DelayLine.MemoryRingHeld);
+
+        using DelayLine third = DelayLine.Create(_folder, Tiny, TimeSpan.FromSeconds(1), TimeSpan.Zero, TimeSpan.FromSeconds(3));
+        Assert.True(third.MemorySlots > 0);
     }
 }

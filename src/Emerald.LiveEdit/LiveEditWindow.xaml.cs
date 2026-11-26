@@ -296,19 +296,31 @@ public partial class LiveEditWindow : Window
         TimeScroll.Visibility = needed ? Visibility.Visible : Visibility.Collapsed;
         if (!needed) return;
 
-        // Set together and in this order: Maximum before Value, or WPF clamps the value against
-        // the old maximum and the thumb lands in the wrong place after a zoom out.
+        // A fixed-size thumb that moves the view at a fixed speed, whatever the zoom.
         //
-        // The thumb is sized ViewportSize/(Maximum+ViewportSize), so at full zoom - twenty frames
-        // out of a day - it comes to four thousandths of the track and cannot be grabbed. The
-        // viewport is therefore floored at a fiftieth of the day purely so there is something to
-        // take hold of. It does not change what can be scrolled to: Value still runs the whole
-        // range, and Value is what the window is drawn from.
+        // The scrollbar used to stand for the whole day, so at the closest zoom - twenty frames
+        // on screen out of two million - one pixel of thumb travel jumped the view by over a
+        // thousand frames and nothing could be found with it. Now its track stands for a fixed
+        // number of screens either side of the view: the thumb is always one screen wide, the
+        // same size at every zoom, and dragging it the whole track moves the same number of
+        // screens at every zoom. When it is let go it re-centres around the new view, so it can
+        // be dragged again in either direction. Near the start or end of the day the window is
+        // held inside it, and the thumb goes to that end.
+        //
+        // Set together and in this order: Maximum before Value, or WPF clamps the value against
+        // the old maximum and the thumb lands in the wrong place.
         //
         // Each only when it differs: this runs on every tick while following air, and setting a
         // scrollbar's properties lays it out again even to the same values.
-        double maximum = _dayFrames - Span, viewport = Math.Max(Span, _dayFrames / 50.0);
-        double large = Span, small = Math.Max(1, Span / 20);
+        long span = ViewSpan;
+        long reach = Math.Max(0, _dayFrames - span);
+        long window = Math.Min(reach, ScrollScreens * span);
+
+        if (!_scrollDragging)
+            _scrollBase = Math.Clamp(ViewStart - window / 2, 0, reach - window);
+
+        double maximum = window, viewport = span;
+        double large = span, small = Math.Max(1, span / 20);
 
         if (TimeScroll.Maximum != maximum) TimeScroll.Maximum = maximum;
         if (TimeScroll.ViewportSize != viewport) TimeScroll.ViewportSize = viewport;
@@ -318,19 +330,38 @@ public partial class LiveEditWindow : Window
         // Where the view actually is, which while the timeline is running is the transmitter's
         // anchor rather than the stored scroll. A thumb parked somewhere the view is not would
         // be a control lying about its own state.
-        double value = Math.Clamp(ViewStart, TimeScroll.Minimum, TimeScroll.Maximum);
+        double value = Math.Clamp(ViewStart - _scrollBase, TimeScroll.Minimum, TimeScroll.Maximum);
         if (TimeScroll.Value != value) TimeScroll.Value = value;
     }
+
+    /// <summary>How many screens the scrollbar's track stands for - the thumb is one of them.</summary>
+    private const long ScrollScreens = 10;
+
+    /// <summary>The frame of the day at the left end of the scrollbar's track.</summary>
+    private long _scrollBase;
+
+    /// <summary>True while the thumb is held, so the track is not re-centred under the pointer.</summary>
+    private bool _scrollDragging;
 
     private void TimeScroll_Scroll(object sender, System.Windows.Controls.Primitives.ScrollEventArgs e)
     {
         // Scrolling by hand means looking at a particular stretch, so the timeline stops
         // running - otherwise the view would be dragged straight back to the transmitter on the
         // next tick and the scrollbar would appear not to work.
+        // The value is measured from the track as it was drawn, so its base is kept across the
+        // freeze, which redraws the scrollbar.
+        long trackBase = _scrollBase;
+
+        _scrollDragging = e.ScrollEventType == System.Windows.Controls.Primitives.ScrollEventType.ThumbTrack;
+
         Freeze(true, "scrolling");
 
-        _scroll = (long)Math.Round(e.NewValue);
+        _scrollBase = trackBase;
+        _scroll = trackBase + (long)Math.Round(e.NewValue);
         ClampScroll();
+
+        // Let go, or a click on the track or its arrows: centred again on where the view now is.
+        if (!_scrollDragging) ShowScroll();
 
         // The playhead is not moved. Scrolling is looking somewhere else, not going there.
         Draw();
@@ -380,6 +411,10 @@ public partial class LiveEditWindow : Window
             _watch.Tick += (_, _) => CheckStore();
             _watch.Start();
 
+            // Ingest media: watched for new folders and dropped files, and low-res copies made
+            // for anything without one.
+            StartIngestWatch();
+
             // A loss is marked the moment it happens rather than at the next refresh, because
             // the operator watching the timeline when it happens is the one it matters to.
             // Raised from the capture and transmitter threads, so it hops to the dispatcher.
@@ -389,6 +424,7 @@ public partial class LiveEditWindow : Window
             {
                 MemoryGauges.Register("LiveEdit", "segments on the timeline", () => _placed.Count, "count"),
                 MemoryGauges.Register("LiveEdit", "waveforms kept", () => _waves.Count, "count"),
+                MemoryGauges.Register("LiveEdit", "preview sound held", () => _preview?.Bytes ?? 0, "bytes"),
                 MemoryGauges.Register("LiveEdit", "items placed", () => _overlays.Count, "count"),
                 MemoryGauges.Register("LiveEdit", "media players with a file open", () => Volatile.Read(ref _playersOpen), "count"),
             };
@@ -931,6 +967,14 @@ public partial class LiveEditWindow : Window
 
     private void Refresh_Click(object sender, RoutedEventArgs e)
     {
+        // The list being looked at: on the Ingest tab that is the ingest media, not the capture store.
+        if (_showingIngest)
+        {
+            LoadIngest();
+            KickLowResMaker();
+            return;
+        }
+
         FollowCaptureFolder();
         LoadClips();
     }
@@ -978,6 +1022,7 @@ public partial class LiveEditWindow : Window
         if (shift != 0)
         {
             _audioEdits = _audioEdits.Select(a => a with { StartFrame = a.StartFrame + shift }).ToList();
+            _audioSwitches = _audioSwitches.Select(s => s with { StartFrame = s.StartFrame + shift }).ToList();
 
             long[] cuts = _audioCuts.Select(c => c + shift).ToArray();
             _audioCuts.Clear();
@@ -1239,6 +1284,9 @@ public partial class LiveEditWindow : Window
 
     private void Seek(long dayFrame)
     {
+        LeaveJoin();
+        _playedOf = null;
+
         _at = Math.Clamp(dayFrame, 0, _dayFrames - 1);
 
         // Does an ingest placement cover this frame? If so it plays instead of the recording,
@@ -1312,7 +1360,8 @@ public partial class LiveEditWindow : Window
         _wantOffset = want.OffsetOf(on.CapturedFrame);
 
         _seekedCaptured = on.CapturedFrame;
-        _seekedAt = DateTime.UtcNow;
+        _seekedAt = _seekSentAt = DateTime.UtcNow;
+        _playFloor = on.CapturedFrame;
 
         bool swapped = false;
 
@@ -1320,6 +1369,10 @@ public partial class LiveEditWindow : Window
         {
             _loaded = want;
             _open = false;
+
+            // Before the file is in the player, which may be playing: of several tracks it is the
+            // wrong one that would be heard.
+            ApplyLevel();
 
             swapped = Show(new Uri(want.Clip.Path));
             Player.SpeedRatio = 1;
@@ -1438,11 +1491,16 @@ public partial class LiveEditWindow : Window
     /// which is better than starting again, and its MediaOpened then arrives as the screen's own
     /// and is handled as one.
     /// </summary>
-    private bool Show(Uri uri)
+    /// <param name="later">Let go of the one leaving in a moment, not now, where it would hold up the picture.</param>
+    private bool Show(Uri uri, bool later = false)
     {
         if (_standbyUri != uri || _standby.Source is null)
         {
             Player.Source = uri;
+
+            // Parked, it is opened by being told to pause: the first click in a new window showed nothing.
+            if (!_playing) Player.Pause();
+
             return false;
         }
 
@@ -1457,10 +1515,7 @@ public partial class LiveEditWindow : Window
         leaving.Opacity = 0;
 
         // Out of sight first, then stopped - so the stop's black frame is never on screen.
-        leaving.Stop();
-        leaving.Source = null;
-        leaving.IsMuted = true;
-        leaving.SpeedRatio = 1;
+        if (!later) Release(leaving);
 
         _swappedAt = _standbyOffset;
         _standbyUri = null;
@@ -1470,6 +1525,7 @@ public partial class LiveEditWindow : Window
         _seekRetries = 0;
 
         ApplyLevel();
+        if (later) ReleaseLater(leaving);
 
         return true;
     }
@@ -1540,11 +1596,12 @@ public partial class LiveEditWindow : Window
         if (_standbyUri == want.Uri)
         {
             // Already there. Moved only if the frame wanted on the far side changed.
-            if (_standbyReady && _standbyOffset != want.Offset) Park(want.Offset);
+            if (_standbyReady && _standbyOffset != want.Offset) { _rolling = false; Park(want.Offset); }
             else _standbyOffset = want.Offset;
             return;
         }
 
+        _rolling = false;
         _standbyUri = want.Uri;
         _standbyOffset = want.Offset;
         _standbyReady = false;
@@ -1552,6 +1609,10 @@ public partial class LiveEditWindow : Window
         _standby.IsMuted = true;
         _standby.SpeedRatio = 1;
         _standby.Source = want.Uri;
+
+        // Windows opens nothing until it is told to play or pause. Without this the first file held
+        // ready in a window's life was not, and the first join was a black screen while it opened.
+        _standby.Pause();
     }
 
     /// <summary>
@@ -1581,6 +1642,10 @@ public partial class LiveEditWindow : Window
         {
             cuts.Add(IngestTimeline.RulerFrameOf(loaded.StartFrame, items));
             cuts.Add(IngestTimeline.RulerFrameOf(loaded.EndFrame, items));
+
+            // A capture that dropped a frame leaves one or two between its files, with nothing to open.
+            if (NextSegmentFrom(loaded.EndFrame) is { } after && after.StartFrame > loaded.EndFrame)
+                cuts.Add(IngestTimeline.RulerFrameOf(after.StartFrame, items));
         }
 
         IEnumerable<long> ahead = direction > 0
@@ -1634,6 +1699,7 @@ public partial class LiveEditWindow : Window
     /// <summary>Lets go of whatever the standby holds - a jump elsewhere, a new day, a failure.</summary>
     private void DropStandby()
     {
+        _rolling = false;
         _standby.Stop();
         _standby.Source = null;
         _standbyUri = null;
@@ -1806,6 +1872,9 @@ public partial class LiveEditWindow : Window
 
         if (_loaded is not { } ended) { Pause(); return; }
 
+        // Going over the join the way it always does, for the rare time it was not done before the end.
+        if (EndedIntoNext()) return;
+
         // The end of one segment is the start of the next, mapped onto the ruler so an insert
         // before it does not send the playhead to the wrong place.
         // Two coordinates, and they must not be mixed: the next segment is found by the
@@ -1933,7 +2002,16 @@ public partial class LiveEditWindow : Window
         // frame, a verification retry, the end of a previous play. Re-applying costs nothing and
         // makes "space plays from the indicator" true by construction rather than by assuming
         // nothing interfered.
-        if (_open) ApplyOffset();
+        //
+        // A seek to the playhead, not the last seek's offset over again: that is where the operator
+        // last clicked, so pausing and playing on went back there every time.
+        if (_open && !_held)
+        {
+            Seek(_at);
+
+            // Parked where nothing plays any more - the end of the last segment, say.
+            if (_loaded is null && _onIngest is null && !_held) return;
+        }
 
         // Set here, from where this run actually begins: an out mark behind the playhead is not
         // something this run can reach, so it is not a stop point for it.
@@ -1988,6 +2066,7 @@ public partial class LiveEditWindow : Window
 
         Player.Pause();
         _playing = false;
+        LeaveJoin();
         _stopAt = null;
         PlayButton.Content = "▶";
 
@@ -2016,6 +2095,8 @@ public partial class LiveEditWindow : Window
         ShowRecordingView();
         SettleHeld();
         ShowCountdown();
+        FollowTrack();
+        FollowSound();
         FollowAudioLevel();
         FollowIngestSound();
         FollowEdl();
@@ -2115,7 +2196,7 @@ public partial class LiveEditWindow : Window
         {
             // Through the mapping, so an insert before the playhead is accounted for: the
             // player's position is in captured frames and the ruler is not.
-            long captured = loaded.StartFrame + (long)Math.Round(Player.Position.TotalSeconds * _rate);
+            long captured = loaded.StartFrame + (long)Math.Round(PlayedSeconds() * _rate);
 
             // Just after a seek the player still reports where it was for a moment. Read as the
             // playhead, that put it back where it had come from - at a deleted scene, back in
@@ -2123,14 +2204,38 @@ public partial class LiveEditWindow : Window
             // instead of playing on. So the position is not believed until it has arrived.
             if (_seekedCaptured is { } wanted)
             {
-                if (Math.Abs(captured - wanted) > _rate / 2 && (DateTime.UtcNow - _seekedAt).TotalMilliseconds < 1500)
+                double waited = (DateTime.UtcNow - _seekedAt).TotalSeconds;
+                bool arrived = Math.Abs(captured - wanted) <= _rate / 2;
+
+                // At the top of the file and only as far in as it has had time to play: the position
+                // was dropped, as Windows does when it is set while a file is opening. Sent again,
+                // for longer than a landing is waited for: believed, it put the playhead back at the
+                // start of the segment.
+                bool dropped = !arrived && captured < wanted && Player.Position.TotalSeconds <= waited + 0.5;
+
+                if (dropped && waited < 5 && (DateTime.UtcNow - _seekSentAt).TotalMilliseconds > 400)
+                {
+                    _seekSentAt = DateTime.UtcNow;
+                    Player.Position = TimeSpan.FromSeconds((wanted - loaded.StartFrame) / (double)_rate);
+                }
+
+                if (!arrived && waited < (dropped ? 5 : 1.5))
                 {
                     DrawMarkers();
                     return;
                 }
 
+                // It landed somewhere else for good - media with few keyframes. The playhead is where
+                // the picture is.
+                if (!arrived) _playFloor = captured;
+
                 _seekedCaptured = null;
             }
+
+            // A player lands on the keyframe at or before where it was sent, so for up to half a second
+            // it reads behind that. The playhead waits there rather than going back: playing only goes
+            // forward.
+            captured = Math.Max(captured, _playFloor);
 
             List<IngestItem> items = PlayedItems();
 
@@ -2183,8 +2288,11 @@ public partial class LiveEditWindow : Window
 
         if (_chasing) { Chase(); AutoSync(); }
 
-        // The next cut, opened before the playhead gets there.
+        // The next cut, opened before the playhead gets there, and the next segment set going.
         if (_playing) PreloadNext();
+
+        FollowJoin();
+        KeepMoving();
     }
 
     /// <summary>The view start the last redraw was built for, so the scroll can be paced.</summary>
@@ -2460,6 +2568,12 @@ public partial class LiveEditWindow : Window
     /// <summary>The frame of the recording the last seek asked the player for, until it reports being there.</summary>
     private long? _seekedCaptured;
 
+    /// <summary>The frame of the recording playing goes on from, and never back behind. Set by every seek.</summary>
+    private long _playFloor;
+
+    /// <summary>When the player was last told the position of the seek that is landing.</summary>
+    private DateTime _seekSentAt = DateTime.MinValue;
+
     /// <summary>The frame into an ingest item the last seek asked the player for, until it reports being there.</summary>
     private long? _seekedIngest;
     private DateTime _seekedAt = DateTime.MinValue;
@@ -2660,7 +2774,8 @@ public partial class LiveEditWindow : Window
         bool muted = MuteButton.IsChecked == true;
         double level = LevelSlider.Value;
 
-        Player.IsMuted = muted;
+        // Silent while the sound is played beside it (PlaysOwnSound).
+        Player.IsMuted = muted || PlaysOwnSound;
         // At the level set on the sound under the playhead, so the preview sounds as air will.
         Player.Volume = Math.Clamp(level * _previewGain, 0, 1);
 
@@ -3011,14 +3126,21 @@ public partial class LiveEditWindow : Window
     {
         e.Handled = true;
 
-        if (Dropped(e) is not { } path) return;
+        if (Dropped(e) is not { } dropped) return;
 
-        // Every lane is stacked in one grid, so the horizontal coordinate means the same thing in
-        // all of them.
-        double dropX = e.GetPosition(TrackCanvas).X;
+        // Ingest media is listed by its low-res copy; what is placed - and goes to air - is the
+        // high-res beside it. The timeline and monitor still play the low-res (PlayablePathFor).
+        string path = IngestLibrary.MasterFor(dropped) ?? dropped;
 
-        long start = TimelineZoom.FrameAt(dropX, ViewStart, ViewSpan, TrackCanvas.ActualWidth,
-                                          _dayFrames - 1);
+        // A mark in first, whatever the mode: the clip goes where the operator marked, not where
+        // the pointer happened to be let go - a drop with the mouse is rarely frame accurate. The
+        // dialog starts there, and PLACE AT can still be changed in it.
+        if (_markIn is not { } start)
+        {
+            LayerText.Text = "Set a mark in on the timeline first (I), then drop the ingest clip - it goes in at the mark.";
+            LayerText.Foreground = Brush("Warn");
+            return;
+        }
 
         long frames = 0;
         bool hasVideo = true, hasAudio = true;
@@ -3050,8 +3172,8 @@ public partial class LiveEditWindow : Window
         // operator's behalf. Cancelling places nothing. A file dragged in from Explorer goes the
         // same way: there is no other kind of lane for it to land on.
         //
-        // A drop inside the no edit zone is not refused here: the dialog starts at the drop point
-        // and says why it cannot go there, and the operator can type a timecode that can.
+        // A mark in inside the no edit zone is not refused here: the dialog starts at mark in and
+        // says why it cannot go there, and the operator can type a timecode that can.
 
         // The dialog speaks timeline timecode, which is what the operator reads off the ruler,
         // and plans in the recording's own frames. On the ruler an insert earlier on has pushed
@@ -3479,6 +3601,134 @@ public partial class LiveEditWindow : Window
         ShowPosition();
     }
 
+    // ------------------------------------------------------------------ dragging a mark
+
+    /// <summary>How near a mark's line, in pixels, the pointer has to be to take hold of it.</summary>
+    private const double MarkGrabPixels = 6;
+
+    /// <summary>The mark being dragged: true for in, false for out, null when none is.</summary>
+    private bool? _markDrag;
+
+    /// <summary>True once a drag has actually moved its mark, so a plain click on a mark logs nothing.</summary>
+    private bool _markDragMoved;
+
+    /// <summary>
+    /// The mark whose line is under <paramref name="x"/> on the segments lane, or null. When both
+    /// are within reach - a short range, zoomed out - the nearer one wins, and on a tie the side
+    /// of it the pointer is on: left of the pair takes in, right takes out.
+    /// </summary>
+    private bool? MarkUnder(double x)
+    {
+        double width = TrackCanvas.ActualWidth;
+        if (width <= 1) return null;
+
+        double? xi = _markIn is { } i ? TimelineZoom.XOf(i, ViewStart, ViewSpan, width) : null;
+        double? xo = _markOut is { } o ? TimelineZoom.XOf(o, ViewStart, ViewSpan, width) : null;
+
+        double di = xi is { } a ? Math.Abs(x - a) : double.MaxValue;
+        double dout = xo is { } b ? Math.Abs(x - b) : double.MaxValue;
+
+        if (di > MarkGrabPixels && dout > MarkGrabPixels) return null;
+        if (Math.Abs(di - dout) < 0.5 && xi is { } li) return x <= li;
+
+        return di <= dout;
+    }
+
+    /// <summary>
+    /// Left button down on a mark's line takes hold of it, instead of seeking. Handled as a
+    /// preview so the click never reaches <see cref="Timeline_Click"/>.
+    /// </summary>
+    private void Mark_Down(object sender, MouseButtonEventArgs e)
+    {
+        if (MarkUnder(e.GetPosition(TrackCanvas).X) is not { } inPoint) return;
+
+        LeaveRecordingView();
+        Pause();
+        HideDetails();
+
+        _markDrag = inPoint;
+        _markDragMoved = false;
+
+        TrackCanvas.CaptureMouse();
+        TrackCanvas.Cursor = Cursors.SizeWE;
+
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Moves the mark being dragged to the frame under the pointer, and the playhead with it so
+    /// the picture shows the frame the mark is on - dragging a mark is seeking with it. In stays
+    /// before out by at least a frame, so the range can be stretched or shrunk but not turned
+    /// inside out. Not dragging, it shows a resize cursor over a mark that can be taken hold of.
+    /// </summary>
+    private void Mark_Move(object sender, MouseEventArgs e)
+    {
+        double x = e.GetPosition(TrackCanvas).X;
+
+        if (_markDrag is not { } inPoint)
+        {
+            if (_panning) return;
+
+            Cursor? want = MarkUnder(x) is not null ? Cursors.SizeWE : null;
+            if (!ReferenceEquals(TrackCanvas.Cursor, want)) TrackCanvas.Cursor = want;
+            return;
+        }
+
+        if (e.LeftButton != MouseButtonState.Pressed) { EndMarkDrag(); return; }
+
+        long frame = TimelineZoom.FrameAt(x, ViewStart, ViewSpan, TrackCanvas.ActualWidth, _dayFrames - 1);
+
+        if (inPoint)
+        {
+            if (_markOut is { } o) frame = Math.Min(frame, o - 1);
+            if (_markIn == frame) return;
+            _markIn = frame;
+        }
+        else
+        {
+            if (_markIn is { } i) frame = Math.Max(frame, i + 1);
+            if (_markOut == frame) return;
+            _markOut = frame;
+        }
+
+        // Held still while a mark is dragged, so the view does not slide out from under it with
+        // air. Dragging past the edge still brings the view along, through the seek.
+        if (!_markDragMoved) Freeze(true, "dragging a mark");
+        _markDragMoved = true;
+
+        Seek(frame);
+        e.Handled = true;
+    }
+
+    private void Mark_Up(object sender, MouseButtonEventArgs e)
+    {
+        if (_markDrag is null) return;
+
+        EndMarkDrag();
+        e.Handled = true;
+    }
+
+    /// <summary>The capture taken away - the window lost focus mid-drag - ends the drag where it is.</summary>
+    private void Mark_LostCapture(object sender, MouseEventArgs e) => EndMarkDrag();
+
+    private void EndMarkDrag()
+    {
+        if (_markDrag is not { } inPoint) return;
+
+        _markDrag = null;
+        TrackCanvas.ReleaseMouseCapture();
+        TrackCanvas.Cursor = null;
+
+        if (!_markDragMoved) return;
+
+        // Into the EDL log where it was let go, as if it had been marked there.
+        LogMark(inPoint, cleared: false);
+
+        Draw();
+        ShowPosition();
+        Focus();
+    }
+
     // ------------------------------------------------------------------ zoom
 
     private void ZoomIn_Click(object sender, RoutedEventArgs e) => Zoom(+1);
@@ -3740,8 +3990,6 @@ public partial class LiveEditWindow : Window
             return;
         }
 
-        double where = e.GetPosition(TrackCanvas).X;
-
         // A deleted scene is drawn across the segments, so it is picked up here - and Del
         // restores it.
         if (CutNear(under) is { } cut)
@@ -3769,16 +4017,9 @@ public partial class LiveEditWindow : Window
 
         ShowLayer();
 
-        if (_bookmarks.Nearest(under, FramesPerPixel() * 5) is { } hit)
-            ShowDetails($"Bookmark  {Stamp(hit.Frame)}",
-                        (hit.Note.Length > 0 ? hit.Note : "(no note)") +
-                        $"\n\nframe {hit.Frame:N0} of the day" +
-                        "\n\nUse the Bookmark button to change or remove it.",
-                        where);
-        else if (_placed.FirstOrDefault(p => p.Holds(under)) is { } segment)
-            ShowDetails(segment.Clip.DisplayName, SegmentDetails(segment), where);
-        else
-            HideDetails();
+        // A click only seeks and selects: no details card pops up over the timeline. A
+        // bookmark's note is still on its tooltip and on Up / Down.
+        HideDetails();
 
         Seek(TimelineZoom.FrameAt(e.GetPosition(TrackCanvas).X, ViewStart, ViewSpan,
                                   TrackCanvas.ActualWidth, _dayFrames - 1));
@@ -4007,7 +4248,6 @@ public partial class LiveEditWindow : Window
     private static readonly Brush MarkedRangeFill = Frozen(new SolidColorBrush(Color.FromArgb(0x50, 0x4A, 0xD1, 0x95)));
     private static readonly Brush IngestItemFill = Frozen(new SolidColorBrush(Color.FromArgb(0x55, 0x3B, 0x82, 0xF6)));
     private static readonly Brush TagBackground = Frozen(new SolidColorBrush(Color.FromArgb(0xD0, 0x10, 0x14, 0x19)));
-    private static readonly Brush CardBackground = Frozen(new SolidColorBrush(Color.FromArgb(0xE6, 0x10, 0x16, 0x1D)));
 
     private static readonly FontFamily Mono = new("Consolas");
 
@@ -4326,9 +4566,10 @@ public partial class LiveEditWindow : Window
         // looking for where it landed showed nothing at all. One mark is a decision worth seeing
         // on its own, and a mark outside the window is drawn nowhere rather than at the edge,
         // which would put it at a time it is not.
+        // No card of timecodes over the range: the marks are drawn, labelled and draggable, and
+        // their timecodes are in the EDL log.
         DrawMark(_markIn, "IN");
         DrawMark(_markOut, "OUT");
-        DrawMarkCard(width, start, span);
 
         GreyCovered(TrackCanvas, width, start, span, height, sound: false);
         DrawBlanks(TrackCanvas, width, start, span, height, sound: false);
@@ -4551,7 +4792,10 @@ public partial class LiveEditWindow : Window
     {
         // The transmission is this window's: the timeline it plays is here. Closing ends it, so
         // that is asked rather than done quietly.
-        if (LiveAir.Shared.State is not (LiveAirState.Off or LiveAirState.Failed))
+        // A transmission armed from the playback deck is that deck's to end: closing this window
+        // only stops further edits reaching it.
+        if (LiveAir.Shared.State is not (LiveAirState.Off or LiveAirState.Failed) &&
+            LiveAir.Shared.Owner == LiveAirOwner.LiveEdit)
         {
             // Asked when the operator closes this window. Not when the whole application is
             // going - the capture deck closing closes this too, and WPF will not show anything
@@ -4613,6 +4857,7 @@ public partial class LiveEditWindow : Window
 
         _tick.Stop();
         _watch.Stop();
+        StopIngestWatch();
 
         // A static event holds this window for the life of the process otherwise.
         DropMarks.Shared.Changed -= OnDropsChanged;
@@ -4625,12 +4870,15 @@ public partial class LiveEditWindow : Window
         SaveBookmarks();
 
         StopMonitor();
+        LeaveJoin();
 
         Player.Stop();
         Player.Close();
         _standby.Stop();
         _standby.Close();
         StopIngestSound();
+        _preview?.Dispose();
+        _preview = null;
     }
 
     // ------------------------------------------------------------- the two media tabs
@@ -4658,6 +4906,7 @@ public partial class LiveEditWindow : Window
 
         ClipList.Visibility = ingest ? Visibility.Collapsed : Visibility.Visible;
         IngestPanel.Visibility = ingest ? Visibility.Visible : Visibility.Collapsed;
+        IngestSettingsButton.Visibility = ingest ? Visibility.Visible : Visibility.Collapsed;
 
         if (ingest) LoadIngest(); else LoadClips();
     }
@@ -4671,7 +4920,9 @@ public partial class LiveEditWindow : Window
     private void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
         StorePaths store = MediaLibrary.PathsFor(_settings);
-        string folder = _showingIngest ? store.Exports : store.Root ?? store.Low;
+        string folder = _showingIngest
+            ? _ingestFolder is { IsLoose: false } open ? open.Path : IngestLibrary.RootFor(_settings)
+            : store.Root ?? store.Low;
 
         try
         {
@@ -4691,50 +4942,6 @@ public partial class LiveEditWindow : Window
             // The path still said out loud, which is most of what was wanted.
             StoreText.Text = $"{folder}  ({ex.Message})";
         }
-    }
-
-    private bool _listingIngest;
-
-    /// <summary>
-    /// Reads the ingest folder.
-    ///
-    /// Off the dispatcher for the same reason the capture list is: it probes every file, and an
-    /// operator who has exported a day's worth would otherwise watch the window freeze.
-    /// </summary>
-    private void LoadIngest()
-    {
-        if (_listingIngest) return;
-        _listingIngest = true;
-
-        StorePaths store = MediaLibrary.PathsFor(_settings);
-        string folder = store.Exports;
-        string? ffprobe = MediaProbe.LocateFfprobe(Ffmpeg.Locate(_settings.FfmpegPath));
-        int rate = _rate;
-
-        StoreText.Text = $"reading {folder}...";
-
-        Task.Run(() => RangeExport.List(store, ffprobe, rate))
-            .ContinueWith(t =>
-            {
-                _listingIngest = false;
-
-                IReadOnlyList<CapturedClip> clips =
-                    t.IsFaulted ? Array.Empty<CapturedClip>() : t.Result;
-
-                _rebinding = true;
-                IngestList.ItemsSource = clips;
-                _rebinding = false;
-
-                // Not while an export is running: "nothing exported yet" over the top of a
-                // progress bar is two statements that cannot both be true.
-                IngestEmptyText.Visibility =
-                    clips.Count == 0 && !_exporting ? Visibility.Visible : Visibility.Collapsed;
-
-                StoreText.Text = clips.Count == 0
-                    ? $"Exports land in {folder}."
-                    : $"{clips.Count} export{(clips.Count == 1 ? "" : "s")} in {folder}";
-
-            }, TaskScheduler.FromCurrentSynchronizationContext());
     }
 
     /// <summary>
@@ -4785,7 +4992,8 @@ public partial class LiveEditWindow : Window
     {
         try
         {
-            string sidecar = System.IO.Path.ChangeExtension(mediaPath, ".json");
+            // Beside the high-res, for ingest media listed by its low-res.
+            string sidecar = System.IO.Path.ChangeExtension(IngestLibrary.MasterFor(mediaPath) ?? mediaPath, ".json");
 
             if (!File.Exists(sidecar)) return "";
 
@@ -4939,7 +5147,7 @@ public partial class LiveEditWindow : Window
             extension,
             new Timecode(inFrame, _rate), new Timecode(outFrame, _rate),
             _rate, waitFor is null ? parts : new[] { new RangePart("the master being recorded", 0, outFrame - inFrame) },
-            MediaLibrary.PathsFor(_settings))
+            ExportFolderFor(waitFor is null ? parts : []))
         {
             Owner = this,
         };
@@ -5021,11 +5229,11 @@ public partial class LiveEditWindow : Window
             return;
         }
 
-        StorePaths store = MediaLibrary.PathsFor(_settings);
+        string folder = ExportFolderFor(parts);
         int rate = _rate;
 
         ActivityLog.Shared.Info(LogSource.App,
-            $"EXPORT  {name}.{extension} from {new Timecode(inFrame, rate)} to "
+            $"EXPORT  {name}.{extension} into {folder}, from {new Timecode(inFrame, rate)} to "
           + $"{new Timecode(outFrame, rate)}, {parts.Count} segment"
           + $"{(parts.Count == 1 ? "" : "s")}, from the {(masters ? "masters" : "proxies")}.",
             @event: "liveedit.export",
@@ -5038,24 +5246,34 @@ public partial class LiveEditWindow : Window
         // Shown on the Ingest tab, and switched to it now rather than when it finishes: an
         // operator who pressed Export should be looking at the thing being made, not at a
         // timeline that gives no sign anything is happening.
-        ShowExporting($"{name}.{extension}", "starting");
+        ShowExporting($"{name}.{extension}", "starting", 0);
 
         if (!_showingIngest) Tab_Changed(IngestTab, new RoutedEventArgs());
 
         var cancel = new CancellationTokenSource();
         _exportCancel = cancel;
+        _exportStarted = DateTime.Now;
+        int progressQueued = 0;
 
         Task.Run(() => RangeExport.Write(
-                     ffmpeg, store, name, metadata, parts, rate, extension,
-                     // Off the dispatcher, so it hops back before touching the banner.
-                     progress: stage => Dispatcher.BeginInvoke(() =>
+                     ffmpeg, folder, name, metadata, parts, rate, extension,
+                     // Off the dispatcher, so it hops back before touching the banner - at most one
+                     // update queued at a time, ffmpeg says how far it is twice a second.
+                     progress: p =>
                      {
-                         if (!_closed) ShowExporting($"{name}.{extension}", stage);
-                     }),
+                         if (Interlocked.Exchange(ref progressQueued, 1) == 1) return;
+
+                         Dispatcher.BeginInvoke(() =>
+                         {
+                             Volatile.Write(ref progressQueued, 0);
+                             if (!_closed && _exporting) ShowExporting($"{name}.{extension}", p.Stage, p.Fraction);
+                         });
+                     },
                      cancel: cancel.Token))
             .ContinueWith(t =>
             {
                 _exportCancel = null;
+                bool cancelledHere = cancel.IsCancellationRequested;
                 cancel.Dispose();
 
                 ExportResult result = t.IsFaulted
@@ -5076,29 +5294,72 @@ public partial class LiveEditWindow : Window
 
                 if (!result.Ok)
                 {
-                    StoreText.Text = $"Export failed: {result.Problem}";
+                    if (cancelledHere)
+                    {
+                        StoreText.Text = $"Export of {name} cancelled; nothing was left behind.";
+                        ActivityLog.Shared.Info(LogSource.App, $"EXPORT  {name}.{extension} cancelled by the operator.",
+                                                @event: "liveedit.exportcancelled");
+                    }
+                    else
+                    {
+                        StoreText.Text = $"Export failed: {result.Problem}";
+                        ActivityLog.Shared.Warn(LogSource.App,
+                            $"EXPORT failed: {result.Problem}", @event: "liveedit.exportfailed");
+                    }
 
-                    ActivityLog.Shared.Warn(LogSource.App,
-                        $"EXPORT failed: {result.Problem}", @event: "liveedit.exportfailed");
-
-                    // The list still refreshed: a failure can leave a part-written file, and
-                    // seeing it is better than being told about it.
                     if (_showingIngest) LoadIngest();
                     return;
                 }
 
+                TimeSpan took = DateTime.Now - _exportStarted;
+
                 ActivityLog.Shared.Ok(LogSource.App,
-                    $"EXPORT wrote {System.IO.Path.GetFileName(result.Path)}.",
+                    $"EXPORT wrote {System.IO.Path.GetFileName(result.Path)} and its low-res copy in {took.TotalSeconds:F0} s." +
+                    (result.Problem.Length > 0 ? $" {result.Problem}" : ""),
                     @event: "liveedit.exported", file: result.Path);
 
-                // Show them the thing they just made, rather than leaving them on the timeline
-                // wondering whether it worked.
-                if (_showingIngest) LoadIngest();
-                else Tab_Changed(IngestTab, new RoutedEventArgs());
+                // Show them the thing they just made: the recording's folder, open.
+                if (!_showingIngest) Tab_Changed(IngestTab, new RoutedEventArgs());
+                OpenIngestFolderAt(folder, select: IngestLibrary.LowPathFor(result.Path));
 
-                StoreText.Text = $"Exported {System.IO.Path.GetFileName(result.Path)}.";
+                StoreText.Text = $"Exported {System.IO.Path.GetFileName(result.Path)} in {took.TotalSeconds:F0} s." +
+                                 (result.Problem.Length > 0 ? $" {result.Problem}" : "");
 
             }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    /// <summary>When the export running now began, for the time left.</summary>
+    private DateTime _exportStarted;
+
+    /// <summary>
+    /// The recording's folder on the ingest media path that a range goes into: the recording its
+    /// first segment belongs to, by the folder it was recorded in, or the timeline's recording.
+    /// </summary>
+    private string ExportFolderFor(IReadOnlyList<RangePart> parts)
+    {
+        string? recording = parts.Count > 0
+            ? System.IO.Path.GetFileName(System.IO.Path.GetDirectoryName(parts[0].Path))
+            : null;
+
+        if (recording is null || RecordingSequence.FolderStartedAt(recording) is null) recording = RecordingName();
+
+        return IngestLibrary.FolderFor(IngestLibrary.RootFor(_settings), recording);
+    }
+
+    private void ExportCancel_Click(object sender, RoutedEventArgs e)
+    {
+        if (_waitingExport is not null)
+        {
+            Export_Click(sender, e);
+            return;
+        }
+
+        if (_exportCancel is { } cancel)
+        {
+            ExportBusyStage.Text = "cancelling...";
+            ExportCancelButton.IsEnabled = false;
+            try { cancel.Cancel(); } catch (ObjectDisposedException) { }
+        }
     }
 
     /// <summary>True while an export is being written, so the panel does not contradict itself.</summary>
@@ -5111,31 +5372,49 @@ public partial class LiveEditWindow : Window
     private bool _closed;
 
     /// <summary>
-    /// Puts the Ingest panel into its working state, and says which part is running.
-    ///
-    /// The stage matters because the two halves of an export are nothing like each other in
-    /// length: the cut is a stream copy and finishes in seconds, and the playable copy beside it
-    /// is a real encode that can run for minutes on a long range. One unchanging "writing..."
-    /// across both is indistinguishable from a hang, which is the thing an operator reaches for
-    /// Task Manager over.
+    /// Puts the Ingest panel into its working state: which part is running, how far through the
+    /// whole export it is, and roughly how long is left. With no fraction - waiting for a master -
+    /// the bar runs without claiming one.
     /// </summary>
-    private void ShowExporting(string name, string stage)
+    private void ShowExporting(string name, string stage, double? fraction = null)
     {
         _exporting = true;
 
         ExportBusyName.Text = name;
-        ExportBusyStage.Text = stage;
         ExportBusy.Visibility = Visibility.Visible;
+        ExportCancelButton.IsEnabled = true;
+
+        if (fraction is { } f)
+        {
+            ExportBusyBar.IsIndeterminate = false;
+            ExportBusyBar.Value = f;
+
+            TimeSpan spent = DateTime.Now - _exportStarted;
+            string left = f > 0.05 && f < 1
+                ? $"  -  about {Math.Max(1, (int)(spent.TotalSeconds * (1 - f) / f))} s left"
+                : "";
+
+            ExportBusyPercent.Text = $"{f * 100:F0}%";
+            ExportBusyStage.Text = stage + left;
+        }
+        else
+        {
+            ExportBusyBar.IsIndeterminate = true;
+            ExportBusyPercent.Text = "";
+            ExportBusyStage.Text = stage;
+        }
 
         IngestEmptyText.Visibility = Visibility.Collapsed;
 
-        StoreText.Text = $"{name} - {stage}";
+        StoreText.Text = fraction is { } done ? $"{name} - {stage} {done * 100:F0}%" : $"{name} - {stage}";
     }
 
     private void HideExporting()
     {
         _exporting = false;
         ExportBusy.Visibility = Visibility.Collapsed;
+        ExportBusyBar.IsIndeterminate = false;
+        ExportBusyBar.Value = 0;
     }
 
     /// <summary>
@@ -5237,79 +5516,6 @@ public partial class LiveEditWindow : Window
         double width = TrackCanvas.ActualWidth;
 
         return width <= 1 ? 1 : Math.Max(1, (long)Math.Round(ViewSpan / width));
-    }
-
-    /// <summary>
-    /// A small card with the marks' timecodes, and the range's length once both are set - over
-    /// the marked range, or at the right edge when the marks are off screen, so the numbers are
-    /// there whether or not the marks are in view.
-    /// </summary>
-    private void DrawMarkCard(double width, long start, long span)
-    {
-        if (_markIn is null && _markOut is null) return;
-
-        var lines = new StackPanel();
-
-        void Line(string label, string value, string brush)
-        {
-            var row = new StackPanel { Orientation = Orientation.Horizontal };
-
-            row.Children.Add(new TextBlock
-            {
-                Text = label,
-                Width = 30,
-                Foreground = Brush("Muted"),
-                FontFamily = Mono,
-                FontSize = 10,
-            });
-
-            row.Children.Add(new TextBlock
-            {
-                Text = value,
-                Foreground = Brush(brush),
-                FontFamily = Mono,
-                FontSize = 11,
-                FontWeight = FontWeights.Bold,
-            });
-
-            lines.Children.Add(row);
-        }
-
-        Line("IN", _markIn is { } i ? Stamp(i) : "--:--:--:--", "Ok");
-        Line("OUT", _markOut is { } o ? Stamp(o) : "--:--:--:--", "Ok");
-
-        if (_markIn is { } a && _markOut is { } b && b > a)
-            Line("DUR", $"{new Timecode(b - a, _rate)}  ({b - a:N0} f)", "Tc");
-
-        var card = new Border
-        {
-            Child = lines,
-            Background = CardBackground,
-            BorderBrush = Brush("Ok"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(4),
-            Padding = new Thickness(7, 4, 7, 4),
-            IsHitTestVisible = false,
-        };
-
-        card.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-        double cardWidth = card.DesiredSize.Width;
-
-        // Over the middle of what is marked and on screen; at the right edge when none of it is.
-        double? x1 = _markIn is { } mi ? TimelineZoom.XOf(mi, start, span, width) : null;
-        double? x2 = _markOut is { } mo ? TimelineZoom.XOf(mo, start, span, width) : null;
-
-        double centre = (x1, x2) switch
-        {
-            ({ } p, { } q) => (p + q) / 2,
-            ({ } p, null) => p,
-            (null, { } q) => q,
-            _ => width,
-        };
-
-        Canvas.SetLeft(card, Math.Clamp(centre - cardWidth / 2, 2, Math.Max(2, width - cardWidth - 2)));
-        Canvas.SetTop(card, 4);
-        TrackCanvas.Children.Add(card);
     }
 
     /// <summary>
@@ -5536,7 +5742,13 @@ public partial class LiveEditWindow : Window
 
         try
         {
-            Monitor.Source = new Uri(path);
+            // Asked again when a copy of it has been made, unless something else is there by then.
+            string? shown = _monitoring;
+
+            if (MonitorPathOf(path, () => { if (_monitoring == shown) ShowInMonitor(path, caption, actual); }) is not { } playable)
+                return;
+
+            Monitor.Source = new Uri(playable);
 
             // Paused on the first frame rather than playing: a list selection is a question
             // about what a file is, and audio starting unbidden over a studio monitor is its
@@ -5877,6 +6089,13 @@ public partial class LiveEditWindow : Window
 
         // A capture proxy's master.
         if (MasterOf(path) is { } master) all.Add(master);
+
+        // Ingest media, listed by its low-res: the high-res beside it and its sidecar.
+        if (IngestLibrary.MasterFor(path) is { } high)
+        {
+            all.Add(high);
+            all.Add(System.IO.Path.ChangeExtension(high, ".json"));
+        }
 
         // An export's playable copy and its metadata. Named by convention beside the export, so
         // they are found whether or not this window listed them.

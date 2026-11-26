@@ -57,15 +57,15 @@ public partial class App : Application
     /// </summary>
     public static string TidalLockRingFolder(AppSettings settings)
     {
-        string fallback = System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Emerald", "delay");
+        Emerald.Video.StorePaths store = Emerald.Media.MediaLibrary.PathsFor(settings);
+
+        bool OnStore(string folder) => SameVolume(folder, store.High) || SameVolume(folder, store.Low);
+
+        string fallback = AutomaticRingFolder(store, OnStore);
 
         if (string.IsNullOrWhiteSpace(settings.TidalLockRingFolder)) return fallback;
 
         string chosen = settings.TidalLockRingFolder;
-        Emerald.Video.StorePaths store = Emerald.Media.MediaLibrary.PathsFor(settings);
-
-        bool OnStore(string folder) => SameVolume(folder, store.High) || SameVolume(folder, store.Low);
 
         if (!OnStore(chosen) || OnStore(fallback)) return chosen;
 
@@ -79,6 +79,121 @@ public partial class App : Application
     }
 
     private static int _ringWarned;
+
+    /// <summary>The folder used when none is set: what the delay path box goes back to when cleared.</summary>
+    public static string AutomaticTidalLockRingFolder(AppSettings settings)
+    {
+        Emerald.Video.StorePaths store = Emerald.Media.MediaLibrary.PathsFor(settings);
+        return AutomaticRingFolder(store, f => SameVolume(f, store.High) || SameVolume(f, store.Low));
+    }
+
+    /// <summary>The old default, under %LOCALAPPDATA% - on the Windows drive. Now the last resort.</summary>
+    public static string SystemRingFolder => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Emerald", "delay");
+
+    /// <summary>Free space a drive needs before the ring is put on it: the longest ready ring plus headroom.</summary>
+    private const long RingDriveMinFree = 64L * 1024 * 1024 * 1024;
+
+    private static string? _autoRing;
+    private static string? _autoRingKey;
+    private static readonly object _autoRingGate = new();
+
+    /// <summary>
+    /// Where the ring goes when no folder has been set.
+    ///
+    /// It used to be %LOCALAPPDATA%, which is always C:. The ring writes about 104 MB/s at
+    /// 1080p25, nonstop, for as long as a recording runs. The Windows drive shares that with
+    /// the page file, Windows Update, Defender and every other program, so it is the worst
+    /// local drive to put it on, and when it fell behind, frames were missing on air. Now:
+    /// the drive Emerald runs from if it is a local fixed drive that is not the Windows drive
+    /// and not a recording drive; otherwise the local fixed drive like that with the most
+    /// free space; and only if there is none, the old folder on C:.
+    ///
+    /// Worked out once per store layout and said in the log, so it is clear which disk a
+    /// "could not keep up" line is about.
+    /// </summary>
+    private static string AutomaticRingFolder(Emerald.Video.StorePaths store, Func<string, bool> onStore)
+    {
+        string key = $"{store.High}|{store.Low}";
+
+        lock (_autoRingGate)
+        {
+            if (_autoRing is not null && _autoRingKey == key) return _autoRing;
+
+            string chosen = PickRingFolder(onStore) ?? SystemRingFolder;
+
+            if (_autoRing != chosen)
+                ActivityLog.Shared.Info(LogSource.Capture,
+                    $"DELAY  ring folder is {chosen} ({DelayLine.DescribeDisk(chosen)})" +
+                    (chosen == SystemRingFolder
+                        ? " - no other local drive with room, so it is on the Windows drive. Set " +
+                          "tidalLockRingFolder in settings.json to a fast drive of its own if frames drop."
+                        : ", away from the Windows drive and the recording drives."),
+                    @event: "delay.folder");
+
+            _autoRing = chosen;
+            _autoRingKey = key;
+            return chosen;
+        }
+    }
+
+    private static string? PickRingFolder(Func<string, bool> onStore)
+    {
+        string? system = SafeRoot(Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+        string? appDrive = SafeRoot(AppContext.BaseDirectory);
+
+        var candidates = new List<DriveInfo>();
+
+        try
+        {
+            foreach (DriveInfo drive in DriveInfo.GetDrives())
+            {
+                try
+                {
+                    if (drive.DriveType != DriveType.Fixed || !drive.IsReady) continue;
+                    if (string.Equals(drive.RootDirectory.FullName, system, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (onStore(drive.RootDirectory.FullName)) continue;
+
+                    // Sparse files, which the ring depends on to take only the disk it holds.
+                    if (!string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(drive.DriveFormat, "ReFS", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    if (drive.AvailableFreeSpace < RingDriveMinFree) continue;
+
+                    candidates.Add(drive);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+
+        IEnumerable<DriveInfo> ordered = candidates
+            .OrderByDescending(d => string.Equals(d.RootDirectory.FullName, appDrive, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(d => d.AvailableFreeSpace);
+
+        foreach (DriveInfo drive in ordered)
+        {
+            string folder = System.IO.Path.Combine(drive.RootDirectory.FullName, "EmeraldDelay");
+
+            try
+            {
+                Directory.CreateDirectory(folder);
+                return folder;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        return null;
+    }
+
+    private static string? SafeRoot(string path)
+    {
+        try { return string.IsNullOrEmpty(path) ? null : System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(path)); }
+        catch (ArgumentException) { return null; }
+    }
 
     private static bool SameVolume(string a, string b)
     {
@@ -133,6 +248,8 @@ public partial class App : Application
         //
         // Six gigabytes of delay ring survives a crash perfectly well, and three crashes
         // would be eighteen. Swept once, here, before anything can allocate another.
+        // The old default on C: too, so rings left there before the ring moved are not left for good.
+        DelayLine.SweepOrphans(SystemRingFolder);
         DelayLine.SweepOrphans(TidalLockRingFolder(Settings));
 
         StartActivityLog();
@@ -210,6 +327,8 @@ public partial class App : Application
         // recording disk every time Live Edit shows them.
         Emerald.Media.Waveform.CacheFolder = System.IO.Path.Combine(
             Database is null ? AppSettings.DefaultDataFolder : System.IO.Path.GetDirectoryName(Database.Path)!, "peaks");
+        Emerald.Media.TrackCopy.Folder = System.IO.Path.Combine(
+            System.IO.Path.GetDirectoryName(Emerald.Media.Waveform.CacheFolder)!, "tracks");
         _ = Task.Run(() => Emerald.Media.Waveform.SweepCache(Math.Max(30, Settings.LogRetentionDays)));
 
         DispatcherUnhandledException += (_, e) =>

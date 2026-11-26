@@ -254,6 +254,7 @@ This letterboxes, conforms the rate and drops audio. There is no deinterlacer in
 - **Disk cache.** `<data folder>\peaks\`, one `.peaks` file per file, named by a hash of its path, length and write time. 50 peaks a second, one byte a peak, so a 30-second segment is about 1.5 KB. A file that changes is read again.
 - **Kept while used.** Reading a cached waveform touches the file. `SweepCache` runs at startup and deletes `.peaks` files not used for `max(30, logRetentionDays)` days.
 - **One at a time.** Live Edit runs one waveform ffmpeg at a time (it was two).
+- **Every track in one read.** `Waveform.Tracks` mixes each track to mono and reads them side by side, so four tracks cost one pass over the file. Each has its own `.peaks` file.
 - **Overlays.** An overlay's waveform is read from its `.preview.mp4` when there is one, not from a DNxHD export of gigabytes.
 
 ## Recording profile
@@ -328,7 +329,7 @@ A ring of raw frames in a memory-mapped file: `src/Emerald.Video/DelayLine.cs`.
 - **Memory:** about 4 s of the ring stays in the working set, plus up to 15 s for a reader close behind the writer. A flusher thread writes the ring to its file half a second behind the writer, so nothing piles up as dirty memory, and a transmitter a delay behind reads its frames back from the standby cache. `FlushedThrough` and the Memory gauge "ring not yet on disk" show how far behind the disk is.
 - **Disk:** the ring file is sparse (`FSCTL_SET_SPARSE`), so it takes disk only for the frames it holds, not its whole length. The flusher thread gives back the space of frames nothing will read again (`ReleaseBehind`, `FSCTL_SET_ZERO_DATA`): everything older than the line's keep distance plus 2 s, but never at or past a transmitter's `DelayHold` (each transmitter holds its read position, including while it plays an insert), never a frame not yet written to disk, and never within 5 s of the writer's next slots. A line keeps its delay (`TargetFrames`); the ready line keeps only the longest delay a transmitter could start with (`ShellWindow.ReadyKeepFrames`: the larger of `liveDelaySeconds`, the deck's delay and Live Edit's resolved delay), not the headroom for inserts. A read of a given-back frame is `Lapped`. At the default 120 s delay with 300 s headroom the ready line takes about 13 GB of C: instead of 41 GB; while Live Edit holds the picture back for inserts it grows by what is held, and shrinks again after. Free space for the whole length is still checked when the ring is made (`Validate`). Measured with a 1080p25 ring on C: (10 s delay, 50 s headroom, 6.2 GB long): about 1.2 to 1.4 GB on disk, flat, every read correct.
 - **Layout:** 4096-byte header with magic `EMLDLY01`, then slots at `header + seq % SlotCount * stride`. Each slot has a 64-byte header, video and audio.
-- **Audio capacity:** four frames of stereo.
+- **Audio capacity:** one frame of all 16 channels and 64 samples over. The channel count is in the slot's flags.
 - **Free-space guard:** requires size plus 2,000,000,000 bytes, for the whole length, although a sparse ring takes much less.
 
 Sizes at 1080p25 (stride 4,182,016 bytes, 50 guard slots):

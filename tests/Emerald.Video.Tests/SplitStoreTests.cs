@@ -297,6 +297,104 @@ public sealed class SplitStoreTests : IDisposable
         }
     }
 
+    /// <summary>A picture and four sound tracks at levels of their own: full, a half, silent, a quarter.</summary>
+    private static void EncodeTracks(string path)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo(Ffmpeg!)
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true,
+        };
+
+        var args = new List<string> { "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=25:duration=3" };
+
+        foreach (string level in new[] { "0.9", "0.45", "0", "0.22" })
+            args.AddRange(new[] { "-f", "lavfi", "-i", $"aevalsrc={level}*sin(2*PI*440*t)|{level}*sin(2*PI*440*t):s=48000:d=3" });
+
+        args.AddRange(new[] { "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:a", "-map", "4:a",
+                              "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", path });
+
+        foreach (string a in args) psi.ArgumentList.Add(a);
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        string problem = p.StandardError.ReadToEnd();
+        p.WaitForExit();
+        Assert.True(p.ExitCode == 0, problem);
+    }
+
+    [Fact]
+    public void Every_track_has_its_own_waveform_read_in_one_pass_and_kept()
+    {
+        if (Ffmpeg is null) return;
+
+        string? before = Waveform.CacheFolder;
+        Waveform.CacheFolder = Path.Combine(_temp, "peaks");
+
+        try
+        {
+            EncodeTracks(Proxy(1));
+            var file = new FileInfo(Proxy(1));
+            DateTime written = file.LastWriteTimeUtc;
+            int decoded = Waveform.Decoded;
+
+            IReadOnlyList<WavePeaks> tracks = Waveform.Tracks(Ffmpeg, file.FullName, 4)!;
+
+            Assert.Equal(4, tracks.Count);
+            Assert.Equal(decoded + 1, Waveform.Decoded);
+            Assert.InRange(tracks[0].Max(0.5, 2.5), 0.8f, 1.0f);
+            Assert.InRange(tracks[1].Max(0.5, 2.5), 0.38f, 0.52f);
+            Assert.InRange(tracks[2].Max(0.5, 2.5), 0f, 0.01f);
+            Assert.InRange(tracks[3].Max(0.5, 2.5), 0.17f, 0.27f);
+            Assert.All(tracks, t => Assert.InRange(t.Fine.Length, 148, 156));
+
+            // The first is the one a single-track read makes, in the same place.
+            Assert.InRange(Waveform.Peaks(Ffmpeg, file.FullName)!.Max(0.5, 2.5), 0.8f, 1.0f);
+            Assert.Equal(decoded + 1, Waveform.Decoded);
+
+            // From the disk, with nothing in the file to read them from again.
+            Waveform.ForgetRemembered();
+            File.WriteAllBytes(file.FullName, new byte[file.Length]);
+            File.SetLastWriteTimeUtc(file.FullName, written);
+
+            IReadOnlyList<WavePeaks> again = Waveform.Tracks(Ffmpeg, file.FullName, 4)!;
+            Assert.Equal(decoded + 1, Waveform.Decoded);
+            Assert.InRange(again[3].Max(0.5, 2.5), 0.17f, 0.27f);
+        }
+        finally
+        {
+            Waveform.CacheFolder = before;
+        }
+    }
+
+    [Fact]
+    public void A_copy_of_one_track_has_the_whole_picture_and_that_track_only()
+    {
+        if (Ffmpeg is null || Ffprobe is null) return;
+
+        string? before = TrackCopy.Folder;
+        TrackCopy.Folder = Path.Combine(_temp, "tracks");
+
+        try
+        {
+            EncodeTracks(Proxy(1));
+
+            Assert.Null(TrackCopy.Known(Proxy(1), 1));
+            string copy = TrackCopy.Make(Ffmpeg, Proxy(1), 1)!;
+
+            Assert.Equal(copy, TrackCopy.Known(Proxy(1), 1));
+            Assert.Null(TrackCopy.Known(Proxy(1), 2));
+            Assert.InRange(Waveform.Peaks(Ffmpeg, copy)!.Max(0.5, 2.5), 0.38f, 0.52f);
+            Assert.Equal(3, MediaLengths.Picture(new FileInfo(copy))!.Value.TotalSeconds, 1);
+            Assert.Single(Directory.GetFiles(TrackCopy.Folder));
+
+            // One the file has not got: nothing made, nothing left behind.
+            Assert.Null(TrackCopy.Make(Ffmpeg, Proxy(1), 9));
+            Assert.Single(Directory.GetFiles(TrackCopy.Folder));
+        }
+        finally
+        {
+            TrackCopy.Folder = before;
+        }
+    }
+
     [Fact]
     public void A_waveform_of_a_changed_file_is_read_again()
     {

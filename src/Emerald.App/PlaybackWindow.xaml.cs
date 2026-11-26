@@ -59,8 +59,20 @@ public partial class PlaybackWindow : Window
     /// <summary>Suppresses field handlers while the deck is being populated programmatically.</summary>
     private bool _loading = true;
 
-    /// <summary>The delayed feed, while one is running.</summary>
-    private DelayTransmitter? _delayTx;
+    /// <summary>
+    /// The delayed feed, while one is running. The same transmitter Live Edit's Go Live uses, so
+    /// the timeline's EDL - deleted scenes, dropped ingest media, levels - plays into it.
+    /// </summary>
+    private LiveAirTransmitter? _delayTx;
+
+    /// <summary>The transmitter's last report, for the countdown.</summary>
+    private DelayStatus? _lastDelayStatus;
+
+    /// <summary>True when the live transmission is this deck's tidal lock.</summary>
+    private static bool Ours => LiveAir.Shared.Owner == LiveAirOwner.Playback;
+
+    /// <summary>The live transmission's state as this deck sees it: off unless this deck armed it.</summary>
+    private static LiveAirState LockState => Ours ? LiveAir.Shared.State : LiveAirState.Off;
 
     private WriteableBitmap? _previewBitmap;
     private string _lastAirRender = "";
@@ -70,6 +82,9 @@ public partial class PlaybackWindow : Window
         _settings = settings ?? App.Settings;
 
         InitializeComponent();
+
+        // Before the window is shown, so it opens centred on the size it will actually be.
+        MatchCaptureSize();
 
         LogList.ItemsSource = _log;
 
@@ -89,6 +104,46 @@ public partial class PlaybackWindow : Window
 
         Loaded += Window_Loaded;
         Closing += Window_Closing;
+    }
+
+    // ------------------------------------------------------------------ size
+
+    /// <summary>The design both decks are laid out at; the Viewbox scales it to the window.</summary>
+    private const double DesignWidth = 1060;
+    private const double DesignHeight = 790;
+
+    /// <summary>
+    /// Opens at the capture deck's size - the same window, the same scale, maximised if it is -
+    /// so the two decks read as one application side by side. Without it this deck set no size
+    /// at all and opened at whatever Windows chose, a different size from the capture deck every
+    /// time. When the capture deck is not open, the same largest whole-design fit it opens at.
+    /// </summary>
+    private void MatchCaptureSize()
+    {
+        if (Application.Current?.Windows.OfType<ShellWindow>().FirstOrDefault() is { } capture &&
+            capture.IsLoaded)
+        {
+            Rect normal = capture.RestoreBounds;
+
+            Width = normal.Width > 0 ? normal.Width : capture.ActualWidth;
+            Height = normal.Height > 0 ? normal.Height : capture.ActualHeight;
+
+            if (capture.WindowState == WindowState.Maximized) WindowState = WindowState.Maximized;
+            return;
+        }
+
+        double chromeWidth = 2 * SystemParameters.ResizeFrameVerticalBorderWidth;
+        double chromeHeight = SystemParameters.WindowCaptionHeight
+                            + 2 * SystemParameters.ResizeFrameHorizontalBorderHeight;
+
+        double availableWidth = SystemParameters.WorkArea.Width - chromeWidth - 40;
+        double availableHeight = SystemParameters.WorkArea.Height - chromeHeight - 24;
+
+        double scale = Math.Clamp(
+            Math.Min(availableWidth / DesignWidth, availableHeight / DesignHeight), 1.0, 1.6);
+
+        Width = Math.Round(DesignWidth * scale + chromeWidth);
+        Height = Math.Round(DesignHeight * scale + chromeHeight);
     }
 
     // ------------------------------------------------------------------ lifecycle
@@ -125,7 +180,7 @@ public partial class PlaybackWindow : Window
 
         ActivityLog.Shared.Line += OnLogLine;
 
-        TidalLock.Shared.Changed += OnTidalLockChanged;
+        LiveAir.Shared.Changed += OnTidalLockChanged;
         PipelineState.Shared.Changed += OnPipelineChanged;
         SdiPorts.Shared.Changed += OnPortsChanged;
 
@@ -143,7 +198,7 @@ public partial class PlaybackWindow : Window
     {
         // Releasing the output drops whatever is on air, which is not something to do because
         // a window was closed by accident.
-        if (_playout?.Current is not null)
+        if (_playout?.Current is not null || _delayTx is not null)
         {
             MessageBoxResult answer = MessageBox.Show(this,
                 "The transmitter is live.\n\nClosing the playback deck will release the output. Close anyway?",
@@ -157,7 +212,7 @@ public partial class PlaybackWindow : Window
         }
 
         _clock.Stop();
-        TidalLock.Shared.Changed -= OnTidalLockChanged;
+        LiveAir.Shared.Changed -= OnTidalLockChanged;
         PipelineState.Shared.Changed -= OnPipelineChanged;
         SdiPorts.Shared.Changed -= OnPortsChanged;
 
@@ -165,8 +220,8 @@ public partial class PlaybackWindow : Window
         // line written after it closes still runs its handler.
         ActivityLog.Shared.Line -= OnLogLine;
 
-        if (TidalLock.Shared.State != TidalLockState.Off)
-            TidalLock.Shared.Disarm("Playback deck closed - tidal lock released.");
+        if (LockState != LiveAirState.Off)
+            LiveAir.Shared.Stop("Playback deck closed - tidal lock released.");
 
         // Not waited on. The card is let go of on a background thread, and a deck that hangs
         // for five seconds on the way out is the same freeze this moved off the UI thread.
@@ -306,11 +361,13 @@ public partial class PlaybackWindow : Window
     /// <summary>
     /// How this deck names itself when it holds ports, so its own are never shown as taken.
     ///
-    /// The same string <see cref="Emerald.Video.DelayTransmitter"/> uses, because it is this
-    /// deck's transmitter doing the holding. If the two ever disagree the deck would grey out its
-    /// own ports mid-transmission.
+    /// The same string the transmitter uses, because it is this deck's transmitter doing the
+    /// holding. If the two ever disagree the deck would grey out its own ports mid-transmission.
+    /// Tidal lock transmits with <see cref="LiveAirTransmitter"/>, which names itself by board.
     /// </summary>
-    private string PortOwner => $"tidal lock (board {_settings.PlaybackBoardIndex})";
+    private string PortOwner => _delayTx is not null || (Ours && LiveAir.Shared.State != LiveAirState.Off)
+        ? LiveAirTransmitter.OwnerFor(Ours ? LiveAir.Shared.BoardIndex : (uint)Math.Max(0, _settings.PlaybackBoardIndex))
+        : $"tidal lock (board {_settings.PlaybackBoardIndex})";
 
     /// <summary>
     /// Another module took or gave back a port. Raised from whichever thread that module runs on,
@@ -543,7 +600,7 @@ public partial class PlaybackWindow : Window
     {
         // Not while it is armed: the list is disabled then, and rewriting the selection under
         // an operator who has already committed to a delay would change what they armed.
-        if (TidalLock.Shared.State == TidalLockState.Off) RenderDelayOptions();
+        if (LockState == LiveAirState.Off) RenderDelayOptions();
     });
 
 
@@ -594,12 +651,12 @@ public partial class PlaybackWindow : Window
 
     private async void Arm_Click(object sender, RoutedEventArgs e)
     {
-        if (TidalLock.Shared.State != TidalLockState.Off)
+        if (LockState is not (LiveAirState.Off or LiveAirState.Failed))
         {
             // Said and drawn before the card is let go of, not after: the release can take as
             // long as the card takes, and a button that appears to have done nothing until it
             // finishes is a button an operator presses again.
-            TidalLock.Shared.Disarm();
+            LiveAir.Shared.Stop("Tidal lock disarmed on the playback deck.");
             Show("Tidal lock disarmed.", Level.Warn);
 
             ArmButton.IsEnabled = false;
@@ -608,9 +665,21 @@ public partial class PlaybackWindow : Window
             return;
         }
 
+        // One live transmission at a time: it is the one the timeline's EDL is sent to.
+        if (LiveAir.Shared.State is not (LiveAirState.Off or LiveAirState.Failed))
+        {
+            Log("Live Edit is already live (Go Live). End it there before arming tidal lock here.", Level.Warn);
+            return;
+        }
+
         if (!TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)) return;
 
-        TidalLock.Shared.Arm(SelectedDelay, SelectedStart);
+        // Armed through the same engine as Live Edit's Go Live, so every edit on the timeline -
+        // a deleted scene, a dropped ingest item, a level - reaches this transmitter. The headroom
+        // is the room inserts have to grow the delay into, as Go Live last chose it.
+        _lastDelayStatus = null;
+        LiveAir.Shared.Arm(SelectedDelay, TimeSpan.FromSeconds(Math.Max(0, _settings.LiveHeadroomSeconds)),
+                           board!.Index, ChosenTxPorts, SelectedStart, LiveAirOwner.Playback);
 
         // Said plainly, because arming on its own transmits nothing and the next step is in
         // the other window - which is exactly the thing an operator would wait in vain for.
@@ -620,21 +689,34 @@ public partial class PlaybackWindow : Window
             Level.Warn);
     }
 
-    private void OnTidalLockChanged(TidalLock lockState) => Dispatcher.BeginInvoke(() =>
+    private void OnTidalLockChanged(LiveAir lockState) => Dispatcher.BeginInvoke(() =>
     {
         RenderTidalLock();
+
+        // Go Live from Live Edit is that window's business; only this deck's own lock is acted on.
+        if (lockState.Owner != LiveAirOwner.Playback)
+        {
+            if (_delayTx is not null) _ = StopDelayedFeed();
+            return;
+        }
 
         switch (lockState.State)
         {
             // Shown, not logged: the lock writes its own transitions into the record, and
             // logging them here would say everything twice.
-            case TidalLockState.CountingDown:
+            case LiveAirState.CountingDown:
                 Show(lockState.Detail, Level.Ok);
                 StartDelayTransmitter(lockState);
                 break;
 
-            case TidalLockState.Failed:
+            case LiveAirState.Failed:
                 Show(lockState.Detail, Level.Error);
+                _ = StopDelayedFeed();
+                break;
+
+            case LiveAirState.Off:
+                Show(lockState.Detail, Level.Warn);
+                _ = StopDelayedFeed();
                 break;
 
             default:
@@ -653,35 +735,42 @@ public partial class PlaybackWindow : Window
     /// wrong thing for a delay: there is no file to decode and no cue to wait for, only a
     /// ring of frames and a fixed distance to keep from its head.
     /// </summary>
-    private void StartDelayTransmitter(TidalLock lockState)
+    private void StartDelayTransmitter(LiveAir lockState)
     {
         if (_delayTx is not null) return;
 
         if (lockState.Line is not DelayLine line)
         {
-            TidalLock.Shared.Fail("The capture deck did not open a delay line.");
+            lockState.Fail("The capture deck did not open a delay line.");
             return;
         }
 
-        if (!TryTransmitTarget(out BoardInfo? board, out ChannelPort? port)) return;
+        if (!TryTransmitTarget(out BoardInfo? board, out ChannelPort? port))
+        {
+            lockState.Fail("No transmitter is selected on the playback deck.");
+            return;
+        }
 
         // A TX channel cannot be opened twice, and PlayoutService holds its output open
         // indefinitely once the queue drains. It has to let go first.
         _playout?.StopAll();
 
-        // Every port switched on, carrying the one delayed picture. They are fixed for the life
-        // of this transmitter: a card does not grow another output under a running one, so a port
-        // switched on from here is wanted at the next arm rather than now.
-        IReadOnlyList<int> ports = ChosenTxPorts;
+        // The ports chosen when it was armed, carrying the one delayed picture. They are fixed for
+        // the life of this transmitter: a card does not grow another output under a running one.
+        IReadOnlyList<int> ports = lockState.Ports.Count > 0 ? lockState.Ports : ChosenTxPorts;
 
         try
         {
-            _delayTx = new DelayTransmitter(board!.Index, ports, line, lockState.Delay,
-                                            _settings.RecordingSegmentSeconds);
+            // Plays the timeline's EDL into the delay, exactly as Go Live does: the cues are read
+            // from LiveAir every frame, so an edit made in Live Edit reaches air while this runs.
+            _delayTx = new LiveAirTransmitter(lockState.BoardIndex, ports, line, lockState.Delay,
+                                              _playout!.FfmpegPath!, LiveAir.Shared.CuesForAir,
+                                              () => LiveAir.Shared.AudioEdits,
+                                              () => LiveAir.Shared.AudioSwitches);
         }
         catch (DelayLineException ex)
         {
-            TidalLock.Shared.Fail(ex.Message);
+            lockState.Fail(ex.Message);
             return;
         }
 
@@ -692,13 +781,15 @@ public partial class PlaybackWindow : Window
         _delayTx.Start();
 
         Log($"Delaying {line.Width}x{line.Height}{line.FrameRate} to {port!.Name} on board " +
-            $"{board!.Index}, {TidalLock.Describe(lockState.Delay)} behind. " +
-            $"Ring: {line.SlotCount} frames at {line.Path}.", Level.Ok);
+            $"{board!.Index}, {TidalLock.Describe(lockState.Delay)} behind, with Live Edit's timeline " +
+            $"played into it. Ring: {line.SlotCount} frames at {line.Path}.", Level.Ok);
     }
 
     /// <summary>The transmitter reports from its own thread; everything here marshals.</summary>
     private void OnDelayStatus(DelayStatus status) => Dispatcher.BeginInvoke(() =>
     {
+        _lastDelayStatus = status;
+
         (string label, string brush) = status.Phase switch
         {
             DelayPhase.Opening => ("Opening the transmitter", "IpMuted"),
@@ -737,45 +828,54 @@ public partial class PlaybackWindow : Window
         switch (status.Phase)
         {
             case DelayPhase.OnAir:
-                TidalLock.Shared.WentToAir();
+                LiveAir.Shared.WentToAir();
                 break;
 
             case DelayPhase.Finished:
-                TidalLock.Shared.DrainComplete();
-                StopDelayedFeed();
+                _ = StopDelayedFeed();
+                LiveAir.Shared.Stop("Tidal lock: the delay has played out.");
                 break;
 
             case DelayPhase.Failed:
-                TidalLock.Shared.Fail(status.Message.Length > 0 ? status.Message : "The delayed feed stopped.");
-                StopDelayedFeed();
+                _ = StopDelayedFeed();
+                LiveAir.Shared.Fail(status.Message.Length > 0 ? status.Message : "The delayed feed stopped.");
                 break;
         }
     });
 
     private void RenderTidalLock()
     {
-        TidalLock lockState = TidalLock.Shared;
+        LiveAir lockState = LiveAir.Shared;
+        LiveAirState state = LockState;
 
-        (string label, string brush) = lockState.State switch
+        (string label, string brush) = state switch
         {
-            TidalLockState.Armed => ("ARMED", "Warn"),
-            TidalLockState.CountingDown => ("COUNTING DOWN", "IpTeal"),
-            TidalLockState.OnAir => ("ON AIR", "Ok"),
-            TidalLockState.Failed => ("FAILED", "IpRed"),
+            LiveAirState.Armed => ("ARMED", "Warn"),
+            LiveAirState.CountingDown => ("COUNTING DOWN", "IpTeal"),
+            LiveAirState.OnAir => ("ON AIR", "Ok"),
+            LiveAirState.Draining => ("DRAINING", "IpTeal"),
+            LiveAirState.Failed => ("FAILED", "IpRed"),
             _ => ("OFF", "IpMuted"),
         };
 
         LockDot.Fill = Brush(brush);
         LockStateText.Text = label;
         LockStateText.Foreground = Brush(brush);
-        LockDetailText.Text = lockState.Detail;
+        LockDetailText.Text = Ours
+            ? lockState.Detail
+            : lockState.Active || lockState.State == LiveAirState.Armed
+                ? "Live Edit is live with Go Live - tidal lock here is unavailable until it ends."
+                : "";
 
-        ArmButton.Content = lockState.State == TidalLockState.Off ? "ARM TIDAL LOCK" : "DISARM TIDAL LOCK";
-        DelayBox.IsEnabled = lockState.State == TidalLockState.Off;
+        // Failed counts as off for the button: there is nothing to disarm, only to arm again.
+        bool off = state is LiveAirState.Off or LiveAirState.Failed;
+
+        ArmButton.Content = off ? "ARM TIDAL LOCK" : "DISARM TIDAL LOCK";
+        DelayBox.IsEnabled = off;
 
         // Coming back to off is the moment "no delay" can start or stop being on offer: the
         // capture deck may have rolled while this was armed.
-        if (lockState.State == TidalLockState.Off) RenderDelayOptions();
+        if (off) RenderDelayOptions();
 
         // Which of the three steps is live. The one still to be done by the operator is lit;
         // arming and then waiting for a window that is not this one is the mistake worth
@@ -783,19 +883,19 @@ public partial class PlaybackWindow : Window
         // Says the delay actually chosen rather than a number baked into the markup. It read
         // "one minute later" whatever was selected, which was wrong for three of the four
         // options and is wrong for the default now.
-        DelayStart start = lockState.State == TidalLockState.Off ? SelectedStart : lockState.Start;
+        DelayStart start = off ? SelectedStart : lockState.Start;
 
-        Step3Text.Text = start == DelayStart.Fixed || lockState.State is not (TidalLockState.Off or TidalLockState.Armed)
-            ? $"3.  On air {Describe(lockState.State == TidalLockState.Off ? SelectedDelay : lockState.Delay)} later"
+        Step3Text.Text = start == DelayStart.Fixed || state is not (LiveAirState.Off or LiveAirState.Failed or LiveAirState.Armed)
+            ? $"3.  On air {Describe(off ? SelectedDelay : lockState.Delay)} later"
             : start == DelayStart.FromFirstSegment
                 ? "3.  On air from the first segment"
                 : "3.  On air from the first segment, once it is recorded";
 
-        Step1Text.Foreground = Brush(lockState.State == TidalLockState.Off ? "IpMint" : "IpDim");
-        Step2Text.Foreground = Brush(lockState.State == TidalLockState.Armed ? "IpMint" : "IpDim");
+        Step1Text.Foreground = Brush(off ? "IpMint" : "IpDim");
+        Step2Text.Foreground = Brush(state == LiveAirState.Armed ? "IpMint" : "IpDim");
         Step3Text.Foreground = Brush(
-            lockState.State is TidalLockState.CountingDown or TidalLockState.OnAir
-                             or TidalLockState.Draining ? "IpMint" : "IpDim");
+            state is LiveAirState.CountingDown or LiveAirState.OnAir
+                  or LiveAirState.Draining ? "IpMint" : "IpDim");
     }
 
     /// <summary>
@@ -810,7 +910,7 @@ public partial class PlaybackWindow : Window
     /// its life inside the card's blocking slot call — it only comes back when the card is
     /// ready for another frame, and a card that has stopped taking them does not come back at
     /// all. Doing that on the UI thread stopped the whole application dead for the five-second
-    /// join, twice over once <see cref="DelayTransmitter.Dispose"/> joined it again, which is
+    /// join, twice over once the transmitter's Dispose joined it again, which is
     /// what "not responding" on DISARM was.
     ///
     /// The field is cleared first, so the deck is already disarmed as far as anything else is
@@ -846,8 +946,8 @@ public partial class PlaybackWindow : Window
     {
         Log("Stop requested - releasing the transmitter.", Level.Warn);
 
-        if (TidalLock.Shared.State != TidalLockState.Off)
-            TidalLock.Shared.Disarm("Output stopped by the operator.");
+        if (LockState != LiveAirState.Off)
+            LiveAir.Shared.Stop("Output stopped by the operator.");
 
         Task released = StopDelayedFeed();
 
@@ -922,11 +1022,11 @@ public partial class PlaybackWindow : Window
 
         // The countdown is the whole point of the panel, so it is redrawn on the clock rather
         // than on a slower tick: an operator watching the last seconds should see every one.
-        TidalLock lockState = TidalLock.Shared;
+        LiveAir lockState = LiveAir.Shared;
 
-        switch (lockState.State)
+        switch (LockState)
         {
-            case TidalLockState.Armed:
+            case LiveAirState.Armed:
                 // Armed and waiting. Said on the stage, not just in a corner: arming
                 // transmits nothing, and the next move is in the other window.
                 LockPanel.Visibility = Visibility.Visible;
@@ -936,13 +1036,15 @@ public partial class PlaybackWindow : Window
                 CountdownDetail.Text = "Waiting for the capture deck. Press Record there to start the countdown.";
                 break;
 
-            case TidalLockState.CountingDown:
-                // Counted in frames actually in the line, not against the station clock. The
-                // receiver's own cadence is the truth about how much delay exists, so this
-                // stays honest through a timecode outage and cannot reach zero before the
-                // frames to fill the delay have really arrived.
-                TimeSpan left = lockState.TimeToAir;
-                long target = lockState.TargetFrames;
+            case LiveAirState.CountingDown:
+                // Counted in frames actually buffered, as the transmitter reports them, not
+                // against the station clock. The receiver's own cadence is the truth about how
+                // much delay exists, so this cannot reach zero before the frames have arrived.
+                int lineRate = Math.Max(1, lockState.Line?.FrameRate ?? 25);
+                long target = _lastDelayStatus?.Target ?? _delayTx?.TargetFrames
+                              ?? (long)Math.Ceiling(lockState.Delay.TotalSeconds * lineRate);
+                long buffered = Math.Min(target, _lastDelayStatus?.Buffered ?? 0);
+                TimeSpan left = TimeSpan.FromSeconds(Math.Ceiling(Math.Max(0, target - buffered) / (double)lineRate));
 
                 LockPanel.Visibility = Visibility.Visible;
                 CountdownText.Foreground = Brush("IpMint");
@@ -963,12 +1065,11 @@ public partial class PlaybackWindow : Window
                 CountdownText.Text = $"{(int)left.TotalMinutes:00}:{left.Seconds:00}";
 
                 CountdownDetail.Text =
-                    $"{lockState.FramesBuffered:N0} of {target:N0} frames buffered" +
-                    (lockState.CueAt is { } cue ? $"  |  on air at {cue}" : "") +
+                    $"{buffered:N0} of {target:N0} frames buffered" +
                     "  |  holding black on the transmitter until then";
                 break;
 
-            case TidalLockState.Draining:
+            case LiveAirState.Draining:
                 LockPanel.Visibility = Visibility.Visible;
                 LockHeadline.Text = "TIDAL LOCK - DRAINING";
                 CountdownText.Text = TidalLock.Describe(lockState.Delay);
@@ -1083,35 +1184,49 @@ public partial class PlaybackWindow : Window
     private void ShowAirFrames()
     {
         FrameLedger frames = PipelineState.Shared.Frames;
-        TidalLock tidal = TidalLock.Shared;
+        LiveAir live = LiveAir.Shared;
 
-        if (frames.Aired == 0 && tidal.State is TidalLockState.Off or TidalLockState.Armed)
+        if (_delayTx is not { } tx || LockState is LiveAirState.Off or LiveAirState.Armed)
         {
             AirFramesText.Text = "-";
             AirFramesText.Foreground = Brush("IpDim");
             return;
         }
 
-        long delay = tidal.TargetFrames;
+        // The transmitter's own count; the delay it is holding now, which inserts and cuts on the
+        // timeline change.
+        long aired = tx.Counters.FramesOut;
+        long repeats = tx.Counters.Repeats, skips = tx.Counters.Skips, resyncs = tx.Counters.Resyncs;
+        long delay = live.DelayFrames > 0 ? live.DelayFrames : tx.TargetFrames;
+
         // From the frame of the recording actually on air, not from frames sent: the line can have
         // been filling since the recording began, long before this transmitter started counting.
         // A second of slack, because the recorded count is only published once a second.
-        long slack = TidalLock.Shared.Line?.FrameRate ?? 25;
-        long behind = PipelineState.Shared.AiredFrame is { } airedAt
-            ? Math.Max(0, frames.Recorded - (airedAt + 1) - delay - slack)
+        long slack = live.Line?.FrameRate ?? 25;
+        long behind = live.Position is { RecordingFrame: >= 0 } at && at.CueId is null
+            ? Math.Max(0, frames.Recorded - (at.RecordingFrame + 1) - delay - slack)
             : 0;
 
+        // Frames the ring itself turned away, and the disk it is on: those never reach air, and
+        // the disk is the thing to move or replace.
+        long notDelayed = live.Line is DelayLine ring ? ring.Dropped : 0;
+        string disk = live.Line is DelayLine on ? on.Disk : "";
+
         AirFramesText.Text =
-            $"{frames.Aired:N0} out of {frames.Recorded:N0}  ·  delay {delay:N0}" +
+            $"{aired:N0} out of {frames.Recorded:N0}  ·  delay {delay:N0}" +
+            (disk.Length > 0 ? $"  ·  ring on {disk}" : "") +
+            (notDelayed > 0 ? $"  ·  {notDelayed:N0} NOT DELAYED - {disk} could not keep up" : "") +
             (behind > 0 ? $"  ·  {behind:N0} BEHIND" : "") +
-            (frames.Skipped > 0 ? $"  ·  {frames.Skipped:N0} SKIPPED" : "") +
-            (frames.Repeated > 0 ? $"  ·  {frames.Repeated:N0} repeated" : "") +
-            (frames.Resyncs > 0 ? $"  ·  {frames.Resyncs} resync" : "") +
-            (behind == 0 && frames.Skipped == 0 && frames.Repeated == 0 ? "  ·  no drops" : "");
+            (skips > 0 ? $"  ·  {skips:N0} SKIPPED" : "") +
+            (repeats > 0 ? $"  ·  {repeats:N0} repeated" : "") +
+            (resyncs > 0 ? $"  ·  {resyncs} resync" : "") +
+            (behind == 0 && skips == 0 && repeats == 0 && notDelayed == 0 ? "  ·  no drops" : "");
+
+        AirFramesText.ToolTip = live.Line is DelayLine path ? $"Delay ring: {path.Path}" : null;
 
         AirFramesText.Foreground = Brush(
-            behind > 0 || frames.Skipped > 0 ? "IpRed"
-            : frames.Repeated > 0 ? "Warn"
+            notDelayed > 0 || behind > 0 || skips > 0 ? "IpRed"
+            : repeats > 0 ? "Warn"
             : "IpTeal");
     }
 
@@ -1124,7 +1239,10 @@ public partial class PlaybackWindow : Window
     /// </summary>
     private void ShowOnAirTimecode()
     {
-        if (PipelineState.Shared.AiredFrame is not { } frame)
+        // The live transmitter's position: the recording frame last sent.
+        long? onAir = Ours && LiveAir.Shared.Position is { RecordingFrame: >= 0 } at ? at.RecordingFrame : null;
+
+        if ((onAir ?? PipelineState.Shared.AiredFrame) is not { } frame)
         {
             AirTcPanel.Visibility = Visibility.Collapsed;
             return;
@@ -1133,7 +1251,7 @@ public partial class PlaybackWindow : Window
         AirTcPanel.Visibility = Visibility.Visible;
 
         Timecode? start = PipelineState.Shared.RecordingStart;
-        int rate = start?.Rate ?? TidalLock.Shared.Line?.FrameRate ?? 25;
+        int rate = start?.Rate ?? LiveAir.Shared.Line?.FrameRate ?? TidalLock.Shared.Line?.FrameRate ?? 25;
 
         AirTcText.Text = PipelineState.TimecodeOf(start, frame)?.ToString() ?? "--:--:--:--";
         AirElapsedText.Text = $"+{new Timecode(frame, Math.Max(1, rate))}";

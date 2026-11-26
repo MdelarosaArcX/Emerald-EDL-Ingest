@@ -1569,6 +1569,9 @@ public partial class EdlWindow : Window
 
         _capture.Start(request! with { Names = naming });
 
+        // Its ingest folder, as the deck makes one for its own recordings.
+        IngestLibrary.Ensure(IngestLibrary.RootFor(_settings), naming.Folder);
+
         Log($"Recording the receiver while on air, into {naming.Folder}. " +
             "This is the EDL's own recording, separate from the capture deck's.", LogLevel.Info);
 

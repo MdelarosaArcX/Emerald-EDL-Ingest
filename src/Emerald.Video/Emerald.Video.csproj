@@ -14,6 +14,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- DelayLine.AlwaysRelease: test rings are too small for the volume ever to be short of room. -->
+    <InternalsVisibleTo Include="Emerald.Video.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Emerald.Core\Emerald.Core.csproj" />
     <ProjectReference Include="..\Emerald.Deltacast\Emerald.Deltacast.csproj" />
   </ItemGroup>

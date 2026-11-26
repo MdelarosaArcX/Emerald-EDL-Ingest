@@ -80,6 +80,23 @@ public sealed class AudioSource : IDisposable
     public static AudioSource Silent(int frameRate) => new(null, SampleRate / frameRate);
 
     /// <summary>
+    /// Silence that lasts <paramref name="length"/> before it counts as exhausted. For a file that
+    /// has no audio stream at the index a track asks for: its picture still runs for its whole
+    /// length, so the track has to stay silent for that long too. A plain <see cref="Silent"/>
+    /// source is exhausted straight away, so the track would jump to the next file's audio and
+    /// put the wrong programme's sound under this one's picture.
+    /// </summary>
+    public static AudioSource SilentFor(int frameRate, TimeSpan length)
+    {
+        var source = new AudioSource(null, SampleRate / frameRate);
+
+        // The buffer is all zeros and is never written to, so every sample read in
+        // [0, _written) comes out silent. _written only marks where it ends.
+        source._written = Math.Max(0, (long)(length.TotalSeconds * SampleRate));
+        return source;
+    }
+
+    /// <summary>
     /// Decodes one media file to stereo 48 kHz.
     ///
     /// <paramref name="streamIndex"/> picks which audio stream of the file to take, counted

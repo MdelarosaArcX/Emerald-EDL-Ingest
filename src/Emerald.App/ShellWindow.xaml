@@ -527,7 +527,7 @@
                                                              GroupName="AudioPair"
                                                              IsChecked="{Binding Listening, Mode=TwoWay}"
                                                              Checked="AudioPair_Checked"
-                                                             ToolTip="{Binding ChannelLabel}"/>
+                                                             ToolTip="Hear these two channels on this PC. Every pair marked REC is in the recording."/>
 
                                                 <!-- In the file. Not the same as being on the
                                                      wire: the channel count is settled when the
@@ -865,6 +865,7 @@
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
                                         </Grid.RowDefinitions>
 
                                         <TextBlock Grid.Row="0" Grid.Column="0" Text="High-res path"
@@ -891,6 +892,22 @@
                                                 Tag="{StaticResource IconFolder}"
                                                 Foreground="{StaticResource IpMuted}" Click="BrowseStorePath_Click"
                                                 ToolTip="Choose the low-res folder"/>
+
+                                        <!-- The tidal lock / Go Live delay ring: about 104 MB/s of
+                                             writes at 1080p25, nonstop. Wants a fast local drive of
+                                             its own - not the Windows drive, not a recording drive. -->
+                                        <TextBlock Grid.Row="2" Grid.Column="0" Text="Delay path"
+                                                   Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
+                                        <TextBox x:Name="DelayPathBox" Grid.Row="2" Grid.Column="1"
+                                                 Style="{StaticResource IpMiniTextBox}" Margin="0,3,0,0"
+                                                 LostFocus="DelayPath_LostFocus" KeyDown="DelayPath_KeyDown"
+                                                 ToolTip="Folder for the tidal lock and Go Live delay ring. It writes about 104 MB/s at 1080p25 for as long as a recording runs, so give it a fast local drive that is not the Windows drive and not a recording drive. Clear it to go back to automatic. Takes effect on the next recording."/>
+                                        <Button x:Name="DelayPathBrowse" Grid.Row="2" Grid.Column="3"
+                                                Style="{StaticResource IpIconButton}" Width="24" Height="18"
+                                                Margin="0,3,0,0"
+                                                Tag="{StaticResource IconFolder}"
+                                                Foreground="{StaticResource IpMuted}" Click="BrowseDelayPath_Click"
+                                                ToolTip="Choose the delay ring folder"/>
                                     </Grid>
 
                                     <TextBlock Grid.Row="3" Grid.Column="0" Text="Title"

@@ -171,7 +171,7 @@ public sealed class RangePlanTests
     [Fact]
     public void Listing_a_store_that_has_never_exported_anything_is_empty_and_not_an_error()
     {
-        Assert.Empty(RangeExport.List(
+        Assert.Empty(IngestLibrary.Folders(
             System.IO.Path.Combine(System.IO.Path.GetTempPath(), "emerald-no-such-store"), null));
     }
 

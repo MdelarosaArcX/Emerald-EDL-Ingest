@@ -232,7 +232,7 @@ There is no string parsing into an index. Single-port selectors are combo boxes 
 
 **RX extract** (`SdiAudioReader`). Unused channels return full zero buffers, so a pair counts as present only if a sample is non-zero. `SdiCapture.DetectPairs` watches for 2 seconds and takes the highest count, minimum 1. The count runs from the first pair and stops at the first silent one, so audio on pairs 1 and 3 with pair 2 empty records one pair. No caller passes `audioPairs`, so pairs are always auto-detected.
 
-**Known fault.** On feeds with more than one pair, the delay paths treat multichannel audio as stereo. See the [assessment](11_TECHNICAL_ASSESSMENT.md).
+**On the delayed output**, `RecordingSound` takes the pair chosen in Live Edit (`AudioSwitches`) out of the frame's interleaved channels and sends it on CH 1-2, cross-fading a change over one frame. The channel count travels with each frame in the delay slot's flags. `DelayTransmitter`, which nothing starts, still reads the sound as stereo. Not yet heard at a card.
 
 ## Error handling by layer
 

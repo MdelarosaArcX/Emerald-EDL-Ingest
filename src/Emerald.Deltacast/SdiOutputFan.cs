@@ -60,7 +60,8 @@ public sealed class SdiOutputFan : ISdiOutput
     /// again and the exception is left to the caller. A transmitter half on air is worse than one
     /// that refused to start, because only one of those gets noticed.
     /// </summary>
-    public static SdiOutputFan Open(uint boardIndex, IReadOnlyList<int> txChannels, VideoFormat format)
+    public static SdiOutputFan Open(uint boardIndex, IReadOnlyList<int> txChannels, VideoFormat format,
+                                    uint queueDepth = SdiOutput.DefaultQueueDepth)
     {
         if (txChannels.Count == 0)
             throw new SdiOutputException("No TX port was selected.");
@@ -70,7 +71,7 @@ public sealed class SdiOutputFan : ISdiOutput
         try
         {
             foreach (int channel in txChannels.Distinct())
-                fan._outputs.Add(SdiOutput.Open(boardIndex, channel, format));
+                fan._outputs.Add(SdiOutput.Open(boardIndex, channel, format, queueDepth));
         }
         catch
         {

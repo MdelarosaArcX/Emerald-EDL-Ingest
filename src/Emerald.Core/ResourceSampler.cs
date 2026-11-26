@@ -158,6 +158,8 @@ public sealed class ResourceSampler : IDisposable
             try { sample = Sample(); }
             catch { continue; }
 
+            WarnIfMemoryLow(sample);
+
             LogDatabase? db;
             lock (_gate)
             {
@@ -187,6 +189,49 @@ public sealed class ResourceSampler : IDisposable
 
         // Asked for again between the check and the clear: start over.
         if (Wanted) EnsureRunning();
+    }
+
+    // ------------------------------------------------------------------ low memory
+
+    private readonly LowMemoryWatch _lowMemory = new();
+
+    /// <summary>
+    /// Says so in the log the moment free memory crosses a threshold, rather than only turning a
+    /// tile on the monitoring page amber. With the delay held in RAM, a busy Live Edit session -
+    /// players, inserts, an export - is what is left to squeeze, and the operator needs to know to
+    /// close something before Windows starts paging and playout stutters.
+    /// </summary>
+    private void WarnIfMemoryLow(ResourceSample sample)
+    {
+        if (sample.RamTotalBytes <= 0) return;
+
+        long free = sample.RamTotalBytes - sample.RamUsedBytes;
+        LowMemoryWatch.Level? crossed = _lowMemory.Check(free);
+        if (crossed is null) return;
+
+        string gb = $"{free / (double)(1L << 30):F1} GB";
+        string emerald = $"{sample.EmeraldPrivateBytes / (double)(1L << 30):F1} GB";
+
+        switch (crossed)
+        {
+            case LowMemoryWatch.Level.Critical:
+                ActivityLog.Shared.Warn(LogSource.App,
+                    $"MEMORY  only {gb} free - Windows is about to page and playout can stutter. Close other programs " +
+                    $"now, and hold off exports. (Emerald {emerald}.)",
+                    @event: "memory.critical");
+                break;
+
+            case LowMemoryWatch.Level.Low:
+                ActivityLog.Shared.Warn(LogSource.App,
+                    $"MEMORY  {gb} free - close other programs; exports and inserts may stutter if it falls further. " +
+                    $"(Emerald {emerald}.)",
+                    @event: "memory.low");
+                break;
+
+            default:
+                ActivityLog.Shared.Info(LogSource.App, $"MEMORY  {gb} free again.", @event: "memory.recovered");
+                break;
+        }
     }
 
     // ------------------------------------------------------------------ one sample

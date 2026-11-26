@@ -9,7 +9,11 @@ namespace Emerald.Video.Tests;
 /// <summary>
 /// The developer's memory record: that it says true things about the process, names the ffmpegs
 /// this process started and no others, and carries what the modules report about themselves.
+///
+/// Run on their own (<see cref="ProcessWideCollection"/>): the handle count is the whole process's,
+/// and an export test starting ffmpeg alongside put a hundred passing handles in it.
 /// </summary>
+[Collection(ProcessWideCollection.Name)]
 public sealed class MemoryMonitorTests
 {
     [Fact]

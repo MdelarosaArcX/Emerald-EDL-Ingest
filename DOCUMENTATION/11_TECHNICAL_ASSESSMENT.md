@@ -56,6 +56,8 @@ Each frame re-read almost the same 1920 samples at 25 fps, moving one sample a f
 
 ### A4. Multi-pair audio corrupts the delayed output
 
+**Fixed in code** for `LiveAirTransmitter`, which both Go Live and the playback deck use: each frame carries its channel count and `RecordingSound` takes out one pair (`RecordingSoundTests`, `DelayLineTests`, `DelayOverflowTests`). Slots now hold eight pairs. Not yet heard at a card. `DelayTransmitter` is unchanged and unused. What follows describes the fault as it was.
+
 `SdiCapture` interleaves `pairs × 2` channels and passes the chunk to the ring unchanged. `DelayLine` allows for stereo. `DelayTransmitter.PushWithAudio` (`src/Emerald.Video/DelayTransmitter.cs:469`) and its copy in `LiveAirTransmitter` treat it as 4 bytes per sample.
 
 With 2 pairs, left alternates channels 1 and 3 sample by sample, at twice the normal count. Above 4 pairs the chunk is cut off. Since pairs are always auto-detected, a multi-language feed triggers this. The recording itself is correct. Only the air path is affected.

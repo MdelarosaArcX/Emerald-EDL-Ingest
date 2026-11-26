@@ -25,11 +25,11 @@ public partial class ExportDialog : Window
     private readonly string _extension;
 
     public ExportDialog(string suggestedName, string extension, Timecode inAt, Timecode outAt,
-                        int rate, IReadOnlyList<RangePart> parts, Emerald.Video.StorePaths store)
+                        int rate, IReadOnlyList<RangePart> parts, string ingestFolder)
     {
         InitializeComponent();
 
-        _folder = store.Exports;
+        _folder = ingestFolder;
         _extension = extension;
 
         long frames = parts.Sum(p => p.Frames);
@@ -76,9 +76,10 @@ public partial class ExportDialog : Window
 
         // Refuse rather than overwrite. An export is somebody's work and the name is a guess
         // we suggested, so silently replacing one would be ours to answer for.
-        if (File.Exists(Path.Combine(_folder, $"{name}.{_extension}")))
+        if (File.Exists(Path.Combine(IngestLibrary.HighOf(_folder), $"{name}.{_extension}")) ||
+            File.Exists(Path.Combine(IngestLibrary.LowOf(_folder), $"{name}.mp4")))
         {
-            Complain($"{name}.{_extension} is already in the ingest folder. Choose another name.");
+            Complain($"{name} is already in this recording's ingest folder. Choose another name.");
             return;
         }
 

@@ -16,11 +16,11 @@ public sealed class AudioPairRow : INotifyPropertyChanged
 {
     public required int Pair { get; init; }
 
-    /// <summary>"Stereo 1", as the desk labels it — counting from one.</summary>
-    public string Name => $"Stereo {Pair + 1}";
-
-    /// <summary>The SDI channels it occupies, which is what is patched downstream.</summary>
-    public string ChannelLabel => $"CH {Pair * 2 + 1}-{Pair * 2 + 2}";
+    /// <summary>
+    /// "CH 1-2": the SDI channels it occupies, which is what is patched downstream and what the EDL,
+    /// the recording's files and Live Edit all call it. "Stereo 1" was a name nothing else used.
+    /// </summary>
+    public string Name => $"CH {Pair * 2 + 1}-{Pair * 2 + 2}";
 
     private double _left, _right, _leftPeak, _rightPeak;
     private bool _present, _listening, _hot, _clipping, _audible, _recorded;

@@ -258,7 +258,7 @@ Weak:
 
 `src/Emerald.Core/TimecodeService.cs`, with `TimecodeLink.cs` as the single process-wide owner.
 
-**URL.** `timecodeApiUrl`, default `http://10.0.0.31:8888/api/timecode`. `TrySetUrl` requires an absolute `http` or `https` URI.
+**URL.** `timecodeApiUrl`, default `http://<local IPv4>:8888/api/timecode` (this computer's address, from `LocalAddress.IPv4`; a saved `10.0.0.31` default is migrated to it). `TrySetUrl` requires an absolute `http` or `https` URI.
 
 **Request.** `GET {url}` every 500 ms, 3-second timeout.
 

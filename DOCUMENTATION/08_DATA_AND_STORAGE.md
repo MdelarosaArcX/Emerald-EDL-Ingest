@@ -145,7 +145,7 @@ There is no delete code, so the database grows with history. Removing a finished
 
 | JSON name | Default | Meaning |
 |---|---|---|
-| `timecodeApiUrl` | `http://10.0.0.31:8888/api/timecode` | Timecode service |
+| `timecodeApiUrl` | `http://<local IPv4>:8888/api/timecode` | Timecode service |
 | `captureBoardIndex`, `capturePort` | 0, `RX0` | Capture input |
 | `playbackBoardIndex`, `playbackPort` | 0, `TX0` | Playback output |
 | `playbackPorts` | empty | All TX port names, `|` separated |
@@ -168,7 +168,8 @@ There is no delete code, so the database grows with history. Removing a finished
 | `edlRecordWhileOnAir` | false | EDL records the RX during playout |
 | `monitorApi`, `monitorApiPort` | false, 8787 | Remote monitoring |
 | `audioTracks` | empty | `label`, `source`, `offsetMs`, `isDefault`, `stream`, `streamDetail`, `gainDb` |
-| `ingestBoardIndex`, `ingestPort`, `ingestSom`, `ingestDuration`, `ingestDirectory`, `ingestMetadata`, `ingestTimingMode`, `ingestMockMode` | 0, `RX0`, `01:00:00:00`, `00:15:00:00`, empty, empty, `duration`, false | Last ingest form values. `ingestSom` is the timecode stamped into the clip. `ingestDirectory` empty means the default media folder. `ingestTimingMode` is `duration` or `eom`. `ingestMockMode` simulates boards and the recorder. |
+| `ingestBoardIndex`, `ingestPort`, `ingestSom`, `ingestDuration`, `ingestDirectory`, `ingestMetadata`, `ingestTimingMode`, `ingestMockMode` | 0, `RX0`, `01:00:00:00`, `00:15:00:00`, empty, empty, `duration`, false | Last ingest form values. `ingestSom` is the timecode stamped into the clip. `ingestDirectory` empty means the ingest media path; a job pointed there records into the folder of the recording on air when it starts. `ingestTimingMode` is `duration` or `eom`. `ingestMockMode` simulates boards and the recorder. |
+| `ingestMediaFolder` | empty | The ingest media path (`IngestLibrary.RootFor`), set from Live Edit's Ingest tab. Empty means the exports folder, `StorePaths.Exports`. Read fresh from the file (`AppSettings.SavedIngestMediaFolder`), and kept by `Save` unless that copy of the settings changed it, so the deck saving on close does not undo a change made in Live Edit. |
 | `tidalLockRingFolder` | empty | Empty means `%LOCALAPPDATA%\Emerald\delay`. A folder on the same drive as either recording folder is passed over for that default (`delay.samedisk`). |
 | `dataFolder` | empty | Where `emerald.db`, `ingest.db` and `peaks` go. Empty means `%APPDATA%\Emerald`. |
 | `logRetentionDays` | 14 | Days of log rows and resource samples kept in `emerald.db`. 0 means today only, negative keeps everything. |
@@ -192,19 +193,22 @@ The two folders can be on different drives. On one spinning disk every read of a
 <low-res folder>\
   yyyy-MM-dd_HH-mm-ss\<prefix>_<MMddyyHHmm>_<N>.mp4         proxy segments
   yyyy-MM-dd_HH-mm-ss\pruned.ledger
+<ingest media path>\                                        ingestMediaFolder, default the exports folder
+  yyyy-MM-dd_HH-mm-ss\                                      one per capture recording, made when it rolls
+    high\<name>.mov|.mp4|...                                export, ingest master or dropped file: what airs
+    high\<name>.json                                        export sidecar
+    low\<name>.mp4                                          960x540 H.264 low-res: what Live Edit lists and plays
+    low\.<name>.part.mp4                                    low-res being written (never listed)
+  <name>.mov, <name>.json, <name>.preview.mp4               exports from before folders ("Earlier exports")
 <exports folder>\
-  <name>.mov or .mp4                                        exports
-  <name>.json                                               export sidecar
-  <name>.preview.mp4                                        export viewing copy
   snapshot_yyyy-MM-dd_HH-mm-ss.png                          deck snapshots
-<ingest directory>\
-  low\<clip>.mp4                                            single-file ingest proxy
-  high\<clip>.mov                                           single-file ingest master
 ```
 
-**The exports folder** is `StorePaths.Exports`. When the two folders are laid out the old way, `<store>\high` and `<store>\low`, it is `<store>\ingest`, so existing exports are still found. Otherwise it is `ingest` inside the high-res folder, since an export is cut from the masters. Deck snapshots go to the store's root as before, or to the high-res folder when the two are apart.
+**The exports folder** is `StorePaths.Exports`. When the two folders are laid out the old way, `<store>\high` and `<store>\low`, it is `<store>\ingest`, so existing exports are still found. Otherwise it is `ingest` inside the high-res folder. It is the ingest media path unless `ingestMediaFolder` is set. Deck snapshots go to the store's root as before, or to the high-res folder when the two are apart.
 
-The EDL window's own capture folder box is unchanged: one folder, `high` and `low` under it. So is the Ingest Controller's `ingestDirectory`.
+**The ingest media path** (`IngestLibrary`) holds exports, Ingest Controller clips and dropped media, one folder per capture recording. The deck and the EDL make the recording's folder when they roll, and Live Edit makes it for the recording on air if missing. Live Edit watches the path (`FileSystemWatcher`, plus a 15 s sweep). A file at a recording folder's top level is moved into `high\`, and any `high\` file without a `low\` copy gets one from `IngestProxy` (NVENC or Quick Sync if `GpuEncoder.Choose` finds one that works, otherwise libx264 veryfast), one at a time. Files still open for writing are left until they close. The path may not be the high-res or low-res folder itself, where the storage warden deletes old recordings.
+
+The EDL window's own capture folder box is unchanged: one folder, `high` and `low` under it. The Ingest Controller's `ingestDirectory` defaults to the ingest media path. Pointed anywhere else, it records there as before.
 
 ## Naming conventions
 
@@ -238,7 +242,7 @@ The EDL window's own capture folder box is unchanged: one folder, `high` and `lo
 | `<data folder>\peaks\*.peaks` | One byte a peak, 50 a second | `Waveform` | `Waveform` | Not used for `max(30, logRetentionDays)` days, at startup |
 | `%APPDATA%\Emerald\logs\*.jsonl` (or `logFolder`) | JSONL from earlier builds | Nothing now | Nothing now | `emerald-`, `edl-` and `memory-` files deleted at startup once past `logRetentionDays`, by the date in the name |
 | `%APPDATA%\Emerald\bookmarks\yyyy-MM-dd.json` | JSON, not atomic | `BookmarkBook` | `BookmarkBook` | Deleted when the day's book is emptied |
-| `%LOCALAPPDATA%\Emerald\delay\tidal-*.ring` | Memory-mapped, pre-extended | `DelayLine` | Transmitters, `HeldPicture` | Deleted on last release. Orphans swept at startup. |
+| `<ring folder>\tidal-*.ring` | Memory-mapped, sparse | `DelayLine` | Transmitters, `HeldPicture` | Deleted on last release. Orphans swept at startup. Disk given back only when the volume runs short (see below). |
 | Low-res and high-res folder segments | MP4, MOV | ffmpeg | `MediaLibrary`, `StoreIndex`, `SegmentWatch` | `StorageWarden`, a limit per folder; manual in Live Edit |
 | `pruned.ledger` | Text, one line | `PruneLedger` | `MediaLibrary`, `low` copy only | None |
 | `<ingest dir>\low` and `high` clips | MP4, MOV | ffmpeg | `IngestMediaRegistrar` | Warden only if the ingest directory is the store |
@@ -248,6 +252,56 @@ The EDL window's own capture folder box is unchanged: one folder, `high` and `lo
 | `<ingest dir>\.emerald-ingest-<guid>.tmp` | Probe | `DiskSpace` | None | `DeleteOnClose` |
 | Store root (or the high-res folder), `snapshot_*.png` | PNG | `ShellWindow` | Operator | None |
 | `%TEMP%\Emerald\thumbs\*.png` | PNG | `ClipThumbnails` | `ClipThumbnails` | None |
+
+### Delay ring disk use
+
+**The delay is held in RAM, and on disk only when RAM cannot hold it** (`DelayLine.Create`, decided once as the line opens; a delay on air is never moved).
+
+- **In RAM**, when memory can hold the delay and a 7 s guard, leaving 6 GB free. Raw 1080p25 is 104.5 MB/s, so 120 s is 12.4 GB; that and no more is taken (`delay.memory`). The RAM is locked where Windows allows it (`delay.memoryunlocked` if not). Nothing goes to the disk. The file is still made, sparse and empty, and its drive needs 4 GB free.
+- **On disk** (`DelayLine.IsDirect`, `delay.ondisk`), in the delay path (`tidalLockRingFolder`), when memory cannot hold the delay or another line has it. Read and written directly, past the Windows cache, with a 3 s write queue and 3 s read ahead of the transmitter. A drive that stalls for longer than that loses frames.
+
+**Inserts take memory as they need it** (`DelayOverflow`). An insert makes the delay longer for the rest of the transmission. The part it adds is compressed to DNxHD 145 as it leaves the raw ring, kept in memory taken a second at a time (about 16 MB for each second of insert), decoded a second ahead of air, and given back when air has passed it or the transmission ends. The delay itself stays raw and untouched until an insert is placed; from then on the recording goes to air through that one compression.
+
+| Inserts in all | Extra memory, about |
+|---|---|
+| none | nothing |
+| 34 s | 0.7 GB |
+| 1:49 | 1.9 GB |
+| 5 min | 5 GB |
+
+(Plus about 0.1 GB of decoded frames, and two ffmpeg processes, while any is in use.) An insert is refused when taking it would leave less than 3 GB free (`DelayLine.RoomFrames`, asked as the insert is placed and again as air reaches it: `liveair.cue.refused`). If memory runs out regardless, below 1.5 GB free, frames are lost rather than the machine made to page (`delay.overflowlost`), and air holds the picture before each. The encoder and decoder are tried out as the recording starts; where they do not work (`delay.overflowoff`), the line asks for its insert room in memory up front, as before, and longer inserts are refused.
+
+**Measured on this plant** (`delay.dropped` totals and `resource_disk`, delay on D:, a Crucial BX500 500 GB):
+
+| Mode | Session | Frames lost |
+|---|---|---|
+| Mapped file | 21 Nov 2026 13:50-14:13 | 17,323 |
+| Mapped file, no give-back, 3 s queue | 21 Nov 14:15-15:00 | 682 |
+| RAM, no insert | 21 Nov 15:08-15:29 and 17:33-17:57 | 0, D: about 0 MB/s |
+| RAM, after a 1:49 insert, RAM holding 130 s | 21 Nov 15:29-17:23 | 37,397 |
+| Direct disk | 23 Nov 12:12-12:26 | 851 |
+
+On direct disk D: ran at 105 MB/s each way until it had taken about 38 GB, some six minutes. From then on it stalled about every 43 s: 100% busy, about 40 MB/s, for around 10 s. That matches this model's published fast cache (about 45 GB) and its speed once full (44 MB/s).
+
+**Endurance.** A ring on disk writes about 9 TB per 24 h. D: is rated for 120 TB in all; C: (MSI M371 500 GB) probably for 110. Do not move the ring to C: to cure drops on D:.
+
+The three-argument and four-argument `Create` still open a line through the memory-mapped file and the Windows cache, which the older tests cover.
+
+**One ring in RAM per process** (`DelayLine.MemoryRingHeld`). A second line opened while one holds the RAM runs from disk and logs `delay.memoryshort` and `delay.ondisk`. When Go Live needs a line of its own because the ready line cannot serve its delay, `ShellWindow.TryOpenLiveLine` first lets the ready line go and waits for it (`delay.readyreleased`), so the RAM moves to the line going on air. The REC view follows the new line. The ready line is opened again only once that line has closed (`DelayLine.Closed`), after its transmitter has played out the rest of the delay, so the reopened ready line gets the RAM back instead of writing to disk.
+
+**Low-memory warnings.** While a recording runs (or the Monitor is open), `ResourceSampler` logs `memory.low` when free physical memory falls below 3 GB and `memory.critical` below 1.5 GB, then `memory.recovered` once it is 0.5 GB back above the line (`LowMemoryWatch`). Each is logged once per crossing. On seeing them, close other programs and hold off exports. Windows pages next, and playout can stutter.
+
+**Page file.** The ring is locked, so it is never paged, but everything else can be. Keep the page file system-managed, or at least 16 GB. A small fixed one lowers the commit limit (RAM plus page file), and reaching it makes allocations fail outright.
+
+With RAM in use the file is a last resort: a frame leaving RAM is written to it only if a transmitter's hold still wants it, which staying inside `RoomFrames` prevents. `delay.spilling` means it happened, and is a fault to look into. A line whose whole ring is in RAM never spills.
+
+The ring file is sparse and sized for the longest delay plus every insert (about 41 GB for a ready line at 420 s). A line without a RAM ring writes about 104 MB/s to it at 1080p25 for as long as a delay is held.
+
+`DelayLine.ReleaseBehind` gives back the disk of frames older than what is kept, but **only while the volume is short of room**: free space below the ring's full length plus 20 GB, checked every 10 s. With room to spare the ring fills its length once and is then overwritten in place. Each release is a TRIM on an SSD and leaves holes the file system fills again, for no gain on a drive with room. How much it added to the drops is not known: turning it off and lengthening the queue were one change, and drops on D: went on without it. When it does release, it does so 25 frames (about 100 MB) at a time.
+
+The writer queue between the receiver and the ring holds 3 s of frames (`DelayLine.QueueDepthFor`). That is up to about 300 MB of capture buffers, held only while the disk is behind.
+
+A `delay.dropped` line names the slowest waits since the previous one: `write` (a frame into the ring, on the writer thread), `flush` (dirty pages to disk, on the flusher thread), `give-back` (a release) and the queue's high-water mark against its depth. A full queue with a long `write` means the writer was waiting on the disk. A long `give-back` means the volume is short of room and releasing is stalling the drive.
 
 ## Log formats
 

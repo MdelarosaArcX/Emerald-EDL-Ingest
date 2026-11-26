@@ -174,8 +174,16 @@ public sealed class FramePoolTests : IDisposable
                                        TimeSpan.FromSeconds(5)),
                     $"{pool.Made} buffers were made and {pool.Waiting} came back");
 
-        // And far fewer were made than frames sent, which is the point of the pool.
-        Assert.True(pool.Made < 64, $"{pool.Made} buffers for {Frames} frames");
+        // And far fewer were made than frames sent, which is the point of the pool. At worst both
+        // rings' queues full with one more in each writer's hands, plus what the pool keeps idle -
+        // with the same margin again for the loop's own timing.
+        //
+        // Made counts every buffer ever made, not how many were out at once: each time a queue
+        // fills and drains, all but KeepAtMost of what it held go to the collector and are made
+        // again on the next fill. With three seconds of queue that churn outgrows any multiple of
+        // the worst case, so the bound is the pool's point instead - most frames reused a buffer.
+        int worst = 2 * (DelayLine.QueueDepthFor(format.FrameRate) + 1) + FramePool.KeepAtMost;
+        Assert.True(pool.Made < Frames / 2, $"{pool.Made} buffers for {Frames} frames (worst case at once {worst})");
     }
 
     [Fact]

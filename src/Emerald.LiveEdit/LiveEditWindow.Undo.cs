@@ -5,7 +5,7 @@ namespace Emerald.LiveEdit;
 
 /// <summary>
 /// Undo and redo for the timeline's edits: what is placed on the ingest lanes and its levels,
-/// deleted scenes, levels, and the audio lane's cuts and levels.
+/// deleted scenes, levels, and the audio lanes' cuts, levels and choice of track.
 ///
 /// Each edit records the whole edit state as it was before it - small, a list of placements and
 /// levels - and undo puts that back. Whole states rather than inverse operations, because an
@@ -27,7 +27,8 @@ public partial class LiveEditWindow
         string What,
         OverlayState[] Overlays,
         IReadOnlyList<AudioEdit> Audio,
-        long[] AudioCuts);
+        long[] AudioCuts,
+        IReadOnlyList<AudioSwitch> Switches);
 
     private readonly List<EditState> _undo = new();
     private readonly List<EditState> _redo = new();
@@ -43,7 +44,8 @@ public partial class LiveEditWindow
         what,
         _overlays.Select(o => new OverlayState(o, o.StartFrame, o.GainDb, o.Plan)).ToArray(),
         _audioEdits,
-        _audioCuts.ToArray());
+        _audioCuts.ToArray(),
+        _audioSwitches);
 
     /// <summary>
     /// Called by every edit just before it changes anything - after it has passed its checks, so
@@ -171,6 +173,12 @@ public partial class LiveEditWindow
             earliest = earliest is { } e ? Math.Min(e, at) : at;
         }
 
+        if (AudioSwitches.FirstDifference(_audioSwitches, target.Switches) is { } switched)
+        {
+            long at = RulerOf(switched);
+            earliest = earliest is { } e ? Math.Min(e, at) : at;
+        }
+
         return earliest;
     }
 
@@ -187,6 +195,7 @@ public partial class LiveEditWindow
         }
 
         _audioEdits = state.Audio;
+        _audioSwitches = state.Switches;
         _audioCuts.Clear();
         _audioCuts.UnionWith(state.AudioCuts);
 

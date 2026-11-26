@@ -597,7 +597,7 @@ public sealed class SdiCapture : IDisposable
                         {
                             tap.Invoke(new CapturedFrame(tapVideo, tapVideoBytes,
                                                          tapAudio, tapAudioBytes, audioReal,
-                                                         frames - 1, picture));
+                                                         frames - 1, picture, recordChannels));
                         }
                         catch
                         {
@@ -1241,11 +1241,16 @@ public sealed record CaptureResult(
 /// sent either way, because a transmitter needs continuous audio, but the distinction is
 /// worth reporting rather than quietly transmitting nothing.
 /// </param>
+/// <param name="AudioChannels">
+/// Channels interleaved in <paramref name="Audio"/>: two for every pair the recording takes. Zero is not
+/// said, and read as two.
+/// </param>
 public readonly record struct CapturedFrame(
     byte[] Video, int VideoBytes,
     byte[]? Audio, int AudioBytes, bool AudioReal,
     long Sequence,
-    FrameLease? Lease = null)
+    FrameLease? Lease = null,
+    int AudioChannels = 0)
 {
     /// <summary>
     /// Takes a claim on the picture, so it stays this frame's after the handler returns. Matched

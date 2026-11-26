@@ -39,7 +39,7 @@ public partial class LiveEditWindow
     private readonly HashSet<string> _waveReading = new();
     private readonly HashSet<string> _waveFailed = new();
 
-    /// <summary>Waveforms read, by path - asked for every redraw, so kept here rather than checked against the disk.</summary>
+    /// <summary>Waveforms read, by path and track (<see cref="WaveKey"/>) - asked for every redraw, so kept here rather than checked against the disk.</summary>
     private readonly Dictionary<string, WavePeaks> _waves = new();
 
     /// <summary>Kept below this without a look; past it, only what the timeline still shows is kept.</summary>
@@ -65,8 +65,8 @@ public partial class LiveEditWindow
                    .Concat(_overlays.Select(o => o.Path)),
             StringComparer.OrdinalIgnoreCase);
 
-        foreach (string path in _waves.Keys.Where(path => !shown.Contains(path)).ToList())
-            _waves.Remove(path);
+        foreach (string key in _waves.Keys.Where(key => !shown.Contains(WavePath(key))).ToList())
+            _waves.Remove(key);
 
         _waveFailed.RemoveWhere(path => !shown.Contains(path));
     }
@@ -98,6 +98,8 @@ public partial class LiveEditWindow
     private void Audio_Click(object sender, MouseButtonEventArgs e)
     {
         LeaveRecordingView();
+
+        if (TrackClicked(e)) return;
 
         long frame = TimelineZoom.FrameAt(e.GetPosition(AudioCanvas).X, ViewStart, ViewSpan,
                                           AudioCanvas.ActualWidth, _dayFrames - 1);
@@ -572,9 +574,9 @@ public partial class LiveEditWindow
             }
             else if (to - from >= 3)
             {
-                // A master-quality export is gigabytes of DNxHD; its preview copy has the same
-                // sound in a few megabytes.
-                ReadWaveform(overlay.Path, RangeExport.PreviewFor(overlay.Path));
+                // A master-quality export is gigabytes of DNxHD; its low-res copy (or an older
+                // export's preview copy) has the same sound in a few megabytes.
+                ReadWaveform(overlay.Path, RangeExport.PlayablePathFor(overlay.Path));
             }
 
             if (to - from > 60)
@@ -615,20 +617,26 @@ public partial class LiveEditWindow
     {
         AudioCanvas.Children.Clear();
 
+        ShowTrackLanes();
+
         double height = Math.Max(10, AudioCanvas.ActualHeight);
-        double mid = height / 2;
+        int lanes = TrackLanes;
+        double laneHeight = height / lanes, half = laneHeight / 2;
         List<IngestItem> items = IngestItems();
         long? airedTo = OnAirFrame();
 
         double X(long rulerFrame) => (rulerFrame - start) / (double)span * width;
 
         // The waveform, piece by piece of each segment as the ruler lays it out, so a segment cut
-        // by an insert has its sound on both sides of it.
+        // by an insert has its sound on both sides of it. A lane for every track, and the ones that
+        // are not playing dimmed.
         var wave = new StreamGeometry();
         var aired = new StreamGeometry();
+        var unplayed = new StreamGeometry();
 
         using (StreamGeometryContext live = wave.Open())
         using (StreamGeometryContext past = aired.Open())
+        using (StreamGeometryContext off = unplayed.Open())
         {
             // Only the run of segments that can be on screen, found by halving.
             foreach (Placed placed in Visible(_placed, items, start, span, _longestPlaced))
@@ -642,30 +650,39 @@ public partial class LiveEditWindow
 
                     if (to - from < 0.5) continue;
 
+                    int tracks = TracksOf(placed);
+
                     // A block per segment, as in the picture row above, so the sound reads as the
                     // same files: where one ends and the next begins.
                     if (to - from >= 3)
-                        AudioCanvas.Children.Add(new Rectangle
-                        {
-                            Width = Math.Max(1, to - from - 1),
-                            Height = height - 2,
-                            RadiusX = 3,
-                            RadiusY = 3,
-                            Fill = placed.Pending ? PendingBlockFill : AudioBlockFill,
-                            Stroke = placed.Pending ? Brush("Warn") : AudioBlockStroke,
-                            StrokeThickness = 1,
-                            Margin = new Thickness(from, 1, 0, 0),
-                            IsHitTestVisible = false,
-                        });
+                        for (int lane = 0; lane < tracks; lane++)
+                            AudioCanvas.Children.Add(new Rectangle
+                            {
+                                Width = Math.Max(1, to - from - 1),
+                                Height = Math.Max(1, laneHeight - 2),
+                                RadiusX = 3,
+                                RadiusY = 3,
+                                Fill = placed.Pending ? PendingBlockFill : AudioBlockFill,
+                                Stroke = placed.Pending ? Brush("Warn") : AudioBlockStroke,
+                                StrokeThickness = 1,
+                                Margin = new Thickness(from, lane * laneHeight + 1, 0, 0),
+                                IsHitTestVisible = false,
+                            });
 
                     // Still being written: no file to read its sound from yet.
                     if (placed.Pending) continue;
 
-                    if (!_waves.TryGetValue(placed.Clip.Path, out WavePeaks? peaks))
+                    var peaks = new WavePeaks[tracks];
+                    bool read = true;
+
+                    for (int lane = 0; lane < tracks && read; lane++)
+                        read = _waves.TryGetValue(WaveKey(placed.Clip.Path, lane), out peaks[lane]!);
+
+                    if (!read)
                     {
                         // Only once there is room to draw it: a whole day of segments a pixel
                         // wide each would be hundreds of reads for nothing visible.
-                        if (to - from >= 3) ReadWaveform(placed.Clip.Path);
+                        if (to - from >= 3) ReadWaveforms(placed.Clip.Path, tracks);
                         continue;
                     }
 
@@ -683,12 +700,19 @@ public partial class LiveEditWindow
                         long c1 = piece.CapturedStart + (f1 - piece.RulerStart) - placed.StartFrame;
 
                         double gainDb = AudioEdits.GainDbAt(placed.StartFrame + c0, _audioEdits);
-                        double a = Loudness(peaks.Max(c0 / (double)_rate, c1 / (double)_rate), gainDb);
-                        double h = Math.Max(0.5, a * (mid - 3));
+                        int playing = PlayedTrack(placed, placed.StartFrame + c0);
 
-                        StreamGeometryContext into = airedTo is { } air && f1 <= air ? past : live;
-                        into.BeginFigure(new Point(x + 0.5, mid - h), false, false);
-                        into.LineTo(new Point(x + 0.5, mid + h), true, false);
+                        for (int lane = 0; lane < tracks; lane++)
+                        {
+                            double a = Loudness(peaks[lane].Max(c0 / (double)_rate, c1 / (double)_rate), gainDb);
+                            double h = Math.Max(0.5, a * (half - 3));
+                            double mid = lane * laneHeight + half;
+
+                            StreamGeometryContext into = lane != playing ? off
+                                                       : airedTo is { } air && f1 <= air ? past : live;
+                            into.BeginFigure(new Point(x + 0.5, mid - h), false, false);
+                            into.LineTo(new Point(x + 0.5, mid + h), true, false);
+                        }
                     }
                 }
             }
@@ -696,6 +720,7 @@ public partial class LiveEditWindow
 
         wave.Freeze();
         aired.Freeze();
+        unplayed.Freeze();
 
         // What has been set, under the waveform: deleted sound red, a changed level amber.
         foreach (AudioEdit edit in _audioEdits)
@@ -749,6 +774,7 @@ public partial class LiveEditWindow
                 });
         }
 
+        AudioCanvas.Children.Add(new Path { Data = unplayed, Stroke = WaveOffBrush, StrokeThickness = 1, IsHitTestVisible = false });
         AudioCanvas.Children.Add(new Path { Data = aired, Stroke = WaveAiredBrush, StrokeThickness = 1, IsHitTestVisible = false });
         AudioCanvas.Children.Add(new Path { Data = wave, Stroke = WaveBrush, StrokeThickness = 1, IsHitTestVisible = false });
 
@@ -771,6 +797,11 @@ public partial class LiveEditWindow
                 IsHitTestVisible = false,
             });
         }
+
+        DrawTracks(width, height, start, span);
+
+        // With several lanes, each has its own name.
+        if (lanes > 1) return;
 
         var label = new TextBlock
         {

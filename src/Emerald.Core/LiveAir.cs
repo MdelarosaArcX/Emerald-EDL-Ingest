@@ -164,6 +164,14 @@ public static class LiveCues
         return null;
     }
 
+    /// <summary>
+    /// Whether an insert of <paramref name="frames"/> fits: the delay it makes stays inside
+    /// <paramref name="room"/>, the furthest back the delay line lets a transmitter be, with a second to
+    /// spare for frames held while its decoder catches up. An insert lengthens the delay for the rest of the
+    /// transmission, so one that does not fit is never only a passing problem.
+    /// </summary>
+    public static bool InsertFits(long delay, long frames, long room, int rate) => delay + frames <= room - rate;
+
     /// <summary>The delay once every cue has played: the base plus what inserts add, less what cuts remove.</summary>
     public static long DelayWith(long baseFrames, IEnumerable<LiveCue> cues) =>
         baseFrames + cues.Sum(c => c.DelayChange);
@@ -174,6 +182,19 @@ public static class LiveCues
 /// <param name="CueId">The cue whose media is going out, or null when the recording is.</param>
 /// <param name="CueOffset">Frames into that cue's media.</param>
 public readonly record struct LiveAirPosition(long RecordingFrame, string? CueId, long CueOffset);
+
+/// <summary>
+/// Which deck armed the live transmission, and so which one runs its transmitter. The EDL is the
+/// timeline's either way: Live Edit sends every edit to <see cref="LiveAir"/> whoever owns it.
+/// </summary>
+public enum LiveAirOwner
+{
+    /// <summary>Armed with Go Live in Live Edit.</summary>
+    LiveEdit,
+
+    /// <summary>Armed with tidal lock on the playback deck.</summary>
+    Playback,
+}
 
 /// <summary>
 /// Going live from Live Edit: the capture deck's receiver put to air a delay later, with the
@@ -215,9 +236,22 @@ public sealed class LiveAir : IEdlPlayback
     /// <summary>How much more than the delay the ring holds, for inserts to grow it into.</summary>
     public TimeSpan Headroom { get; private set; }
 
+    /// <summary>
+    /// Settles the headroom to what the line it was given actually holds beyond the delay - less
+    /// than asked when it goes live from the line the capture deck keeps ready rather than opening
+    /// a second ring. Live Edit refuses an insert that would need more, as it always has.
+    /// </summary>
+    public void FitHeadroom(TimeSpan headroom)
+    {
+        lock (_gate) Headroom = headroom < TimeSpan.Zero ? TimeSpan.Zero : headroom;
+    }
+
     public uint BoardIndex { get; private set; }
 
     public IReadOnlyList<int> Ports { get; private set; } = Array.Empty<int>();
+
+    /// <summary>The deck that armed it, and runs its transmitter. See <see cref="LiveAirOwner"/>.</summary>
+    public LiveAirOwner Owner { get; private set; } = LiveAirOwner.LiveEdit;
 
     /// <summary>The delay line, once the capture deck has opened one.</summary>
     public IDelayLine? Line { get; private set; }
@@ -254,6 +288,17 @@ public sealed class LiveAir : IEdlPlayback
     public IReadOnlyList<AudioEdit> AudioEdits
     {
         get { lock (_gate) return _audioEdits; }
+    }
+
+    private IReadOnlyList<AudioSwitch> _audioSwitches = Array.Empty<AudioSwitch>();
+
+    /// <summary>
+    /// Which of the recording's sound tracks plays, in frames of the recording, from the same
+    /// revision as the cues.
+    /// </summary>
+    public IReadOnlyList<AudioSwitch> AudioSwitches
+    {
+        get { lock (_gate) return _audioSwitches; }
     }
 
     // ------------------------------------------------------------------ the EDL handshake
@@ -297,7 +342,9 @@ public sealed class LiveAir : IEdlPlayback
             {
                 long? changed = EdlDiff.EarliestChange(_cues, revision.Cues);
                 long? level = global::Emerald.Core.AudioEdits.FirstDifference(_audioEdits, revision.AudioEdits);
-                long first = Math.Min(changed ?? long.MaxValue, level ?? long.MaxValue);
+                long? track = global::Emerald.Core.AudioSwitches.FirstDifference(
+                    _audioSwitches, revision.AudioSwitches ?? Array.Empty<AudioSwitch>());
+                long first = Math.Min(Math.Min(changed ?? long.MaxValue, level ?? long.MaxValue), track ?? long.MaxValue);
 
                 if (first <= committed)
                     return new EdlReceipt(EdlVerdict.TooLate, revision.Version, revision.TransactionId,
@@ -307,6 +354,7 @@ public sealed class LiveAir : IEdlPlayback
 
             _cues = revision.Cues;
             _audioEdits = revision.AudioEdits;
+            _audioSwitches = revision.AudioSwitches ?? Array.Empty<AudioSwitch>();
             _acceptedVersion = revision.Version;
             _acceptedTransaction = revision.TransactionId;
 
@@ -325,6 +373,15 @@ public sealed class LiveAir : IEdlPlayback
             _appliedVersion = _acceptedVersion;
             return _cues;
         }
+    }
+
+    /// <summary>
+    /// The last recording frame that can no longer be changed, or null when nothing has gone out.
+    /// What a change asked for at once is placed after.
+    /// </summary>
+    public long? CommittedFrame
+    {
+        get { lock (_gate) return CommittedThrough(); }
     }
 
     /// <summary>
@@ -376,10 +433,11 @@ public sealed class LiveAir : IEdlPlayback
     // ------------------------------------------------------------------ transitions
 
     public void Arm(TimeSpan delay, TimeSpan headroom, uint boardIndex, IReadOnlyList<int> ports,
-                    DelayStart start = DelayStart.Fixed)
+                    DelayStart start = DelayStart.Fixed, LiveAirOwner owner = LiveAirOwner.LiveEdit)
     {
         lock (_gate)
         {
+            Owner = owner;
             Delay = delay < TimeSpan.Zero ? TimeSpan.Zero : delay;
             Headroom = headroom < TimeSpan.Zero ? TimeSpan.Zero : headroom;
             Start = start;
@@ -477,6 +535,7 @@ public sealed class LiveAir : IEdlPlayback
             RecordingStartedAt = null;
             _cues = Array.Empty<LiveCue>();
             _audioEdits = Array.Empty<AudioEdit>();
+            _audioSwitches = Array.Empty<AudioSwitch>();
             ClearPosition();
             Detail = reason;
         }

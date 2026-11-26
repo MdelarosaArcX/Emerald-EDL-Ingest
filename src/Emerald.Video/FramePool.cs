@@ -65,7 +65,7 @@ public sealed class FramePool
 {
     /// <summary>
     /// Buffers kept waiting for the next frame. More than this only ever exist while they are in
-    /// use: the encoder's queue and each ring's hold nine apiece when everything is stalled.
+    /// use: the encoder's queue holds nine, and each ring's a second of frames, when everything is stalled.
     /// </summary>
     public const int KeepAtMost = 16;
 

@@ -27,6 +27,7 @@ public enum EdlSubmissionKind
 /// <param name="Version">Grows by at least one with every revision issued. Playback refuses anything not above what it has.</param>
 /// <param name="TransactionId">Unique per send, so the same revision delivered twice is recognised rather than applied again.</param>
 /// <param name="EditIds">The edits this revision conforms, for a <see cref="EdlSubmissionKind.Conform"/>; empty otherwise.</param>
+/// <param name="AudioSwitches">Which of the recording's sound tracks plays, and from where. Null is none: the first track throughout.</param>
 public sealed record EdlRevision(
     long Version,
     string TransactionId,
@@ -34,7 +35,8 @@ public sealed record EdlRevision(
     IReadOnlyList<LiveCue> Cues,
     IReadOnlyList<AudioEdit> AudioEdits,
     DateTime IssuedAt,
-    IReadOnlyList<string> EditIds);
+    IReadOnlyList<string> EditIds,
+    IReadOnlyList<AudioSwitch>? AudioSwitches = null);
 
 public enum EdlVerdict
 {
