@@ -40,7 +40,6 @@ public sealed class LiveAirTransmitter : IDisposable
     private readonly string _ffmpegPath;
     private readonly Func<IReadOnlyList<LiveCue>> _cues;
     private readonly Func<IReadOnlyList<AudioEdit>> _audioEdits;
-    private readonly Func<IReadOnlyList<AudioSwitch>> _audioSwitches;
     private readonly RecordingSound _sound = new();
 
     private Thread? _worker;
@@ -68,11 +67,9 @@ public sealed class LiveAirTransmitter : IDisposable
     /// Read every frame for the levels set on the recording's own sound. Not the cues' media:
     /// that plays at its own level.
     /// </param>
-    /// <param name="audioSwitches">Read every frame for which of the recording's sound tracks plays.</param>
     public LiveAirTransmitter(uint boardIndex, IReadOnlyList<int> txChannels, DelayLine line, TimeSpan delay,
                               string ffmpegPath, Func<IReadOnlyList<LiveCue>> cues,
-                              Func<IReadOnlyList<AudioEdit>>? audioEdits = null,
-                              Func<IReadOnlyList<AudioSwitch>>? audioSwitches = null)
+                              Func<IReadOnlyList<AudioEdit>>? audioEdits = null)
     {
         if (txChannels.Count == 0)
             throw new DelayLineException("No TX port was chosen to go live on.");
@@ -87,7 +84,6 @@ public sealed class LiveAirTransmitter : IDisposable
         _ffmpegPath = ffmpegPath;
         _cues = cues;
         _audioEdits = audioEdits ?? (() => Array.Empty<AudioEdit>());
-        _audioSwitches = audioSwitches ?? (() => Array.Empty<AudioSwitch>());
         // Its own delay, not the line's size - the capture deck's line can hold far more.
         _target = (long)Math.Ceiling(Math.Max(0, delay.TotalSeconds) * _format.FrameRate);
 
@@ -163,7 +159,9 @@ public sealed class LiveAirTransmitter : IDisposable
         int samples = AudioSource.SampleRate / _format.FrameRate;
         var left = new short[samples];
         var right = new short[samples];
-        var fileChannels = new List<short[]> { left, right };
+
+        // What goes out under a cue or a deleted scene: as many channels as the recording has.
+        var fileChannels = new List<short[]>(16);
         // A little over a frame: how long to wait for a decoded frame before holding the last one.
         TimeSpan frameTime = TimeSpan.FromMilliseconds(1200.0 / _format.FrameRate);
 
@@ -239,7 +237,7 @@ public sealed class LiveAirTransmitter : IDisposable
 
                     if (got)
                     {
-                        CueSound(job, under, left, right);
+                        CueSound(job, under, left, right, fileChannels, samples);
 
                         if (!output.PushFrame(frame, fileChannels))
                         {
@@ -484,7 +482,7 @@ public sealed class LiveAirTransmitter : IDisposable
                 // ---------------------------------------------------- the recording frame
                 bool pushed = blank is null
                     ? PushWithAudio(output, into)
-                    : PushBlack(output, black, left, right, fileChannels);
+                    : PushBlack(output, black, fileChannels, samples);
 
                 if (!pushed)
                 {
@@ -695,15 +693,17 @@ public sealed class LiveAirTransmitter : IDisposable
     // ------------------------------------------------------------------ audio
 
     /// <summary>
-    /// A recording frame with the sound of the track chosen for it, at the level set on it.
-    /// See <see cref="RecordingSound"/>.
+    /// A recording frame with every pair of its sound, each on its own channels, at the level set on
+    /// it. Which pair is heard is the hardware's choice downstream. See <see cref="RecordingSound"/>.
     /// </summary>
     private bool PushWithAudio(ISdiOutput output, DelayFrameBuffer frame) =>
-        _sound.Frame(frame.Audio, frame.AudioBytes, frame.AudioChannels, Track(frame), Level(frame)) is { } channels
+        _sound.All(frame.Audio, frame.AudioBytes, frame.AudioChannels, Level(frame)) is { } channels
             ? output.PushFrame(frame.Video, channels)
             : output.PushFrame(frame.Video);
 
-    private int Track(DelayFrameBuffer frame) => AudioSwitches.TrackAt(frame.RecordingFrame, _audioSwitches());
+    /// <summary>How many channels go out: as many as the recording has, and a pair at least.</summary>
+    private int Channels(DelayFrameBuffer? frame) =>
+        Math.Clamp(Math.Max(frame?.AudioChannels ?? 0, _line.AudioChannels), 2, 16);
 
     private double Level(DelayFrameBuffer frame) => AudioEdits.GainDbAt(frame.RecordingFrame, _audioEdits());
 
@@ -712,36 +712,40 @@ public sealed class LiveAirTransmitter : IDisposable
     /// worth of samples, so the sound stays exactly as long as the picture. The level starts from
     /// nothing when the recording comes back, ramped up over its first frame rather than clicking in.
     /// </summary>
-    private bool PushBlack(ISdiOutput output, byte[] black, short[] left, short[] right, List<short[]> channels)
+    private bool PushBlack(ISdiOutput output, byte[] black, List<short[]> channels, int samples)
     {
-        Array.Clear(left);
-        Array.Clear(right);
+        RecordingSound.Fit(channels, Channels(null), samples);
+        foreach (short[] channel in channels) Array.Clear(channel);
         _sound.Silenced();
 
         return output.PushFrame(black, channels);
     }
 
     /// <summary>
-    /// The sound under a frame of a cue: the media's own at the cue's level; or, for a video-only
-    /// cue, the recording's going by underneath at the level set on it; or silence, for a
-    /// video-only insert, where the recording is waiting and has no sound to give.
+    /// The sound under a frame of a cue: the media's own at the cue's level, on every pair - whichever
+    /// pair the hardware has chosen hears the item; or, for a video-only cue, every pair of the
+    /// recording going by underneath at the level set on it; or silence, for a video-only insert,
+    /// where the recording is waiting and has no sound to give.
     /// </summary>
-    private void CueSound(CueMedia job, DelayFrameBuffer? under, short[] left, short[] right)
+    private void CueSound(CueMedia job, DelayFrameBuffer? under, short[] left, short[] right, List<short[]> channels, int samples)
     {
+        RecordingSound.Fit(channels, Channels(under), samples);
+
         if (job.Audio is { } sound)
         {
             sound.ReadVideoFrame(left, right, job.Taken);
 
             if (job.Cue.GainDb != 0) Scale(left, right, left.Length, AudioEdits.Linear(job.Cue.GainDb));
+
+            for (int c = 0; c < channels.Count; c++) Array.Copy(c % 2 == 0 ? left : right, channels[c], samples);
             return;
         }
 
-        Array.Clear(left);
-        Array.Clear(right);
+        foreach (short[] channel in channels) Array.Clear(channel);
 
         if (under is not { } frame) return;
 
-        RecordingSound.Read(frame.Audio, frame.AudioBytes, frame.AudioChannels, Track(frame), Level(frame), left, right);
+        RecordingSound.ReadAll(frame.Audio, frame.AudioBytes, frame.AudioChannels, Level(frame), channels);
     }
 
     private static void Scale(short[] left, short[] right, int samples, double gain)

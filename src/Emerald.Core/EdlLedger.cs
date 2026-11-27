@@ -245,8 +245,7 @@ public sealed class EdlLedger
     /// </summary>
     public EdlReceipt Send(IEdlPlayback playback, EdlSubmissionKind kind,
                            IReadOnlyList<LiveCue> cues, IReadOnlyList<AudioEdit> audio,
-                           (long Air, long Line)? zone, DateTime now, string why,
-                           IReadOnlyList<AudioSwitch>? tracks = null)
+                           (long Air, long Line)? zone, DateTime now, string why)
     {
         List<EdlEditRecord> conforming = zone is { } z ? DueForConform(z.Air, z.Line).ToList() : new();
 
@@ -254,7 +253,7 @@ public sealed class EdlLedger
 
         int attempt = kind == EdlSubmissionKind.Retry && _inFlight is { } previous ? previous.Attempt + 1 : 1;
 
-        EdlRevision revision = Issue(playback, kind, cues, audio, tracks, conforming, now, why);
+        EdlRevision revision = Issue(playback, kind, cues, audio, conforming, now, why);
         EdlReceipt receipt = playback.Submit(revision);
 
         // Someone else got a newer version in first - another window, or this one before it was
@@ -263,7 +262,7 @@ public sealed class EdlLedger
         {
             Said(revision, receipt, conforming);
 
-            revision = Issue(playback, kind, cues, audio, tracks, conforming, now, why + ", reissued above a newer version");
+            revision = Issue(playback, kind, cues, audio, conforming, now, why + ", reissued above a newer version");
             receipt = playback.Submit(revision);
         }
 
@@ -377,13 +376,13 @@ public sealed class EdlLedger
 
     private EdlRevision Issue(IEdlPlayback playback, EdlSubmissionKind kind,
                               IReadOnlyList<LiveCue> cues, IReadOnlyList<AudioEdit> audio,
-                              IReadOnlyList<AudioSwitch>? tracks, List<EdlEditRecord> conforming, DateTime now, string why)
+                              List<EdlEditRecord> conforming, DateTime now, string why)
     {
         long previous = Math.Max(_version, playback.AcceptedVersion);
         _version = previous + 1;
 
         var revision = new EdlRevision(_version, Guid.NewGuid().ToString("N"), kind, cues, audio, now,
-                                       conforming.Select(r => r.EditId).ToList(), tracks);
+                                       conforming.Select(r => r.EditId).ToList());
 
         bool first = _latest is null;
         long? supersedes = _latest?.Version;

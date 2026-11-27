@@ -523,49 +523,6 @@ public sealed class EdlEditingTests
     }
 
     [Fact]
-    public void A_change_of_audio_track_is_taken_ahead_of_air_and_refused_behind_it()
-    {
-        LiveAir air = OnAir();
-        Assert.Null(air.CommittedFrame);
-
-        air.SetPosition(new LiveAirPosition(1500, null, 0), 750);
-        Assert.Equal(1500, air.CommittedFrame);
-
-        IReadOnlyList<AudioSwitch> At(long frame, int track) => AudioSwitches.Set(Array.Empty<AudioSwitch>(), frame, track);
-
-        // On the frame air has sent: too late, and nothing changes.
-        Assert.Equal(EdlVerdict.TooLate, air.Submit(Revision(1) with { AudioSwitches = At(1500, 2) }).Verdict);
-        Assert.Empty(air.AudioSwitches);
-
-        // The very next one: in time. A track needs nothing opened ahead of it.
-        Assert.Equal(EdlVerdict.Accepted, air.Submit(Revision(2) with { AudioSwitches = At(1501, 2) }).Verdict);
-        Assert.Equal(2, AudioSwitches.TrackAt(1501, air.AudioSwitches));
-
-        // Once it is on air it cannot be taken away, but another change ahead can be added.
-        air.SetPosition(new LiveAirPosition(1600, null, 0), 750);
-        Assert.Equal(EdlVerdict.TooLate, air.Submit(Revision(3)).Verdict);
-        Assert.Equal(EdlVerdict.Accepted,
-                     air.Submit(Revision(4) with { AudioSwitches = AudioSwitches.Set(At(1501, 2), 1700, 1) }).Verdict);
-
-        // Going off air forgets them: the next transmission is of another recording's frames.
-        air.Stop("test");
-        Assert.Empty(air.AudioSwitches);
-    }
-
-    [Fact]
-    public void A_send_carries_the_audio_tracks()
-    {
-        LiveAir air = OnAir();
-        IReadOnlyList<AudioSwitch> tracks = AudioSwitches.Set(Array.Empty<AudioSwitch>(), 4000, 3);
-
-        EdlReceipt receipt = new EdlLedger(new EdlLogger()).Send(
-            air, EdlSubmissionKind.Update, Array.Empty<LiveCue>(), Array.Empty<AudioEdit>(), null, T0, "test", tracks);
-
-        Assert.True(receipt.Taken);
-        Assert.Equal(tracks, air.AudioSwitches);
-    }
-
-    [Fact]
     public void A_send_is_issued_above_whatever_version_playback_already_holds()
     {
         var ledger = new EdlLedger(new EdlLogger());

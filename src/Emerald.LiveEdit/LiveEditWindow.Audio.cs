@@ -634,6 +634,10 @@ public partial class LiveEditWindow
         var aired = new StreamGeometry();
         var unplayed = new StreamGeometry();
 
+        // One block for each run of the recording, not one for each file: the files are how it is
+        // stored, not how it is worked on. The part still being recorded is a block of its own.
+        var blocks = new List<(double From, double To, bool Pending, int Tracks)>();
+
         using (StreamGeometryContext live = wave.Open())
         using (StreamGeometryContext past = aired.Open())
         using (StreamGeometryContext off = unplayed.Open())
@@ -652,38 +656,35 @@ public partial class LiveEditWindow
 
                     int tracks = TracksOf(placed);
 
-                    // A block per segment, as in the picture row above, so the sound reads as the
-                    // same files: where one ends and the next begins.
-                    if (to - from >= 3)
-                        for (int lane = 0; lane < tracks; lane++)
-                            AudioCanvas.Children.Add(new Rectangle
-                            {
-                                Width = Math.Max(1, to - from - 1),
-                                Height = Math.Max(1, laneHeight - 2),
-                                RadiusX = 3,
-                                RadiusY = 3,
-                                Fill = placed.Pending ? PendingBlockFill : AudioBlockFill,
-                                Stroke = placed.Pending ? Brush("Warn") : AudioBlockStroke,
-                                StrokeThickness = 1,
-                                Margin = new Thickness(from, lane * laneHeight + 1, 0, 0),
-                                IsHitTestVisible = false,
-                            });
+                    if (blocks.Count > 0 && blocks[^1] is var run && run.Pending == placed.Pending &&
+                        run.Tracks == tracks && from <= run.To + 1.5)
+                        blocks[^1] = run with { To = Math.Max(run.To, to) };
+                    else
+                        blocks.Add((from, to, placed.Pending, tracks));
 
-                    // Still being written: no file to read its sound from yet.
-                    if (placed.Pending) continue;
+                    WavePeaks[] peaks;
 
-                    var peaks = new WavePeaks[tracks];
-                    bool read = true;
-
-                    for (int lane = 0; lane < tracks && read; lane++)
-                        read = _waves.TryGetValue(WaveKey(placed.Clip.Path, lane), out peaks[lane]!);
-
-                    if (!read)
+                    if (placed.Pending)
                     {
-                        // Only once there is room to draw it: a whole day of segments a pixel
-                        // wide each would be hundreds of reads for nothing visible.
-                        if (to - from >= 3) ReadWaveforms(placed.Clip.Path, tracks);
-                        continue;
+                        // Still being written, so no file to read its sound from: the delay's.
+                        if (HeldWaves(placed, tracks) is not { } held) continue;
+                        peaks = held;
+                    }
+                    else
+                    {
+                        peaks = new WavePeaks[tracks];
+                        bool read = true;
+
+                        for (int lane = 0; lane < tracks && read; lane++)
+                            read = _waves.TryGetValue(WaveKey(placed.Clip.Path, lane), out peaks[lane]!);
+
+                        if (!read)
+                        {
+                            // Only once there is room to draw it: a whole day of segments a pixel
+                            // wide each would be hundreds of reads for nothing visible.
+                            if (to - from >= 3) ReadWaveforms(placed.Clip.Path, tracks);
+                            continue;
+                        }
                     }
 
                     for (double x = Math.Floor(from); x < to; x++)
@@ -716,6 +717,28 @@ public partial class LiveEditWindow
                     }
                 }
             }
+        }
+
+        // Under the waveform, so drawn first.
+        int at = 0;
+
+        foreach (var block in blocks)
+        {
+            if (block.To - block.From < 3) continue;
+
+            for (int lane = 0; lane < block.Tracks; lane++)
+                AudioCanvas.Children.Insert(at++, new Rectangle
+                {
+                    Width = Math.Max(1, block.To - block.From - 1),
+                    Height = Math.Max(1, laneHeight - 2),
+                    RadiusX = 3,
+                    RadiusY = 3,
+                    Fill = block.Pending ? PendingBlockFill : AudioBlockFill,
+                    Stroke = block.Pending ? Brush("Warn") : AudioBlockStroke,
+                    StrokeThickness = 1,
+                    Margin = new Thickness(block.From, lane * laneHeight + 1, 0, 0),
+                    IsHitTestVisible = false,
+                });
         }
 
         wave.Freeze();

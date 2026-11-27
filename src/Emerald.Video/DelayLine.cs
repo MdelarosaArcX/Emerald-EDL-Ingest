@@ -2000,6 +2000,30 @@ public sealed class DelayLine : IDelayLine, IDisposable
         return CopySlot(SlotAt(sequence), sequence, into);
     }
 
+    /// <summary>
+    /// Reads one frame's sound, and its picture only where that cannot be helped: from memory the
+    /// sound alone is copied, a few kilobytes rather than four megabytes; from the disk or the
+    /// overflow the whole frame is read, as <see cref="TryRead"/>. For a reader that wants the sound
+    /// ahead of the picture, such as Live Edit's preview of the segment still being recorded.
+    /// </summary>
+    public unsafe DelayReadResult TryReadAudio(long sequence, DelayFrameBuffer into)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return DelayReadResult.EndOfLine;
+
+        long sealedAt = Volatile.Read(ref _sealedAt);
+        if (sealedAt >= 0 && sequence >= sealedAt) return DelayReadResult.EndOfLine;
+
+        long written = Volatile.Read(ref _written);
+        if (sequence >= written) return DelayReadResult.NotYetWritten;
+        if (sequence < written - SlotCount) return DelayReadResult.Lapped;
+
+        if (!_direct && _ram is not null && sequence >= written - _ramSlots &&
+            CopySlot(RamSlotAt(sequence), sequence, into, video: false) == DelayReadResult.Ok)
+            return DelayReadResult.Ok;
+
+        return TryRead(sequence, into);
+    }
+
     /// <summary>Direct: from the read-ahead when it has the frame, otherwise straight off the disk.</summary>
     private unsafe DelayReadResult TryReadDirect(long sequence, DelayFrameBuffer into)
     {
@@ -2154,7 +2178,8 @@ public sealed class DelayLine : IDelayLine, IDisposable
     /// Copies frame <paramref name="sequence"/> out of a slot, in memory or in the file, checking
     /// the slot's sequence before and after so a frame written over mid-copy is never handed on.
     /// </summary>
-    internal unsafe DelayReadResult CopySlot(byte* slot, long sequence, DelayFrameBuffer into)
+    /// <param name="video">False to leave the picture out, and the buffer's picture as it was.</param>
+    internal unsafe DelayReadResult CopySlot(byte* slot, long sequence, DelayFrameBuffer into, bool video = true)
     {
         if (Volatile.Read(ref *(long*)(slot + OffSequence)) != sequence) return DelayReadResult.Lapped;
 
@@ -2166,8 +2191,11 @@ public sealed class DelayLine : IDelayLine, IDisposable
         bool audioReal = (flags & FlagAudioReal) != 0;
         long recordingFrame = *(long*)(slot + OffRecordingFrame);
 
-        fixed (byte* dst = into.Video)
-            Buffer.MemoryCopy(slot + SlotHeaderBytes, dst, into.Video.Length, videoBytes);
+        if (video)
+        {
+            fixed (byte* dst = into.Video)
+                Buffer.MemoryCopy(slot + SlotHeaderBytes, dst, into.Video.Length, videoBytes);
+        }
 
         if (audioBytes > 0)
         {
@@ -2187,7 +2215,7 @@ public sealed class DelayLine : IDelayLine, IDisposable
         // not the buffer the caller is still holding on to.
         if (Volatile.Read(ref *(long*)(slot + OffSequence)) != sequence) return DelayReadResult.Lapped;
 
-        into.VideoBytes = videoBytes;
+        if (video) into.VideoBytes = videoBytes;
         into.AudioBytes = audioBytes;
         into.AudioChannels = ChannelsIn(flags);
         into.AudioWasReal = audioReal;

@@ -1022,7 +1022,6 @@ public partial class LiveEditWindow : Window
         if (shift != 0)
         {
             _audioEdits = _audioEdits.Select(a => a with { StartFrame = a.StartFrame + shift }).ToList();
-            _audioSwitches = _audioSwitches.Select(s => s with { StartFrame = s.StartFrame + shift }).ToList();
 
             long[] cuts = _audioCuts.Select(c => c + shift).ToArray();
             _audioCuts.Clear();
@@ -1286,6 +1285,7 @@ public partial class LiveEditWindow : Window
     {
         LeaveJoin();
         _playedOf = null;
+        _closing = null;
 
         _at = Math.Clamp(dayFrame, 0, _dayFrames - 1);
 
@@ -1344,8 +1344,8 @@ public partial class LiveEditWindow : Window
 
             PreviewPlaceholder.Text = want is null
                 ? $"Nothing recorded at {Stamp(_at)}"
-                : $"{want.Clip.Name}\n\nstill being recorded - it cannot be played until the " +
-                  $"recorder closes it, about every {RecordingProfile.Label(RecordingProfile.SegmentLengths, _settings.RecordingSegmentSeconds)}";
+                : $"{want.Clip.Name}\n\nstill being recorded, and {WhyNotHeld(on.CapturedFrame)} - it can be played " +
+                  $"once the recorder closes it, about every {RecordingProfile.Label(RecordingProfile.SegmentLengths, _settings.RecordingSegmentSeconds)}";
 
             PreviewPlaceholder.Visibility = Visibility.Visible;
 
@@ -1388,12 +1388,7 @@ public partial class LiveEditWindow : Window
         // because a Position set against an unopened source is silently thrown away.
         Settle(swapped);
 
-        EnsureVisible(_at);
-        ShowScroll();
-
-        Draw();
-        DrawOnAir();
-        ShowPosition();
+        AfterSeek();
     }
 
     /// <summary>
@@ -1467,12 +1462,7 @@ public partial class LiveEditWindow : Window
 
         Settle(swapped);
 
-        EnsureVisible(_at);
-        ShowScroll();
-
-        Draw();
-        DrawOnAir();
-        ShowPosition();
+        AfterSeek();
     }
 
     // ------------------------------------------------------------------ the standby player
@@ -1609,6 +1599,10 @@ public partial class LiveEditWindow : Window
         _standby.IsMuted = true;
         _standby.SpeedRatio = 1;
         _standby.Source = want.Uri;
+
+        // A recording's sound read ahead too, for the preview that plays it beside a silent player.
+        if (_placed.FirstOrDefault(p => !p.Pending && new Uri(p.Clip.Path) == want.Uri) is { } segment && TracksOf(segment) > 1)
+            _preview?.Prepare(segment.Clip.Path, TracksOf(segment), want.Offset / (double)_rate);
 
         // Windows opens nothing until it is told to play or pause. Without this the first file held
         // ready in a window's life was not, and the first join was a black screen while it opened.
@@ -1861,6 +1855,9 @@ public partial class LiveEditWindow : Window
                 after++;
 
             bool was = _playing;
+
+            // What comes after already held ready: gone over as the join does it, not opened afresh.
+            if (was && IntoReady(after)) return;
 
             Seek(after);
 
@@ -2188,7 +2185,7 @@ public partial class LiveEditWindow : Window
 
                 // Run off the end of the placement and the recording takes over again, which is
                 // a reload rather than a position change.
-                if (IngestTimeline.At(_at, PlayedItems()).Path != on.Path) Seek(_at);
+                if (IngestTimeline.At(_at, PlayedItems()).Path != on.Path && !RunCutNow()) Seek(_at);
             }
             else Seek(_at);
         }
@@ -2261,6 +2258,8 @@ public partial class LiveEditWindow : Window
             // keeps playing because it was playing.
             if (at >= to)
             {
+                if (RunCutNow()) return;
+
                 Seek(to);
 
                 if (_playing && (_loaded is not null || _onIngest is not null)) Player.Play();

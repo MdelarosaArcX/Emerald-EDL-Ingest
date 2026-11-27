@@ -4,7 +4,8 @@ using Emerald.Core;
 namespace Emerald.Video;
 
 /// <summary>Where the preview's picture is, and what is to be heard there.</summary>
-/// <param name="StartFrame">The captured frame the file begins at, which the switches and levels are counted in.</param>
+/// <param name="StartFrame">The captured frame the file begins at, which the levels are counted in.</param>
+/// <param name="Track">The pair the editor is listening to. Only heard here: it does not go to air.</param>
 /// <param name="Position">How far into the file the picture is, in seconds, at <paramref name="At"/>.</param>
 /// <param name="At">A <see cref="Stopwatch"/> timestamp.</param>
 /// <param name="Volume">The window's own level, 0 to 1. Nought is silence.</param>
@@ -13,13 +14,17 @@ namespace Emerald.Video;
 /// The file that plays straight on from this one, once it is near. Its sound follows this one's with
 /// nothing between, whichever moment the picture changes over.
 /// </param>
+/// <param name="Held">For the segment still being recorded, played from the delay: the line and where in it.</param>
 public sealed record PreviewMoment(
     string Path, int Tracks, long StartFrame, long Frames, int Rate, double Position, long At,
-    IReadOnlyList<AudioSwitch> Switches, IReadOnlyList<AudioEdit> Edits, double Volume,
-    PreviewNext? Next);
+    int Track, IReadOnlyList<AudioEdit> Edits, double Volume,
+    PreviewNext? Next, PreviewHeld? Held = null);
 
 /// <summary>The segment after the one playing, and the captured frame it begins at.</summary>
-public sealed record PreviewNext(string Path, int Tracks, long StartFrame);
+public sealed record PreviewNext(string Path, int Tracks, long StartFrame, PreviewHeld? Held = null);
+
+/// <summary>A segment heard from the delay: the line, and the frame of the recording the segment starts at.</summary>
+public sealed record PreviewHeld(IDelayLine Line, long RecordingStart);
 
 /// <summary>
 /// Where the sound should be read from to be heard with the picture. The picture is the clock: the
@@ -85,14 +90,14 @@ public sealed class SoundFeed
     /// <summary>A length further out than this from the picture's is not believed.</summary>
     private const long LengthSlack = SegmentSound.SampleRate / 4;
 
-    private readonly SegmentSound _source;
+    private readonly ISoundSource _source;
     private readonly SoundCursor _cursor = new();
     private byte[] _rest = Array.Empty<byte>();
     private string? _path;
     private int _tracks;
     private long _start;
 
-    public SoundFeed(SegmentSound source) => _source = source;
+    public SoundFeed(ISoundSource source) => _source = source;
 
     /// <summary>Whether anything has been given since <see cref="Forget"/>.</summary>
     public bool Started => _cursor.Sample is not null;
@@ -118,7 +123,15 @@ public sealed class SoundFeed
     {
         double wanted = now.StartFrame / (double)now.Rate + now.Position + ahead;
 
-        if (_path != now.Path && _path != now.Next?.Path) _cursor.Forget();
+        if (_path != now.Path && _path != now.Next?.Path)
+        {
+            // The segment that was being recorded, now closed: the same sound from the file, on
+            // the same count, where the delay left off.
+            if (_path is not null && DelaySound.PathOf(_path) == DelaySound.PathOf(now.Path) && _start == now.StartFrame)
+                (_path, _tracks) = (now.Path, now.Tracks);
+            else
+                _cursor.Forget();
+        }
 
         Moved = !Started || _cursor.Follow(wanted - _start / (double)now.Rate);
 
@@ -196,8 +209,9 @@ public sealed class SoundFeed
 }
 
 /// <summary>
-/// Plays the sound of Live Edit's preview for recordings of several tracks: the track chosen for each
-/// frame, at the level set on it, exactly as the transmitter does it (<see cref="RecordingSound"/>).
+/// Plays the sound of Live Edit's preview for recordings of several tracks: the pair the editor is
+/// listening to, at the level set on each frame (<see cref="RecordingSound"/>). For the editor only -
+/// air sends every pair and the hardware chooses.
 ///
 /// The picture's player has no way to choose a track, and giving it a different file at every change
 /// stopped the picture and the playhead each time. So the player is silent, its one file plays
@@ -214,7 +228,7 @@ public sealed class PreviewSound : IDisposable
     /// <summary>With nothing said for this long the window is stuck, and so is the picture.</summary>
     private const double StaleSeconds = 1.0;
 
-    private readonly SegmentSound _source;
+    private readonly PreviewSources _source;
     private readonly AutoResetEvent _wake = new(false);
     private readonly Thread _thread;
     private PreviewMoment? _now;
@@ -223,7 +237,7 @@ public sealed class PreviewSound : IDisposable
 
     public PreviewSound(string ffmpeg)
     {
-        _source = new SegmentSound(ffmpeg);
+        _source = new PreviewSources(new SegmentSound(ffmpeg), new DelaySound());
 
         _thread = new Thread(Run) { IsBackground = true, Name = "live edit preview sound", Priority = ThreadPriority.AboveNormal };
         _thread.Start();
@@ -232,7 +246,7 @@ public sealed class PreviewSound : IDisposable
     /// <summary>Times the sound was put back in step, and times it was not in memory when wanted.</summary>
     public (long Moved, long Waited) Counts => (Interlocked.Read(ref _moved), Interlocked.Read(ref _waited));
 
-    public long Bytes => _source.Bytes;
+    public long Bytes => _source.Files.Bytes;
 
     /// <summary>Why nothing is heard, or null.</summary>
     public string? Problem { get; private set; }
@@ -240,6 +254,11 @@ public sealed class PreviewSound : IDisposable
     /// <summary>Playing, and here. Called every tick.</summary>
     public void Play(PreviewMoment now)
     {
+        // The delay, held only while some of what is heard comes out of it.
+        if (now.Held is { } held) _source.Delay.Use(now.Path, held.Line, held.RecordingStart);
+        if (now.Next is { Held: { } after } next) _source.Delay.Use(next.Path, after.Line, after.RecordingStart);
+        if (now.Held is null && now.Next?.Held is null) _source.Delay.Drop();
+
         bool waking = Volatile.Read(ref _now) is null;
 
         Volatile.Write(ref _now, now);
@@ -250,6 +269,7 @@ public sealed class PreviewSound : IDisposable
     public void Pause()
     {
         if (Interlocked.Exchange(ref _now, null) is not null) _wake.Set();
+        _source.Delay.Drop();
     }
 
     /// <summary>Has the sound here ready before it is played: where the playhead has been put.</summary>
@@ -317,7 +337,7 @@ public sealed class PreviewSound : IDisposable
                     Interlocked.Increment(ref _moved);
                 }
 
-                int track = AudioSwitches.TrackAt(feed.Frame, now.Switches);
+                int track = now.Track;
 
                 double level = AudioEdits.GainDbAt(feed.Frame, now.Edits) +
                                (now.Volume <= 0.0001 ? double.NegativeInfinity : 20 * Math.Log10(now.Volume));

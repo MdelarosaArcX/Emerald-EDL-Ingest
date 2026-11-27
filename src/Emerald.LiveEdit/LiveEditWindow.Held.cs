@@ -17,8 +17,8 @@ namespace Emerald.LiveEdit;
 /// segment is shown from there instead, and plays along at the real rate. Further back than the
 /// line reaches is still the sentence.
 ///
-/// Picture only: the line's sound is the recorder's raw input, and there is no player here to
-/// send it through.
+/// Its sound is played from the line too, by the preview's own sound (<see cref="FollowHeldSound"/>),
+/// and its waveform drawn from it (<see cref="HeldWaves"/>).
 /// </summary>
 public partial class LiveEditWindow
 {
@@ -57,6 +57,9 @@ public partial class LiveEditWindow
     /// </summary>
     private bool ShowHeld(long capturedFrame)
     {
+        // Already up: the screen refresh got there first (HeldFrame).
+        if (capturedFrame == _heldShown && HeldView.Visibility == Visibility.Visible && _heldPicture.Line is not null) return true;
+
         if (!_heldPicture.Use(HeldLine) || _heldPicture.Line is not { } line) return false;
 
         if (RecordingFrameOfDay(capturedFrame, line.FrameRate) is not { } frame || frame < 0) return false;
@@ -70,6 +73,7 @@ public partial class LiveEditWindow
         }
 
         _heldBitmap.WritePixels(new Int32Rect(0, 0, width, height), bgra, width * 4, 0);
+        _heldShown = capturedFrame;
 
         HeldView.Visibility = Visibility.Visible;
         _heldLeftAt = null;
@@ -80,6 +84,53 @@ public partial class LiveEditWindow
     /// From Seek, for a frame of the segment still being recorded: shows it from the delay line
     /// and makes the transport run on that. False when the line does not hold it.
     /// </summary>
+    /// <summary>Why a frame of the segment still being recorded cannot be shown from the delay, in words.</summary>
+    private string WhyNotHeld(long capturedFrame)
+    {
+        if (!_heldPicture.Use(HeldLine) || _heldPicture.Line is not { } line) return "no delay is being kept to show it from";
+
+        long held = Math.Max(0, Math.Min(line.FramesWritten, line.SlotCount));
+
+        if (RecordingFrameOfDay(capturedFrame, line.FrameRate) is { } frame &&
+            line.RecordingFrameAt(line.FramesWritten - 1) is var newest and >= 0 && frame > newest)
+            return "not recorded yet";
+
+        return $"further back than the delay holds (the last {new Timecode(held, line.FrameRate)})";
+    }
+
+    /// <summary>The captured frame on the held picture now.</summary>
+    private long _heldShown = -1;
+
+    private bool _heldRefreshing;
+
+    /// <summary>
+    /// At every screen refresh while the delay plays: the next frame up as soon as it is due. On the
+    /// frame timer alone a frame was missed whenever the timer ran late, about one in ten.
+    /// </summary>
+    private void HeldFrame(object? sender, EventArgs e)
+    {
+        if (!_held || !_playing)
+        {
+            _heldRefreshing = false;
+            CompositionTarget.Rendering -= HeldFrame;
+            return;
+        }
+
+        long ruler = Math.Min(_dayFrames - 1, _heldFrom + (long)Math.Round(_heldClock.Elapsed.TotalSeconds * _rate));
+
+        // Only inside the run the timer has checked: what is past it is the timer's to hand over.
+        if (ruler <= _at + 1 && ClipAt(ruler + _heldShift) is { Pending: true }) ShowHeld(ruler + _heldShift);
+    }
+
+    /// <summary>From the frame timer, while the delay plays.</summary>
+    private void RefreshHeld()
+    {
+        if (_heldRefreshing) return;
+
+        _heldRefreshing = true;
+        CompositionTarget.Rendering += HeldFrame;
+    }
+
     private bool EnterHeld(long capturedFrame)
     {
         if (!ShowHeld(capturedFrame)) { LeaveHeld(); return false; }
@@ -137,12 +188,24 @@ public partial class LiveEditWindow
     /// </summary>
     private bool AdvanceHeld()
     {
+        RefreshHeld();
+
         _at = Math.Min(_dayFrames - 1,
                        _heldFrom + (long)Math.Round(_heldClock.Elapsed.TotalSeconds * _rate));
 
         if (StoppedAtMarkOut()) return false;
 
         TimelineAt on = IngestTimeline.At(_at, PlayedItems());
+
+        // The segment has closed under the playhead: the delay plays on until the file is moving.
+        if (!on.OnIngest && on.CapturedFrame - _at == _heldShift && ClipAt(on.CapturedFrame) is { Pending: false } closed &&
+            HeldIntoFile(closed, on.CapturedFrame) is { } handed)
+        {
+            if (handed) return false;
+
+            ShowHeld(on.CapturedFrame);
+            return true;
+        }
 
         // Run into an ingest item, a deleted scene, or a closed file: the ordinary path takes it.
         if (on.OnIngest || ClipAt(on.CapturedFrame) is not { Pending: true } ||

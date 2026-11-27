@@ -61,11 +61,15 @@ public partial class LiveEditWindow
     private DateTime _rolledAt;
     private TimeSpan _rolledFrom;
 
-    /// <summary>The segment that plays straight on from the end of the one loaded, with nothing placed or cut between.</summary>
-    private Placed? StraightOn()
+    /// <summary>
+    /// The segment that plays straight on from the end of the one loaded, with nothing placed or cut
+    /// between. The one still being recorded only when <paramref name="recording"/> is true.
+    /// </summary>
+    private Placed? StraightOn(bool recording = false)
     {
         if (_onIngest is not null || _loaded is not { } ending) return null;
-        if (NextSegmentFrom(ending.EndFrame) is not { Pending: false } next || ReferenceEquals(next, ending)) return null;
+        if (NextSegmentFrom(ending.EndFrame) is not { } next || ReferenceEquals(next, ending)) return null;
+        if (next.Pending && !recording) return null;
 
         List<IngestItem> items = PlayedItems();
         if (items.Count == 0) return next;
@@ -87,8 +91,25 @@ public partial class LiveEditWindow
 
         double left = ending.Frames / (double)_rate - PlayedSeconds();
 
-        return left <= JoinWatchSeconds && ReadyNext() is { } next ? (next, left) : null;
+        return left <= JoinWatchSeconds && (ReadyNext() ?? HeldNext()) is { } next ? (next, left) : null;
     }
+
+    /// <summary>The segment still being recorded, straight on from this one, when the delay holds its first frame.</summary>
+    private Placed? HeldNext()
+    {
+        if (_loaded is not { } ending || StraightOn(recording: true) is not { Pending: true } next) return null;
+
+        long join = Math.Max(ending.EndFrame, next.StartFrame);
+
+        if (_stopAt is { } stop && stop <= IngestTimeline.RulerFrameOf(join, PlayedItems())) return null;
+
+        return HeldHolds(join) ? next : null;
+    }
+
+    /// <summary>Whether the delay holds a captured frame of the day.</summary>
+    private bool HeldHolds(long capturedFrame) =>
+        _heldPicture.Use(HeldLine) && _heldPicture.Line is { } line &&
+        RecordingFrameOfDay(capturedFrame, line.FrameRate) is { } frame && frame >= 0 && line.SequenceOf(frame) >= 0;
 
     /// <summary>The segment that plays straight on, when the standby holds it on its first frame and it is not to stop before.</summary>
     private Placed? ReadyNext()
@@ -105,7 +126,10 @@ public partial class LiveEditWindow
     /// <summary>Every tick.</summary>
     private void FollowJoin()
     {
-        if (Join() is null) { LeaveJoin(); return; }
+        // The standby is out of the delay's way, being made ready for the file closing under it.
+        if (_closing is not null) return;
+
+        if (Join() is null && RunJoin() is null) { LeaveJoin(); return; }
         if (_watchingJoin) return;
 
         _watchingJoin = true;
@@ -114,7 +138,20 @@ public partial class LiveEditWindow
 
     private void JoinFrame(object? sender, EventArgs e)
     {
-        if (Join() is not { } join) { LeaveJoin(); return; }
+        if (Join() is not { } join)
+        {
+            if (RunJoin() is { } run) RunFrame(run.Cut, run.Left);
+            else LeaveJoin();
+
+            return;
+        }
+
+        // Into the segment still being recorded: nothing to set going, the delay is already there.
+        if (join.Next.Pending)
+        {
+            if (join.Left <= CutSeconds) IntoHeld(join.Next);
+            return;
+        }
 
         if (!_rolling)
         {
@@ -148,10 +185,299 @@ public partial class LiveEditWindow
             CompositionTarget.Rendering -= JoinFrame;
         }
 
+        _closing = null;
+
         if (!_rolling) return;
 
         _rolling = false;
+        _standby.SpeedRatio = 1;
         if (_standbyReady) Park(_standbyOffset);
+    }
+
+    // ------------------------------------------------------------------ into and out of ingest items
+
+    /// <summary>
+    /// The change of source the run playing ends in - into an ingest item placed on the timeline, or
+    /// out of one back to the recording - when the standby holds what comes after it on the right
+    /// frame: the ruler frame of the change, and how long until it. The same going over as between
+    /// two segments: what comes next is set going just before, and put on screen once it moves.
+    /// </summary>
+    private (long Cut, double Left)? RunJoin()
+    {
+        if (!_playing || _held || !_open || _seekedCaptured is not null || _seekedIngest is not null) return null;
+
+        List<IngestItem> items = PlayedItems();
+        if (items.Count == 0) return null;
+
+        long cut;
+        double left;
+
+        if (_onIngest is not null)
+        {
+            TimelineAt on = IngestTimeline.At(_at, items);
+            if (!on.OnIngest || on.Path != _onIngest) return null;
+
+            int found = items.FindIndex(i =>
+                i.Path == on.Path && IngestTimeline.RulerStart(i, items) is var s && _at >= s && _at < s + i.Plan.Frames);
+            if (found < 0) return null;
+
+            IngestItem item = items[found];
+
+            long start = IngestTimeline.RulerStart(item, items);
+            double speed = Math.Max(0.0001, on.Speed);
+
+            // Where the player is, on the ruler: the item's start, on by however far into the file it is.
+            double fileAtStart = on.Offset - (_at - start) * speed;
+            double ruler = start + (Player.Position.TotalSeconds * _rate - fileAtStart) / speed;
+
+            cut = start + item.Plan.Frames;
+            left = (cut - ruler) / _rate;
+        }
+        else if (_loaded is { } loaded)
+        {
+            (_, long to) = IngestTimeline.RunAround(_at, items);
+            if (to == long.MaxValue) return null;
+
+            TimelineAt here = IngestTimeline.At(_at, items);
+            if (here.OnIngest) return null;
+
+            // The segment ends first: that is a join between files.
+            long cutCaptured = here.CapturedFrame + (to - _at);
+            if (cutCaptured > loaded.EndFrame) return null;
+
+            cut = to;
+            left = (cutCaptured - loaded.StartFrame) / (double)_rate - PlayedSeconds();
+        }
+        else return null;
+
+        if (left > JoinWatchSeconds) return null;
+        if (_stopAt is { } stop && stop <= cut) return null;
+
+        return _standbyReady && SourceAt(cut, items) is { } next && next.Uri == _standbyUri && next.Offset == _standbyOffset
+            ? (cut, left)
+            : null;
+    }
+
+    private void RunFrame(long cut, double left)
+    {
+        if (!_rolling)
+        {
+            // Windows drops a position set while a file opens: put back on its frame before it is wanted.
+            if (!Parked())
+            {
+                Park(_standbyOffset);
+                return;
+            }
+
+            if (left > RollSeconds) return;
+
+            // At the speed it will play at: a fit-to-fill item runs faster or slower than the clock.
+            TimelineAt after = IngestTimeline.At(cut, PlayedItems());
+            _standby.SpeedRatio = after.OnIngest ? after.Speed : 1;
+            Roll();
+        }
+        else if (_standby.Position > _rolledFrom)
+        {
+            if (left <= CutSeconds) CutRun(cut);
+        }
+        else if ((DateTime.UtcNow - _rolledAt).TotalSeconds > NotMovingSeconds)
+        {
+            _rolledAt = DateTime.UtcNow;
+            Nudge(_standby);
+        }
+    }
+
+    /// <summary>
+    /// Over the change, onto the standby that is already playing. Through the ordinary seek, which
+    /// finds the standby holding what it wants and only puts it on screen; the timeline is redrawn
+    /// after, out of the picture's way.
+    /// </summary>
+    private void CutRun(long cut)
+    {
+        _rolling = false;
+        _quickSeek = true;
+
+        try { Seek(cut); }
+        finally { _quickSeek = false; }
+    }
+
+    /// <summary>
+    /// From the frame timer, at the end of a run: the change as the join makes it, when the standby
+    /// has been set going for it. True when it was.
+    /// </summary>
+    private bool RunCutNow()
+    {
+        if (!_rolling || RunJoin() is not { } run) return false;
+
+        CutRun(run.Cut);
+        return true;
+    }
+
+    /// <summary>
+    /// The item playing has ended with what follows it held ready at <paramref name="cut"/>: that
+    /// set going and put on screen. False when the standby does not hold it.
+    /// </summary>
+    private bool IntoReady(long cut)
+    {
+        if (!_standbyReady || SourceAt(cut, PlayedItems()) is not { } next || next.Uri != _standbyUri || next.Offset != _standbyOffset)
+            return false;
+
+        if (!_rolling)
+        {
+            if (!Parked()) return false;
+
+            TimelineAt after = IngestTimeline.At(cut, PlayedItems());
+            _standby.SpeedRatio = after.OnIngest ? after.Speed : 1;
+            Roll();
+        }
+
+        CutRun(cut);
+        return true;
+    }
+
+    /// <summary>The standby sits on the frame it was sent to, near enough.</summary>
+    private bool Parked() => Math.Abs(_standby.Position.TotalSeconds - _standbyOffset / (double)_rate) <= 0.25;
+
+    /// <summary>Set while the join makes its seek: the timeline redrawn after, not in the way of the picture.</summary>
+    private bool _quickSeek;
+
+    private DispatcherTimer? _redrawLater;
+
+    /// <summary>The end of every seek: the view and the timeline brought up to date.</summary>
+    private void AfterSeek()
+    {
+        if (_quickSeek)
+        {
+            DrawMarkers();
+
+            // A quarter of a second on: a redraw straight after held up the first frames of what came next.
+            if (_redrawLater is null)
+            {
+                _redrawLater = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(250) };
+                _redrawLater.Tick += (_, _) =>
+                {
+                    _redrawLater!.Stop();
+                    if (_closed) return;
+
+                    EnsureVisible(_at);
+                    ShowScroll();
+                    Draw();
+                    ShowPosition();
+                };
+            }
+
+            _redrawLater.Stop();
+            _redrawLater.Start();
+            return;
+        }
+
+        EnsureVisible(_at);
+        ShowScroll();
+
+        Draw();
+        DrawOnAir();
+        ShowPosition();
+    }
+
+    /// <summary>From the file onto the delay's picture of the segment still being recorded, playing on.</summary>
+    private void IntoHeld(Placed next)
+    {
+        long join = Math.Max(_loaded!.EndFrame, next.StartFrame);
+
+        LeaveJoin();
+        Seek(IngestTimeline.RulerFrameOf(join, PlayedItems()));
+    }
+
+    /// <summary>
+    /// The segment being played from the delay has closed, and the file is being made ready to go on
+    /// from: the segment, and the captured frame the file takes over at.
+    /// </summary>
+    private (Placed Segment, long At)? _closing;
+
+    /// <summary>
+    /// Every tick while the delay plays a segment that has since closed. The delay plays on while the
+    /// file opens, out of sight, on a frame a second ahead; at that frame the file is set going, and
+    /// it takes over once it moves. Opening the file where the playhead was held the picture still
+    /// while it opened. True once the file has the screen; false while the delay plays on; null to go
+    /// over the ordinary way.
+    /// </summary>
+    private bool? HeldIntoFile(Placed closed, long captured)
+    {
+        var uri = new Uri(closed.Clip.Path);
+
+        if (_closing is not { } closing || !string.Equals(closing.Segment.Clip.Path, closed.Clip.Path, StringComparison.OrdinalIgnoreCase))
+        {
+            // Too near its end for the file to be worth it: the next one is a moment away.
+            if (closed.EndFrame - captured < 2L * _rate) return null;
+
+            long at = captured + _rate;
+            _closing = (closed, at);
+            _rolling = false;
+            Preload((uri, closed.OffsetOf(at)));
+
+            // Its sound read too, for the moment it takes over from the delay's.
+            _preview?.Prepare(closed.Clip.Path, TracksOf(closed), closed.OffsetOf(at) / (double)_rate);
+            return false;
+        }
+
+        // Never got ready, or the standby was wanted for something else.
+        if (_standbyUri != uri || captured > closing.At + _rate)
+        {
+            _closing = null;
+            return null;
+        }
+
+        if (!_standbyReady) return false;
+
+        if (!_rolling)
+        {
+            // Parked where it was sent. Windows drops a position set as a file opens, which for a
+            // join is the start anyway; here it would go back to the start of the segment.
+            if (!Parked())
+            {
+                Park(_standbyOffset);
+                return false;
+            }
+
+            // A tick ahead, for the moment a player takes to move.
+            if (captured >= closing.At - 1) Roll();
+            return false;
+        }
+
+        if (_standby.Position <= _rolledFrom)
+        {
+            if ((DateTime.UtcNow - _rolledAt).TotalSeconds > NotMovingSeconds)
+            {
+                _rolledAt = DateTime.UtcNow;
+                Nudge(_standby);
+            }
+
+            return false;
+        }
+
+        _closing = null;
+        _rolling = false;
+        _held = false;
+        _heldClock.Reset();
+
+        _loaded = closed;
+        _wantOffset = closed.OffsetOf(closing.At);
+        _seekedCaptured = null;
+        _playFloor = closing.At;
+        _playedOf = null;
+        _at = closing.At - _heldShift;
+
+        Show(uri, later: true);
+        HideHeld();
+
+        ActivityLog.Shared.Info(LogSource.App,
+            $"LOAD  {closed.Clip.Name} - in Live Edit at {Stamp(closed.StartFrame)}, closed while it played from the delay, " +
+            $"{closed.Clip.SizeText}, from {System.IO.Path.GetDirectoryName(closed.Clip.Path)}.",
+            @event: "liveedit.loaded", file: closed.Clip.Path);
+
+        DrawMarkers();
+        Dispatcher.BeginInvoke(() => { if (!_closed) Draw(); }, DispatcherPriority.Background);
+        return true;
     }
 
     /// <summary>The segment has ended with the next one ready. False when there is none.</summary>

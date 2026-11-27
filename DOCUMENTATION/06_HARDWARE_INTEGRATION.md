@@ -228,11 +228,11 @@ There is no string parsing into an index. Single-port selectors are combo boxes 
 - **Up to 16 channels:** 4 groups of 4, so 8 stereo pairs. Channel `i` maps to group `i/4`, channel `i%4`.
 - **`VHD_AUDIOINFO`** is hand-built: 1600 bytes, 400 per group, channel array at offset 64, 80 per channel, with `Mode` at +0, `Format` at +4, `DataSize` at +68 and `Data` at +72. A code comment says this was verified against the SDK on a DELTA-3G.
 
-**TX embed** (`SdiOutput.EmbedAudio`, `SdiOutput.cs:155`). `PlayoutService` puts each bed on channels `i*2` and `i*2+1`. The delay and Live Edit transmitters send one stereo pair.
+**TX embed** (`SdiOutput.EmbedAudio`, `SdiOutput.cs:155`). `PlayoutService` puts each bed on channels `i*2` and `i*2+1`. The Live Edit transmitter sends every pair the recording carries; `DelayTransmitter` sends one.
 
 **RX extract** (`SdiAudioReader`). Unused channels return full zero buffers, so a pair counts as present only if a sample is non-zero. `SdiCapture.DetectPairs` watches for 2 seconds and takes the highest count, minimum 1. The count runs from the first pair and stops at the first silent one, so audio on pairs 1 and 3 with pair 2 empty records one pair. No caller passes `audioPairs`, so pairs are always auto-detected.
 
-**On the delayed output**, `RecordingSound` takes the pair chosen in Live Edit (`AudioSwitches`) out of the frame's interleaved channels and sends it on CH 1-2, cross-fading a change over one frame. The channel count travels with each frame in the delay slot's flags. `DelayTransmitter`, which nothing starts, still reads the sound as stereo. Not yet heard at a card.
+**On the delayed output**, `RecordingSound.All` sends every pair of the frame's interleaved channels on its own SDI channels, CH 1-2 first, at the level set in Live Edit. Which pair is heard is chosen downstream; Live Edit's choice of pair is for its preview only. The channel count travels with each frame in the delay slot's flags. `DelayTransmitter`, which nothing starts, still reads the sound as stereo. Not yet heard at a card.
 
 ## Error handling by layer
 

@@ -95,7 +95,7 @@ select at, area, source, event, message from log_error order by at_ms desc limit
 | Picture freezes when the source stops, and never fails | Known issue: at delays over 0.5 s the 10-second failure is not reached | Check the source. Stop the feed by hand if it does not come back. |
 | Feed drops, deck still shows ON AIR | Known issue: some TX failure paths report nothing | Check the card and restart the feed |
 | Port marks stay lit after stopping | Known issue | Cosmetic. Close and reopen the deck. |
-| Wrong language on air | Another audio track is chosen in Live Edit | Click the lane's name in Live Edit and press **Play instantly** |
+| Wrong language on air | The downstream router or monitor is on another pair. Live Edit's choice of pair is for the editor only and never reaches air. | Choose CH 1-2, or the pair wanted, on the hardware |
 | Audio garbled on a multi-language feed | A build from before multi-pair sound was fixed | Rebuild with `build.bat` |
 | "The receiver has stopped delivering frames. Cutting to black." | No frames for 10 s, at a delay of 0.5 s or less | Check the source |
 | Black frame during the feed | Ring lapped, so resync | Check `delay.dropped` and disk speed |

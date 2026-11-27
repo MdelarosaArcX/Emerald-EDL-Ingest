@@ -4,7 +4,8 @@ using Xunit;
 namespace Emerald.Video.Tests;
 
 /// <summary>
-/// The recording's sound as it goes to air. Every channel here is a different steady level, so a
+/// The recording's sound: every pair as it goes to air, and the one pair Live Edit's editor hears.
+/// Every channel here is a different steady level, so a
 /// sample taken from the wrong channel, or the wrong moment, is a wrong number.
 /// </summary>
 public class RecordingSoundTests
@@ -102,5 +103,54 @@ public class RecordingSoundTests
         Assert.Equal(Samples, RecordingSound.Read(audio, audio.Length, 8, 2, 0, left, right));
         Assert.All(left, s => Assert.Equal(Level(4), s));
         Assert.All(right, s => Assert.Equal(Level(5), s));
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(8)]
+    [InlineData(16)]
+    public void To_air_every_pair_goes_out_on_its_own_channels_in_order(int channels)
+    {
+        byte[] audio = Interleaved(channels);
+
+        List<short[]> sent = new RecordingSound().All(audio, audio.Length, channels, 0)!;
+
+        Assert.Equal(channels, sent.Count);
+        for (int c = 0; c < channels; c++)
+        {
+            Assert.Equal(Samples, sent[c].Length);
+            Assert.All(sent[c], s => Assert.Equal(Level(c), s));
+        }
+    }
+
+    [Fact]
+    public void To_air_a_level_applies_to_every_pair_and_is_ramped()
+    {
+        byte[] audio = Interleaved(8);
+        var sound = new RecordingSound();
+
+        sound.All(audio, audio.Length, 8, 0);
+        List<short[]> sent = sound.All(audio, audio.Length, 8, -6.0206)!;
+
+        for (int c = 0; c < 8; c++)
+        {
+            Assert.InRange(sent[c][0], Level(c) - 20, Level(c));
+            Assert.InRange(sent[c][^1], Level(c) / 2 - 1, Level(c) / 2 + 1);
+        }
+
+        sent = sound.All(audio, audio.Length, 8, -6.0206)!;
+        Assert.All(sent[5], s => Assert.InRange(s, Level(5) / 2 - 1, Level(5) / 2 + 1));
+    }
+
+    [Fact]
+    public void Under_a_video_only_item_every_pair_of_the_recording_is_heard()
+    {
+        byte[] audio = Interleaved(4);
+        var into = Enumerable.Range(0, 8).Select(_ => new short[Samples]).ToList();
+
+        RecordingSound.ReadAll(audio, audio.Length, 4, 0, into);
+
+        for (int c = 0; c < 4; c++) Assert.All(into[c], s => Assert.Equal(Level(c), s));
+        for (int c = 4; c < 8; c++) Assert.All(into[c], s => Assert.Equal(0, s));
     }
 }

@@ -3,16 +3,16 @@ using Emerald.Core;
 namespace Emerald.Video;
 
 /// <summary>
-/// The sound of one recording frame as it goes to air: the chosen pair out of every pair the delay
-/// carries, as the two mono channels the card embeds, at the level set on that frame.
+/// The sound of one recording frame, out of the delay, which carries every recorded pair
+/// interleaved - four pairs is eight channels side by side.
 ///
-/// <b>The delay carries every recorded pair, interleaved</b> - four pairs is eight channels side by
-/// side. Read as stereo, which it was, that is four times as many samples as there are, taken a pair
-/// at a time from different tracks.
+/// <b>To air</b> every pair goes out on its own channels, CH 1-2 first, at the level set on the
+/// frame (<see cref="All"/>): which pair is heard is chosen downstream, by the hardware, not here.
+/// <b>Live Edit's preview</b> takes one pair, the one the editor is listening to (<see cref="Frame"/>).
 ///
-/// Pure and without a card, so it can be tested. One of these per transmitter: it remembers the
-/// level and the track the last frame ended on, so a change is ramped or cross-faded over one frame
-/// rather than made between two samples, which is a click on air.
+/// Pure and without a card, so it can be tested. One per transmitter or preview: it remembers the
+/// level and the pair the last frame ended on, so a change is ramped or cross-faded over one frame
+/// rather than made between two samples, which is a click.
 /// </summary>
 public sealed class RecordingSound
 {
@@ -23,6 +23,66 @@ public sealed class RecordingSound
     /// <summary>The level and the track the last frame ended on; no track after silence.</summary>
     private double _gain = 1;
     private int _track = -1;
+
+    private readonly List<short[]> _all = new(16);
+
+    /// <summary>
+    /// A frame's sound as every channel it has, one mono array each in order - what the card embeds
+    /// as SDI channels 1, 2, 3 ... - at the level set on it, ramped from the last frame's. Null when
+    /// the frame has none.
+    /// </summary>
+    public List<short[]>? All(byte[] audio, int bytes, int channels, double gainDb)
+    {
+        double from = _gain;
+        double to = AudioEdits.Linear(gainDb);
+        _gain = to;
+        _track = -1;
+
+        channels = Math.Max(2, channels);
+        int samples = Samples(bytes, channels);
+        if (samples <= 0) return null;
+
+        Fit(_all, channels, samples);
+
+        for (int i = 0; i < samples; i++)
+        {
+            double gain = from + (to - from) * ((i + 1) / (double)samples);
+
+            for (int c = 0; c < channels; c++)
+                _all[c][i] = Fit(Sample(audio, channels, i, c) * gain);
+        }
+
+        return _all;
+    }
+
+    /// <summary>
+    /// Every channel of a frame into the arrays given, as many samples as they hold, at one level -
+    /// the recording heard under a video-only item. Channels it has not got are silent.
+    /// </summary>
+    public static void ReadAll(byte[] audio, int bytes, int channels, double gainDb, IReadOnlyList<short[]> into)
+    {
+        channels = Math.Max(2, channels);
+        double gain = AudioEdits.Linear(gainDb);
+
+        for (int c = 0; c < into.Count; c++)
+        {
+            short[] channel = into[c];
+            int samples = Math.Min(channel.Length, Samples(bytes, channels));
+
+            Array.Clear(channel);
+            if (c >= channels) continue;
+
+            for (int i = 0; i < samples; i++) channel[i] = Fit(Sample(audio, channels, i, c) * gain);
+        }
+    }
+
+    /// <summary>Makes <paramref name="list"/> exactly <paramref name="count"/> arrays of <paramref name="samples"/>.</summary>
+    internal static void Fit(List<short[]> list, int count, int samples)
+    {
+        while (list.Count > count) list.RemoveAt(list.Count - 1);
+        for (int c = 0; c < list.Count; c++) if (list[c].Length != samples) list[c] = new short[samples];
+        while (list.Count < count) list.Add(new short[samples]);
+    }
 
     /// <summary>Silence has gone out in the recording's place: it comes back ramped up from nothing.</summary>
     public void Silenced()

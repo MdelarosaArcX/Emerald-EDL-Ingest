@@ -177,7 +177,7 @@
                            RenderOptions.BitmapScalingMode="Linear"/>
                     <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10"
                             Background="#C0101419" CornerRadius="4" Padding="8,3"
-                            ToolTip="This segment is still being recorded. Its picture comes from the delay buffer, which holds the last few minutes of the recording; the sound is not played here.">
+                            ToolTip="This segment is still being recorded. Its picture and sound come from the delay buffer, which holds the last few minutes of the recording. It can be marked and edited like any other.">
                         <TextBlock x:Name="HeldText" Text="RECORDING - from the delay buffer"
                                    Foreground="{StaticResource Warn}" FontWeight="Bold"
                                    FontFamily="Consolas" FontSize="12"/>
@@ -787,7 +787,6 @@
                         Background="#0E1512"
                         SizeChanged="Timeline_SizeChanged"
                         MouseLeftButtonDown="Audio_Click"
-                        MouseRightButtonDown="Audio_RightClick"
                         MouseDown="Pan_Down" MouseMove="Pan_Move" MouseUp="Pan_Up"
                         MouseLeave="Pan_Leave"
                         ToolTip="The recording's sound, a lane for each track. Click a lane's name, or double-click in it, to choose which plays. Right-click a change to take it off. Click a segment to pick up its sound; C cuts at the playhead; [ ] level. Delete Scene takes out the sound with the picture."/>

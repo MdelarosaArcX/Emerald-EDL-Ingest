@@ -185,8 +185,7 @@ public partial class LiveEditWindow
         try
         {
             tx = new LiveAirTransmitter(air.BoardIndex, air.Ports, line, air.Delay, ffmpeg, LiveAir.Shared.CuesForAir,
-                                        () => LiveAir.Shared.AudioEdits,
-                                        () => LiveAir.Shared.AudioSwitches);
+                                        () => LiveAir.Shared.AudioEdits);
         }
         catch (DelayLineException ex)
         {
@@ -343,16 +342,7 @@ public partial class LiveEditWindow
             .Select(e => new AudioEdit(DayToRecording(e.StartFrame), ToRecording(e.Frames), e.GainDb))
             .ToList();
 
-        IReadOnlyList<AudioSwitch> tracks = _audioSwitches
-            .Select(s => new AudioSwitch(DayToRecording(s.StartFrame), s.Track))
-            .ToList();
-
-        // What has aired stays as air has it; what is wanted here holds from the first frame that
-        // can still be changed.
-        if (LiveAir.Shared.CommittedFrame is { } committed)
-            tracks = AudioSwitches.From(committed + AudioLead, LiveAir.Shared.AudioSwitches, tracks);
-
-        EdlReceipt receipt = _edl.Send(LiveAir.Shared, kind, cues, levels, ConformZone(), DateTime.UtcNow, why, tracks);
+        EdlReceipt receipt = _edl.Send(LiveAir.Shared, kind, cues, levels, ConformZone(), DateTime.UtcNow, why);
 
         bool refused = !receipt.Taken && receipt.Verdict is not (EdlVerdict.NotLive or EdlVerdict.Stale);
 

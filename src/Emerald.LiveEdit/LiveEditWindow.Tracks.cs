@@ -11,22 +11,17 @@ using Emerald.Video;
 namespace Emerald.LiveEdit;
 
 /// <summary>
-/// The recording's sound tracks: a lane for each, and which of them plays.
+/// The recording's sound tracks: a lane for each, and which of them the editor hears.
 ///
-/// A recording carries a track for every pair the receiver had when it rolled. Each is drawn on a
-/// lane of its own, and one of them plays - bright, with the others dimmed. Clicking a lane's name,
-/// or double-clicking in it, chooses that track and asks when: instantly, or from a timecode. It
-/// plays until the next change on the timeline. It can also be set to start on the mark in.
-///
-/// <b>What plays here is what goes to air.</b> The changes are handed to the transmitter with the
-/// cues, in frames of the recording, and it takes the chosen pair out of the delay - which carries
-/// them all - so a change needs nothing opened and is in time right up to air. That is why
-/// "instantly" may be inside the no edit zone, which is there for media that has to be opened.
+/// <b>For the editor's ears only.</b> Clicking a lane's name, or double-clicking in it, plays that
+/// pair in the preview at once, and from then on until another is clicked. Nothing about it goes to
+/// air: every pair goes out on its own channels, CH 1-2 first, and which is heard there is chosen
+/// downstream, on the hardware.
 /// </summary>
 public partial class LiveEditWindow
 {
-    /// <summary>Which track plays and from where, in captured frames of this ruler's day, sorted.</summary>
-    private IReadOnlyList<AudioSwitch> _audioSwitches = Array.Empty<AudioSwitch>();
+    /// <summary>The pair the editor is listening to. Not saved and not sent: it is only what is heard here.</summary>
+    private int _listenTrack;
 
     /// <summary>The clickable name at the left of each lane.</summary>
     private const double TrackLabelWidth = 108;
@@ -65,9 +60,8 @@ public partial class LiveEditWindow
         return before?.Clip.Info?.Audio.Count ?? TrackLanes;
     }
 
-    /// <summary>The track of a segment that plays at a captured frame. One it has not got plays its first, as on air.</summary>
-    private int PlayedTrack(Placed segment, long captured) =>
-        AudioSwitches.TrackAt(captured, _audioSwitches) is var track && track < TracksOf(segment) ? track : 0;
+    /// <summary>The pair heard of a segment: the one listened to, or its first when it has not got that one.</summary>
+    private int PlayedTrack(Placed segment, long captured) => _listenTrack < TracksOf(segment) ? _listenTrack : 0;
 
     /// <summary>How many pairs the delay is carrying, once it is. Tracks past them are in the files only.</summary>
     private static int? PairsInDelay() =>
@@ -95,164 +89,40 @@ public partial class LiveEditWindow
     private int LaneAt(double y) =>
         Math.Clamp((int)(y / Math.Max(1, AudioCanvas.ActualHeight) * TrackLanes), 0, TrackLanes - 1);
 
-    /// <summary>A click on the audio lanes that chooses a track: on a lane's name, or a double click in it.</summary>
+    /// <summary>A click on the audio lanes that chooses a pair to hear: on a lane's name, or a double click in it.</summary>
     private bool TrackClicked(MouseButtonEventArgs e)
     {
         if (TrackLanes <= 1) return false;
 
         Point at = e.GetPosition(AudioCanvas);
-        bool onName = at.X < TrackLabelWidth;
 
-        if (!onName && e.ClickCount != 2) return false;
+        if (at.X >= TrackLabelWidth && e.ClickCount != 2) return false;
 
         e.Handled = true;
-
-        ChooseTrack(LaneAt(at.Y), onName
-            ? _at
-            : TimelineZoom.FrameAt(at.X, ViewStart, ViewSpan, AudioCanvas.ActualWidth, _dayFrames - 1));
-
+        Listen(LaneAt(at.Y));
         return true;
     }
 
-    /// <summary>A track has been chosen at a ruler frame: asks when it plays, and sets it.</summary>
-    private void ChooseTrack(int track, long rulerFrame)
-    {
-        if (AddedName(track) is not null || (PairsInDelay() is { } pairs && track >= pairs))
-        {
-            Refuse($"{TrackName(track)} is only in the recording's files. Air plays what the receiver carried, so it cannot be chosen.");
-            return;
-        }
-
-        long? first = InstantFromAir();
-
-        // The mark as it is now: the one the dialog shows, whatever happens while it is open.
-        long? markIn = _markIn;
-        bool markAired = markIn is { } mark && first is { } open && CapturedOf(mark) < open;
-
-        var ask = new AudioTrackDialog(TrackName(track), first is not null, markIn is { } at ? Stamp(at) : null,
-                                       markAired, Stamp(rulerFrame), _rate) { Owner = this };
-        if (ask.ShowDialog() != true) return;
-
-        // Asked again whether air has reached it: that may have happened while it was decided.
-        if (ask.Instantly) PlayTrackInstantly(track);
-        else if (ask.OnMarkIn && markIn is { } from) PlayTrackFrom(track, from, "mark in ");
-        else PlayTrackFrom(track, RulerOf(ask.At, rulerFrame));
-
-        Focus();
-    }
-
-    /// <summary>A typed timecode on this ruler: past midnight when that is nearer to where it was asked from.</summary>
-    private long RulerOf(Timecode typed, long near)
-    {
-        long same = typed.TotalFrames, next = same + _oneDay;
-        return next < _dayFrames && Math.Abs(next - near) < Math.Abs(same - near) ? next : same;
-    }
-
-    /// <summary>Half a second of air: how far past what it is committed to a change of track is placed, to be there in time.</summary>
-    private long AudioLead => Math.Max(2, _liveRate / 2);
-
-    /// <summary>The first captured frame a change made now can start at on air, or null when nothing has gone out.</summary>
-    private long? InstantFromAir() =>
-        LiveAir.Shared.Active && KnowsLive() && LiveAir.Shared.CommittedFrame is { } committed
-            ? RecordingToDay(committed + AudioLead)
-            : null;
-
-    private void PlayTrackInstantly(int track)
-    {
-        long from = InstantFromAir() ?? CapturedOf(_at);
-        SetSwitches(s => AudioSwitches.Set(s, from, track), from, $"{TrackName(track)} instantly, from {Stamp(RulerOf(from))}");
-    }
-
-    private void PlayTrackFrom(int track, long rulerFrame, string where = "")
-    {
-        long from = CapturedOf(rulerFrame);
-
-        if (InstantFromAir() is { } first && from < first)
-        {
-            Refuse($"{where}{Stamp(rulerFrame)} has gone to air or is about to - the earliest is {Stamp(RulerOf(first))}. Choose Play instantly, or a later timecode.");
-            return;
-        }
-
-        SetSwitches(s => AudioSwitches.Set(s, from, track), from, $"{TrackName(track)} from {where}{Stamp(rulerFrame)}");
-    }
-
-    /// <summary>A right click on a change takes it off, if air has not reached it.</summary>
-    private void Audio_RightClick(object sender, MouseButtonEventArgs e)
-    {
-        double x = e.GetPosition(AudioCanvas).X;
-
-        double X(long captured) => (RulerOf(captured) - ViewStart) / (double)ViewSpan * AudioCanvas.ActualWidth;
-
-        AudioSwitch? near = _audioSwitches.Where(s => Math.Abs(X(s.StartFrame) - x) < 8)
-                                          .MinBy(s => Math.Abs(X(s.StartFrame) - x));
-        if (near is null) return;
-
-        e.Handled = true;
-
-        if (InstantFromAir() is { } first && near.StartFrame < first)
-        {
-            Refuse("That audio change has gone to air or is about to.");
-            return;
-        }
-
-        SetSwitches(s => AudioSwitches.Remove(s, near.StartFrame), near.StartFrame,
-                    $"the change at {Stamp(RulerOf(near.StartFrame))} taken off");
-    }
-
     /// <summary>
-    /// Changes which track plays, here and on air. When playback will not take it, nothing is changed
-    /// here either, so the timeline never shows a sound air is not going to play.
+    /// The editor hears <paramref name="track"/> from now on, in the preview only, and it plays: a
+    /// click on a pair is to hear it.
     /// </summary>
-    private void SetSwitches(Func<IReadOnlyList<AudioSwitch>, IReadOnlyList<AudioSwitch>> change, long at, string what)
+    private void Listen(int track)
     {
-        IReadOnlyList<AudioSwitch> before = _audioSwitches, after = change(before);
+        bool changed = track != _listenTrack;
+        _listenTrack = track;
 
-        if (AudioSwitches.FirstDifference(before, after) is null)
-        {
-            LayerText.Text = $"AUDIO  {what}: it already plays there.";
-            LayerText.Foreground = Brush("Muted");
-            return;
-        }
-
-        EditState was = Capture($"audio {what}");
-        bool undoable = Editable(RulerOf(at));
-
-        _audioSwitches = after;
-
-        if (!PushCues($"audio: {what}"))
-        {
-            _audioSwitches = before;
-            return;
-        }
-
-        if (undoable)
-        {
-            Push(_undo, was);
-            _redo.Clear();
-            _rememberedKey = null;
-        }
-        else
-        {
-            // On air before it could be undone, so it is part of every state there is to go back
-            // to. Undoing an edit made before it then leaves the sound on air alone.
-            Rewrite(_undo);
-            Rewrite(_redo);
-
-            void Rewrite(List<EditState> states)
-            {
-                for (int i = 0; i < states.Count; i++)
-                    states[i] = states[i] with { Switches = change(states[i].Switches) };
-            }
-        }
-
-        ShowUndo();
-
-        ActivityLog.Shared.Info(LogSource.LiveEdit, $"AUDIO  {what}.", @event: "liveedit.audiotrack");
-
-        LayerText.Text = $"AUDIO  {what}";
+        LayerText.Text = $"LISTENING  {TrackName(track)} - in Live Edit only. Air sends every pair, CH 1-2 first.";
         LayerText.Foreground = Brush("Ok");
 
+        if (changed)
+            ActivityLog.Shared.Info(LogSource.LiveEdit, $"LISTEN  {TrackName(track)} in Live Edit's preview (not on air).",
+                                    @event: "liveedit.listen");
+
         DrawAudio();
+
+        if (!_playing) PlayPause();
+        Focus();
     }
 
     // ------------------------------------------------------------------ hearing it
@@ -281,6 +151,8 @@ public partial class LiveEditWindow
     /// </summary>
     private void FollowSound()
     {
+        if (_held) { FollowHeldSound(); return; }
+
         bool own = PlaysOwnSound;
 
         if (own != _ownSound)
@@ -313,15 +185,25 @@ public partial class LiveEditWindow
                       _overlays.Any(o => o.IsBlank && HoldsOnRuler(o, _at));
 
         // The segment that plays straight on from this one: its sound runs on from this one's end.
-        PreviewNext? next = segment.EndFrame - CapturedOf(_at) < PreloadSeconds * (long)_rate &&
-                            StraightOn() is { } following && TracksOf(following) > 1
-            ? new PreviewNext(following.Clip.Path, TracksOf(following), following.StartFrame)
-            : null;
+        // The one still being recorded is heard from the delay.
+        PreviewNext? next = null;
+
+        if (segment.EndFrame - CapturedOf(_at) < PreloadSeconds * (long)_rate && StraightOn(recording: true) is { } following)
+        {
+            if (!following.Pending)
+            {
+                if (TracksOf(following) > 1) next = new PreviewNext(following.Clip.Path, TracksOf(following), following.StartFrame);
+            }
+            else if (HeldOf(following) is { } held)
+            {
+                next = new PreviewNext(DelaySound.KeyOf(following.Clip.Path), TracksOf(following), following.StartFrame, held);
+            }
+        }
 
         _preview.Play(new PreviewMoment(
             segment.Clip.Path, tracks, segment.StartFrame, segment.Frames, _rate,
             PlayedSeconds(), System.Diagnostics.Stopwatch.GetTimestamp(),
-            _audioSwitches, _audioEdits, silent ? 0 : LevelSlider.Value, next));
+            _listenTrack, _audioEdits, silent ? 0 : LevelSlider.Value, next));
 
         if (_preview.Problem is { } problem && !_soundProblemSaid)
         {
@@ -329,6 +211,99 @@ public partial class LiveEditWindow
             StoreText.Text = $"The preview has no sound: {problem}.";
             ActivityLog.Shared.Warn(LogSource.LiveEdit, $"The preview has no sound: {problem}.", @event: "liveedit.nosound");
         }
+    }
+
+    /// <summary>The waveform of the segment still being recorded, read from the delay: whose, its peaks, and how far read.</summary>
+    private (string Path, float[][] Peaks, long Read, WavePeaks[] Ready)? _heldWave;
+
+    private bool _heldWaveReading;
+    private DateTime _heldWaveAt = DateTime.MinValue;
+
+    /// <summary>
+    /// The waveform of the segment still being recorded, as far as the delay has it; null until some
+    /// has been read. Read on in the background twice a second at most, and only what is new.
+    /// </summary>
+    private WavePeaks[]? HeldWaves(Placed segment, int tracks)
+    {
+        if (_heldWave is { } had && had.Path != segment.Clip.Path) _heldWave = null;
+
+        if (!_heldWaveReading && (DateTime.UtcNow - _heldWaveAt).TotalMilliseconds >= 500 &&
+            HeldOf(segment) is { Line: DelayLine line } held && line.TryAddRef())
+        {
+            _heldWaveReading = true;
+            _heldWaveAt = DateTime.UtcNow;
+
+            string path = segment.Clip.Path;
+            int length = (int)((segment.Frames + 2L * _rate) * Waveform.PeaksPerSecond / _rate) + 1;
+            float[][] peaks = _heldWave is { Peaks: var old } && old.Length == tracks && old[0].Length == length
+                ? old
+                : Enumerable.Range(0, tracks).Select(_ => new float[length]).ToArray();
+            long from = _heldWave is { } going && ReferenceEquals(going.Peaks, peaks) ? going.Read + 1 : 0;
+            long to = segment.Frames + 2L * _rate - 1;
+
+            _ = Task.Run(() =>
+            {
+                long read;
+                try { read = DelaySound.Peaks(line, held.RecordingStart, from, to, peaks, Waveform.PeaksPerSecond); }
+                finally { line.Release(); }
+
+                WavePeaks[] ready = peaks.Select(p => new WavePeaks((float[])p.Clone())).ToArray();
+
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    _heldWaveReading = false;
+                    if (_closed) return;
+
+                    _heldWave = (path, peaks, read, ready);
+
+                    if (read >= from && !_waveRedrawQueued)
+                    {
+                        _waveRedrawQueued = true;
+                        _ = Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+                        {
+                            _waveRedrawQueued = false;
+                            DrawAudio();
+                        });
+                    }
+                });
+            });
+        }
+
+        return _heldWave is { } wave && wave.Path == segment.Clip.Path && wave.Ready.Length == tracks ? wave.Ready : null;
+    }
+
+    /// <summary>Where the delay holds a segment still being recorded, if it does and at this frame rate.</summary>
+    private PreviewHeld? HeldOf(Placed segment) =>
+        _heldPicture.Use(HeldLine) && _heldPicture.Line is { } line && line.FrameRate == _rate &&
+        RecordingFrameOfDay(segment.StartFrame, line.FrameRate) is { } start
+            ? new PreviewHeld(line, start)
+            : null;
+
+    /// <summary>
+    /// Every tick while the segment still being recorded plays from the delay: its sound, out of the
+    /// delay, at the delay's clock. Whatever the number of tracks - there is no file, so no player to
+    /// play it.
+    /// </summary>
+    private void FollowHeldSound()
+    {
+        if (!_playing || ClipAt(CapturedOf(_at)) is not { Pending: true } segment || HeldOf(segment) is not { } held ||
+            (_previewFfmpeg ??= Ffmpeg.Locate(_settings.FfmpegPath)) is null)
+        {
+            _preview?.Pause();
+            return;
+        }
+
+        _preview ??= new PreviewSound(_previewFfmpeg!);
+
+        bool silent = MuteButton.IsChecked == true || SoundOverRecordingAt(_at) is not null ||
+                      _overlays.Any(o => o.IsBlank && HoldsOnRuler(o, _at));
+
+        double position = (_heldFrom + _heldShift - segment.StartFrame) / (double)_rate + _heldClock.Elapsed.TotalSeconds;
+
+        _preview.Play(new PreviewMoment(
+            DelaySound.KeyOf(segment.Clip.Path), TracksOf(segment), segment.StartFrame, segment.Frames, _rate,
+            position, System.Diagnostics.Stopwatch.GetTimestamp(),
+            _listenTrack, _audioEdits, silent ? 0 : LevelSlider.Value, null, held));
     }
 
     /// <summary>
@@ -353,21 +328,13 @@ public partial class LiveEditWindow
         return null;
     }
 
-    private int _drawnTrack = -1, _drawnAirTrack = -1;
+    private int _drawnTrack = -1;
 
-    /// <summary>Every tick: the lanes drawn again when what plays, here or on air, has changed.</summary>
+    /// <summary>Every tick: the lanes drawn again when the pair heard has changed.</summary>
     private void FollowTrack()
     {
-        if (TrackLanes > 1 &&
-            (AudioSwitches.TrackAt(CapturedOf(_at), _audioSwitches) != _drawnTrack || (AirTrack() ?? -1) != _drawnAirTrack))
-            DrawAudio();
+        if (TrackLanes > 1 && _listenTrack != _drawnTrack) DrawAudio();
     }
-
-    /// <summary>The track going to air now, or null when nothing is.</summary>
-    private int? AirTrack() =>
-        LiveAir.Shared.Active && LiveAir.Shared.Position is { RecordingFrame: >= 0 and var frame }
-            ? AudioSwitches.TrackAt(frame, LiveAir.Shared.AudioSwitches)
-            : null;
 
     // ------------------------------------------------------------------ drawing
 
@@ -389,49 +356,19 @@ public partial class LiveEditWindow
         if (AudioButtons.Margin != margin) AudioButtons.Margin = margin;
     }
 
-    /// <summary>The changes of track, and each lane's name, over the lanes.</summary>
+    /// <summary>Each lane's name, over the lanes, the one heard marked.</summary>
     private void DrawTracks(double width, double height, long start, long span)
     {
-        _drawnTrack = AudioSwitches.TrackAt(CapturedOf(_at), _audioSwitches);
-        _drawnAirTrack = AirTrack() ?? -1;
+        _drawnTrack = _listenTrack;
 
         int lanes = TrackLanes;
         if (lanes <= 1) return;
 
         double each = height / lanes;
 
-        foreach (AudioSwitch at in _audioSwitches)
-        {
-            double x = (RulerOf(at.StartFrame) - start) / (double)span * width;
-            if (x < 0 || x > width) continue;
-
-            AudioCanvas.Children.Add(new Rectangle
-            {
-                Width = 2,
-                Height = height,
-                Fill = Brush("Ok"),
-                Margin = new Thickness(x, 0, 0, 0),
-                IsHitTestVisible = false,
-            });
-
-            var tag = new TextBlock
-            {
-                Text = $"▶ {TrackName(at.Track)}",
-                Foreground = Brush("Ok"),
-                FontFamily = Mono,
-                FontSize = 9.5,
-                FontWeight = FontWeights.Bold,
-                IsHitTestVisible = false,
-            };
-
-            Canvas.SetLeft(tag, x + 4);
-            Canvas.SetTop(tag, Math.Min(at.Track, lanes - 1) * each + 2);
-            AudioCanvas.Children.Add(tag);
-        }
-
         for (int lane = 0; lane < lanes; lane++)
         {
-            bool playing = lane == _drawnTrack, air = lane == _drawnAirTrack;
+            bool playing = lane == _drawnTrack;
 
             if (lane > 0)
                 AudioCanvas.Children.Add(new Rectangle
@@ -449,16 +386,16 @@ public partial class LiveEditWindow
                 Height = Math.Max(12, Math.Min(20, each - 4)),
                 CornerRadius = new CornerRadius(3),
                 Background = TrackLabelFill,
-                BorderBrush = Brush(air ? "Bad" : playing ? "Ok" : "Line"),
-                BorderThickness = new Thickness(air || playing ? 1.5 : 1),
+                BorderBrush = Brush(playing ? "Ok" : "Line"),
+                BorderThickness = new Thickness(playing ? 1.5 : 1),
                 IsHitTestVisible = false,
                 Child = new TextBlock
                 {
-                    Text = (air ? "● " : playing ? "▶ " : "  ") + TrackName(lane),
-                    Foreground = Brush(air ? "Bad" : playing ? "Ok" : "Muted"),
+                    Text = (playing ? "▶ " : "  ") + TrackName(lane),
+                    Foreground = Brush(playing ? "Ok" : "Muted"),
                     FontFamily = Mono,
                     FontSize = 10,
-                    FontWeight = playing || air ? FontWeights.Bold : FontWeights.Normal,
+                    FontWeight = playing ? FontWeights.Bold : FontWeights.Normal,
                     Margin = new Thickness(5, 0, 2, 0),
                     VerticalAlignment = VerticalAlignment.Center,
                     TextTrimming = TextTrimming.CharacterEllipsis,

@@ -27,8 +27,7 @@ public partial class LiveEditWindow
         string What,
         OverlayState[] Overlays,
         IReadOnlyList<AudioEdit> Audio,
-        long[] AudioCuts,
-        IReadOnlyList<AudioSwitch> Switches);
+        long[] AudioCuts);
 
     private readonly List<EditState> _undo = new();
     private readonly List<EditState> _redo = new();
@@ -44,8 +43,7 @@ public partial class LiveEditWindow
         what,
         _overlays.Select(o => new OverlayState(o, o.StartFrame, o.GainDb, o.Plan)).ToArray(),
         _audioEdits,
-        _audioCuts.ToArray(),
-        _audioSwitches);
+        _audioCuts.ToArray());
 
     /// <summary>
     /// Called by every edit just before it changes anything - after it has passed its checks, so
@@ -173,12 +171,6 @@ public partial class LiveEditWindow
             earliest = earliest is { } e ? Math.Min(e, at) : at;
         }
 
-        if (AudioSwitches.FirstDifference(_audioSwitches, target.Switches) is { } switched)
-        {
-            long at = RulerOf(switched);
-            earliest = earliest is { } e ? Math.Min(e, at) : at;
-        }
-
         return earliest;
     }
 
@@ -195,7 +187,6 @@ public partial class LiveEditWindow
         }
 
         _audioEdits = state.Audio;
-        _audioSwitches = state.Switches;
         _audioCuts.Clear();
         _audioCuts.UnionWith(state.AudioCuts);
 

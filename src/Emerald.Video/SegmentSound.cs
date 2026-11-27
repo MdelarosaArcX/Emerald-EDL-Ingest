@@ -12,7 +12,7 @@ namespace Emerald.Video;
 /// four stereo tracks are under 8 MB for ten seconds. Each piece is one ffmpeg pass over the file for
 /// all the tracks together, one at a time, behind the recorder for the disk.
 /// </summary>
-public sealed class SegmentSound : IDisposable
+public sealed class SegmentSound : ISoundSource, IDisposable
 {
     public const int SampleRate = 48000;
 

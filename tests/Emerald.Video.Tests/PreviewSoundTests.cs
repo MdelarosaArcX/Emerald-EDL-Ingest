@@ -176,8 +176,8 @@ public sealed class PreviewSoundTests : IDisposable
         using var source = new SegmentSound(ffmpeg);
         var feed = new SoundFeed(source);
         var next = new PreviewNext(parts[1], 4, 1000 + frames);
-        var one = new PreviewMoment(parts[0], 4, 1000, frames, 25, 0, 0, [], [], 1, next);
-        var two = new PreviewMoment(parts[1], 4, 1000 + frames, Pictures(ffmpeg, parts[1]), 25, 0, 0, [], [], 1, null);
+        var one = new PreviewMoment(parts[0], 4, 1000, frames, 25, 0, 0, 0, [], 1, next);
+        var two = new PreviewMoment(parts[1], 4, 1000 + frames, Pictures(ffmpeg, parts[1]), 25, 0, 0, 0, [], 1, null);
 
         source.Want(parts[1], 4, 0);
         double from = frames / 25.0 - 2;

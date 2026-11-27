@@ -105,7 +105,7 @@ Closing the capture deck closes Live Edit too.
 4. To reach an exact frame, type it in the go-to box and press **Enter**. [Accepted forms](#typing-a-position) are listed below.
 5. To check a file without losing your place, click it in the list to preview it in the small monitor. Double-click it to take the timeline there.
 
-The segment still being recorded is amber and has no file that can be opened yet. Where the delay buffer holds it, the big screen shows it from there, labelled `RECORDING - from the delay buffer`, with picture only. To watch the incoming recording itself, press **● REC**.
+The segment still being recorded is amber and has no file that can be opened yet. Where the delay buffer holds it, the big screen shows it from there, labelled `RECORDING - from the delay buffer`, with its sound and waveform, also from the delay buffer. It can be marked and edited like any other part. Playing runs from the last closed file into it, and when the recorder closes it while it plays, the file takes over without a break. Further back than the delay holds, the screen says so. To watch the incoming recording itself, press **● REC**.
 
 ### Mark a range
 
@@ -179,26 +179,21 @@ A range that runs into an ingest item, or across other deleted scenes, is refuse
 
 These levels go to air and are heard in the preview. The **MUTE** button and the volume slider affect only this PC's speakers. To remove sound completely, delete the scene, which takes the picture too.
 
-### Choose which audio track plays
+### Listen to an audio pair
 
-A recording with more than one audio pair has a lane for each, named for its channels as in the EDL and on the capture deck: **CH 1-2**, **CH 3-4** and so on. The track that plays is drawn bright and the others dimmed. The lane names show what plays: green with **▶** at the playhead, red with **●** on air now.
+A recording with more than one audio pair has a lane for each, named for its channels as in the EDL and on the capture deck: **CH 1-2**, **CH 3-4** and so on.
 
-1. Click a lane's name, or double-click in the lane where the change should happen.
-2. Choose **Play instantly**, **Play on mark in**, or type a timecode and press **Play from timecode**.
+Choosing a pair is **for the editor's ears only**. Click a lane's name, or double-click in its lane, and the preview plays that pair at once, and keeps playing it until another is clicked. If the preview was stopped, it starts playing. The pair heard is marked **▶** and its waveform is bright; the others are dimmed. Nothing about it goes to air, and it is not saved or undone.
 
-| Choice | On air | Not on air |
-|---|---|---|
-| Play instantly | Changes within about a second, inside the no edit zone too | Changes at the playhead |
-| Play on mark in | Changes at the mark in. Greyed out when there is no mark in, or air has reached it. | Changes at the mark in |
-| Play from timecode | Changes at that frame. It must be at least half a second ahead of air. It may be a time not recorded yet. | Changes at that frame |
+**On air**, every pair the receiver carried goes out on its own SDI channels: CH 1-2 on channels 1-2, which is the default pair a downstream device monitors, CH 3-4 on channels 3-4, and so on. Which pair is heard on air is chosen downstream, on the hardware (router or monitor), not in Emerald. Levels and deleted sound set in Live Edit apply to every pair. Under an inserted item, the item's sound goes out on every pair, so whichever pair the hardware has chosen hears it.
 
-The track plays until the next change on the timeline, marked by a green line and **▶ CH 3-4**. Right-click a change to take it off before air reaches it. Undo works on changes outside the no edit zone.
+A track added to the recording's files, such as music, can be listened to in the preview. It is not in the delay, so it does not go to air.
 
-On air, the chosen pair goes out on CH 1-2, cross-faded over one frame. A track the recording does not carry plays the first one instead. A track added to the recording's files, such as music, is shown but cannot be chosen: it is not in the delay. While a placed item with its own sound is on air, an instant change starts when the item ends.
+The sound lanes draw each continuous run of the recording as one block, and the part still being recorded as another; the files' own boundaries are shown in the infinite view.
 
-From one segment into the next, the preview plays without a break: the next file is opened eight seconds ahead, set going just before this one ends, and put on screen at the join, while the sound runs on from one file into the other. A preview that stands still is told to play again and logged as `liveedit.stoodstill`.
+From one segment into the next, the preview plays without a break: the next file is opened eight seconds ahead, set going just before this one ends, and put on screen at the join, while the sound runs on from one file into the other. Into and out of an ingest item placed on the timeline (insert, replace, fit to fill) works the same way: the item, or the recording after it, is held ready on its frame, set going just before the change at the speed it plays at, and put on screen at it; the timeline is redrawn a quarter of a second later, out of the picture's way. A preview that stands still is told to play again and logged as `liveedit.stoodstill`.
 
-In the preview, the picture plays straight through a change of track and only the sound changes. The sound of a recording with several tracks is played by Emerald itself (`PreviewSound`), because Windows would play the last track whatever was chosen. After a click far from where you were, it may be silent for a moment while it is read. The small previews play CH 1-2, from a copy kept in the data folder's `tracks` folder (the newest 12).
+In the preview, the sound of a recording with several tracks is played by Emerald itself (`PreviewSound`), because Windows would play the last track whatever was chosen. After a click far from where you were, it may be silent for a moment while it is read. The small previews play CH 1-2, from a copy kept in the data folder's `tracks` folder (the newest 12).
 
 ### Use bookmarks
 
@@ -528,7 +523,7 @@ These are faults in the current code, not setup mistakes. IDs refer to the [tech
 | A3 | **Fixed in code.** The sound of a placed item was read at the wrong position and stayed in the first moments of the file. The fix is tested through the decoder but has not been heard at the card. | Listen to one placed item on a test output before relying on placed sound. |
 | A2 | Stopping the recording while live freezes the output on a silent frame within about a second, instead of playing out the delay. If the recording stopped before the delay filled, it holds black. | Press **END LIVE** when ready to leave air. |
 | B24 | Losing the source on a delayed feed holds a frozen, silent frame and does not fail. | Watch the output, and press **END LIVE** if needed. |
-| A4 | **Fixed in code.** A source with more than one audio pair corrupted the sound on air. The chosen pair now goes out. Tested without a card; not yet heard at one. | Listen to each pair on a test output before relying on it. |
+| A4 | **Fixed in code.** A source with more than one audio pair corrupted the sound on air. Every pair now goes out on its own channels, CH 1-2 first. Tested without a card; not yet heard at one. | Listen to each pair on a test output before relying on it. |
 | | An export carries the first audio track only. | Use the masters when every track is needed. |
 | B1 | Once an edit is refused as too late, every later edit is refused until it is undone. | Undo the refused change. |
 | B20 | Fixed: inserts placed before Go Live are now checked. One that does not fit is not played, and the recording carries on. | None needed. |
