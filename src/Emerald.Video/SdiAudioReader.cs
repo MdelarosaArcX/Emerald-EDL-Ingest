@@ -212,6 +212,47 @@ public sealed class SdiAudioReader : IDisposable
     }
 
     /// <summary>
+    /// Takes sound that did not come off a card slot - an IP stream's - as if it had been read from
+    /// one: <paramref name="bytes"/> of interleaved signed 16-bit little-endian in
+    /// <paramref name="channels"/> channels. Returns samples per channel, zero for none, as
+    /// <see cref="Read"/> does, and the meters and the encoder take it from here the same way.
+    /// </summary>
+    public int Load(byte[] interleaved, int bytes, int channels)
+    {
+        Samples = 0;
+        ChannelsPresent = 0;
+        Array.Clear(_present);
+        Array.Clear(_signal);
+
+        channels = Math.Clamp(channels, 1, _wantChannels);
+
+        int samples = Math.Min(bytes / (channels * 2), Channels[0].Length);
+        if (samples <= 0) return 0;
+
+        for (int c = 0; c < channels; c++)
+        {
+            short[] into = Channels[c];
+
+            for (int s = 0; s < samples; s++)
+            {
+                int o = (s * channels + c) * 2;
+                short v = (short)(interleaved[o] | (interleaved[o + 1] << 8));
+
+                into[s] = v;
+                if (v != 0) _signal[c] = true;
+            }
+
+            if (samples < into.Length) Array.Clear(into, samples, into.Length - samples);
+
+            _present[c] = true;
+        }
+
+        ChannelsPresent = channels;
+        Samples = samples;
+        return samples;
+    }
+
+    /// <summary>
     /// Interleaves the channels read into <paramref name="destination"/> as signed 16-bit
     /// little-endian, in channel order, and returns the byte count.
     ///

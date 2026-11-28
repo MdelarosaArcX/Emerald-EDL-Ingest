@@ -159,6 +159,33 @@ public sealed class StoreIndexTests : IDisposable
     }
 
     [Fact]
+    public void Opening_on_a_big_store_reads_the_newest_recording_first_and_the_rest_after()
+    {
+        if (Ffmpeg is null) return;
+
+        // An older recording, and the one being recorded now.
+        for (int n = 1; n <= 4; n++) Encode(Proxy(n), 1);
+
+        string newer = Path.Combine(Path.GetDirectoryName(_low)!, "2026-11-10_10-00-00");
+        Directory.CreateDirectory(newer);
+        Encode(Path.Combine(newer, "media_1110261000_1.mp4"), 1);
+        Encode(Path.Combine(newer, "media_1110261000_2.mp4"), 1);
+
+        var index = new StoreIndex(_root, Ffprobe);
+
+        Assert.True(index.Refresh(newestOnly: true));
+        Assert.Equal(2, index.FilesRead);
+        Assert.False(index.ListedInFull);
+        Assert.All(index.Clips, c => Assert.Contains("2026-11-10_10-00-00", c.Path));
+
+        // Then everything, without reading the newest again.
+        index.Refresh(full: true);
+        Assert.True(index.ListedInFull);
+        Assert.Equal(6, index.FilesRead);
+        Assert.Equal(6, index.Clips.Count);
+    }
+
+    [Fact]
     public void A_refresh_with_nothing_new_opens_nothing_and_a_new_file_opens_one()
     {
         if (Ffmpeg is null) return;

@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Controls;
 using Emerald.Core;
 using Emerald.Deltacast;
+using Emerald.Video;
 
 namespace Emerald.LiveEdit;
 
@@ -71,6 +72,12 @@ public partial class GoLiveDialog : Window
         HeadroomBox.ItemsSource = Headrooms;
         HeadroomBox.SelectedItem = Headrooms.FirstOrDefault(h => (int)h.Value.TotalSeconds == settings.LiveHeadroomSeconds)
                                    ?? Headrooms[3];
+
+        // As the stream is now, which the playback deck may have changed since this window opened.
+        WebStreamSettings stream = WebStream.Shared.Current;
+        WebStreamBox.IsChecked = stream.Enabled;
+        WebStreamUrlBox.Text = string.IsNullOrWhiteSpace(stream.Url) ? settings.WebStreamUrl : stream.Url;
+        ShowViewers();
 
         GoButton.IsEnabled = false;
         PortsNote.Text = "scanning boards...";
@@ -143,6 +150,31 @@ public partial class GoLiveDialog : Window
 
     private void Room_Changed(object sender, SelectionChangedEventArgs e) => ShowSummary();
 
+    private void WebStream_Changed(object sender, RoutedEventArgs e) => ShowViewers();
+
+    private void WebStreamUrl_Changed(object sender, TextChangedEventArgs e) => ShowViewers();
+
+    /// <summary>Where viewers will watch, or that they will not.</summary>
+    private void ShowViewers()
+    {
+        if (WebStreamViewers is null || WebStreamUrlBox is null) return;
+
+        bool on = WebStreamBox.IsChecked == true;
+        WebStreamUrlBox.IsEnabled = on;
+
+        var preview = new AppSettings
+        {
+            WebStreamUrl = WebStreamUrlBox.Text.Trim(),
+            WebStreamWebRtcPort = _settings.WebStreamWebRtcPort,
+            WebStreamHlsPort = _settings.WebStreamHlsPort,
+        };
+        (string webRtc, string hls) = preview.WebStreamViewers;
+
+        WebStreamViewers.Text = on
+            ? $"Viewers open {webRtc} (under a second behind air) or {hls} (HLS, a few seconds, any phone). MediaMTX must be running."
+            : "Air goes to the SDI card only.";
+    }
+
     private List<int> ChosenPorts() => PortPanel.Children.OfType<CheckBox>()
         .Where(b => b.IsChecked == true)
         .Select(b => (int)b.Tag)
@@ -194,7 +226,28 @@ public partial class GoLiveDialog : Window
         _settings.LiveDelaySeconds = (int)Delay.TotalSeconds;
         _settings.LiveDelayStart = Start;
         _settings.LiveHeadroomSeconds = (int)Headroom.TotalSeconds;
+
+        // The IP stream: switched for air whichever window it is switched from.
+        WebStreamSettings now = WebStream.Shared.Current;
+        bool streamOn = WebStreamBox.IsChecked == true;
+        string streamUrl = WebStreamUrlBox.Text.Trim();
+        if (streamUrl.Length == 0) streamUrl = now.Url;
+
+        now.WriteTo(_settings);
+        _settings.WebStreamEnabled = streamOn;
+        _settings.WebStreamUrl = streamUrl;
         _settings.Save();
+
+        if (streamOn != now.Enabled || streamUrl != now.Url)
+        {
+            ActivityLog.Shared.Info(LogSource.LiveEdit,
+                streamOn
+                    ? $"IP STREAM switched on from Go Live: air goes to {IpSource.Mask(streamUrl)} as well as the card."
+                    : "IP STREAM switched off from Go Live: air goes to the card only.",
+                @event: "webstream.switched");
+
+            WebStream.Shared.Configure(WebStreamSettings.From(_settings));
+        }
 
         DialogResult = true;
     }

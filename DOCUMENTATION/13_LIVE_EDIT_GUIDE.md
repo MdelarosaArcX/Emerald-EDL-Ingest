@@ -85,6 +85,10 @@ Moving to another day keeps placed items, deleted scenes and sound edits, each a
 
 Live Edit follows the capture deck's two folders: proxies from the low-res folder, masters from the high-res one, which may be on different drives. It reads them fresh from `settings.json` (`AppSettings.SavedStoreFolders`), so a change saved on the deck, or a recording started into new folders, is picked up at the next refresh and logged as `liveedit.capturefolder`. **Folder** on the Capture Media tab opens the old store folder when there is one, otherwise the low-res folder.
 
+**The newest recording first.** The first time Live Edit opens, its first read of the store reads only the newest recording folder, the one being recorded, and shows it. Then it reads every other folder behind it. The store bar says "reading older recordings..." meanwhile.
+- Measured on 28 Nov: on a store of 1,227 clips, the full read took 76 s while recording, with nothing on the timeline.
+- What has been read is kept for as long as Emerald runs (`LiveEditWindow._kept`). Opening Live Edit again reads only files that are new or have just closed.
+
 **Waveforms are read once.** Drawing a segment's sound means decoding the whole file, from the drive the recorder is writing to. So the first time a segment is shown its waveform is read, one segment at a time, at low priority, and kept on disk. After that, even on another day or after a restart, it comes from the cache. A day not opened before fills in its waveforms gradually. An overlay's waveform is read from its small `.preview.mp4` when there is one.
 
 ## How to use it

@@ -41,6 +41,63 @@ public sealed class AppSettings
     public const string FormerDefaultTimecodeApiUrl = "http://10.0.0.31:8888/api/timecode";
     [JsonPropertyName("captureBoardIndex")] public uint CaptureBoardIndex { get; set; }
     [JsonPropertyName("capturePort")] public string CapturePort { get; set; } = "RX0";
+
+    /// <summary>
+    /// What the capture deck records: <c>"sdi"</c>, the card's receiver, as always and by default, or
+    /// <c>"ip"</c>, an IP stream (<see cref="IpInputUrl"/>). Settings from before this was offered
+    /// have nothing here and record from the card.
+    /// </summary>
+    [JsonPropertyName("captureInput")] public string CaptureInput { get; set; } = "sdi";
+
+    /// <summary>The IP stream the deck records when <see cref="CaptureInput"/> is "ip": rtsp://, srt://, rtmp://, an https://…m3u8, or twitch:channel.</summary>
+    [JsonPropertyName("ipInputUrl")] public string IpInputUrl { get; set; } = "";
+
+    /// <summary>streamlink, for a Twitch channel; empty looks for it on PATH.</summary>
+    [JsonPropertyName("streamlinkPath")] public string StreamlinkPath { get; set; } = "";
+
+    /// <summary>What is on air is sent as an IP stream too, for phones and browsers. Off by default.</summary>
+    [JsonPropertyName("webStreamEnabled")] public bool WebStreamEnabled { get; set; }
+
+    /// <summary>Where the IP stream of air is sent: MediaMTX, on this computer by default.</summary>
+    [JsonPropertyName("webStreamUrl")] public string WebStreamUrl { get; set; } = "rtsp://127.0.0.1:8554/onair";
+
+    [JsonPropertyName("webStreamBitrateKbps")] public int WebStreamBitrateKbps { get; set; } = 4500;
+
+    /// <summary>MediaMTX's WebRTC page port (under a second behind air).</summary>
+    [JsonPropertyName("webStreamWebRtcPort")] public int WebStreamWebRtcPort { get; set; } = 8889;
+
+    /// <summary>MediaMTX's HLS port. 8880 rather than its own 8888, which the timecode API uses on this computer.</summary>
+    [JsonPropertyName("webStreamHlsPort")] public int WebStreamHlsPort { get; set; } = 8880;
+
+    /// <summary>No SDI board for air: outputs are paced by the computer's clock and air is the IP stream alone.</summary>
+    [JsonPropertyName("airWithoutCard")] public bool AirWithoutCard { get; set; }
+
+    /// <summary>
+    /// The pages viewers open, from the address the stream is sent to: WebRTC first (under a
+    /// second behind air), HLS second (a few seconds, plays everywhere). A stream sent to this
+    /// computer is watched at its network address.
+    /// </summary>
+    [JsonIgnore]
+    public (string WebRtc, string Hls) WebStreamViewers
+    {
+        get
+        {
+            string host = LocalAddress.IPv4, path = "onair";
+
+            if (Uri.TryCreate(WebStreamUrl.Trim(), UriKind.Absolute, out Uri? uri))
+            {
+                if (!uri.IsLoopback && uri.Host.Length > 0) host = uri.Host;
+
+                string first = uri.AbsolutePath.Trim('/');
+                if (first.Length > 0) path = first;
+            }
+
+            return ($"http://{host}:{WebStreamWebRtcPort}/{path}", $"http://{host}:{WebStreamHlsPort}/{path}");
+        }
+    }
+
+    /// <summary>The deck records an IP stream rather than the card.</summary>
+    [JsonIgnore] public bool CaptureFromIp => string.Equals(CaptureInput, "ip", StringComparison.OrdinalIgnoreCase);
     [JsonPropertyName("playbackBoardIndex")] public uint PlaybackBoardIndex { get; set; }
     [JsonPropertyName("playbackPort")] public string PlaybackPort { get; set; } = "TX0";
     [JsonPropertyName("startTimecode")] public string StartTimecode { get; set; } = "00:00:00:00";

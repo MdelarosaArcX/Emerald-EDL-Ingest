@@ -184,6 +184,8 @@ public partial class PlaybackWindow : Window
         PipelineState.Shared.Changed += OnPipelineChanged;
         SdiPorts.Shared.Changed += OnPortsChanged;
 
+        InitWebStream();
+
         _clock.Start();
         _loading = false;
 
@@ -460,6 +462,70 @@ public partial class PlaybackWindow : Window
     }
 
     private async void Rescan_Click(object sender, RoutedEventArgs e) => await ScanBoardsAsync();
+
+    // ------------------------------------------------------------------ IP stream of air
+
+    private void InitWebStream()
+    {
+        WebStreamUrlBox.Text = _settings.WebStreamUrl;
+        WebStream.Shared.Changed += OnWebStreamChanged;
+        WebStream.Shared.Configured += OnWebStreamChanged;
+        Closed += (_, _) =>
+        {
+            WebStream.Shared.Changed -= OnWebStreamChanged;
+            WebStream.Shared.Configured -= OnWebStreamChanged;
+        };
+        ShowWebStream();
+    }
+
+    private void OnWebStreamChanged() => Dispatcher.BeginInvoke(ShowWebStream);
+
+    private void ShowWebStream()
+    {
+        // From the stream itself: Live Edit's Go Live can switch it too.
+        bool on = WebStream.Shared.Current.Enabled;
+        if (!WebStreamUrlBox.IsKeyboardFocusWithin) WebStreamUrlBox.Text = WebStream.Shared.Current.Url;
+
+        WebStreamToggle.IsChecked = on;
+        WebStreamToggle.Content = on ? "ON" : "OFF";
+
+        (string webRtc, string hls) = _settings.WebStreamViewers;
+        WebStreamViewerBox.Text = $"{webRtc}\n{hls}";
+
+        WebStreamStateText.Text = on
+            ? WebStream.Shared.State + (WebStream.Shared.Dropped > 0 ? $" - {WebStream.Shared.Dropped} frame(s) let go" : "")
+            : "off - air goes to the card only";
+    }
+
+    private void WebStreamToggle_Click(object sender, RoutedEventArgs e)
+    {
+        _settings.WebStreamEnabled = WebStreamToggle.IsChecked == true;
+        _settings.Save();
+
+        ActivityLog.Shared.Info(LogSource.Playback,
+            _settings.WebStreamEnabled
+                ? $"IP STREAM switched on: air goes to {IpSource.Mask(_settings.WebStreamUrl)} as well as the card."
+                : "IP STREAM switched off: air goes to the card only.",
+            @event: "webstream.switched");
+
+        App.ApplyWebStream();
+        ShowWebStream();
+    }
+
+    private void WebStreamUrl_LostFocus(object sender, RoutedEventArgs e)
+    {
+        string url = WebStreamUrlBox.Text.Trim();
+        if (url == _settings.WebStreamUrl) return;
+
+        _settings.WebStreamUrl = url;
+        _settings.Save();
+
+        ActivityLog.Shared.Info(LogSource.Playback, $"IP STREAM address set to {IpSource.Mask(url)}.",
+                                @event: "webstream.address");
+
+        App.ApplyWebStream();
+        ShowWebStream();
+    }
 
     private void TxBoard_Changed(object sender, SelectionChangedEventArgs e)
     {

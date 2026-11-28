@@ -99,3 +99,4 @@ $RECYCLE.BIN/
 
 # The published, installable folder. Built by publish.bat, not source.
 dist/
+tools/mediamtx/mediamtx.exe

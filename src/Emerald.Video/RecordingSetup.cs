@@ -75,7 +75,13 @@ public sealed record CaptureRequest(
     /// The high-res and low-res folders when they were chosen apart; null for high\ and low\
     /// under <see cref="Folder"/>, as every recording was before.
     /// </summary>
-    StorePaths? Store = null)
+    StorePaths? Store = null,
+
+    /// <summary>
+    /// An IP stream to record instead of the card's receiver, or null for the receiver, as always.
+    /// <see cref="BoardIndex"/> and <see cref="RxChannel"/> mean nothing when this is set.
+    /// </summary>
+    IpSource? Ip = null)
 {
     /// <summary>Where the masters and the proxies go.</summary>
     public StorePaths Paths => Store ?? StorePaths.Under(Folder);

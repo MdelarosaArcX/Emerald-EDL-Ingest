@@ -825,16 +825,47 @@
                                         <RowDefinition Height="Auto"/>
                                     </Grid.RowDefinitions>
 
-                                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Board"
-                                               Style="{StaticResource IpLabel}"/>
-                                    <ComboBox x:Name="BoardBox" Grid.Row="0" Grid.Column="1"
-                                              Style="{StaticResource IpMiniCombo}" Tag="no boards found"
-                                              SelectionChanged="BoardBox_SelectionChanged"
-                                              ToolTip="DELTACAST board the receiver is on"/>
+                                    <!-- The SDI card, as always and by default, or an IP stream
+                                         (OBS, a phone, Twitch). Chosen before recording. -->
+                                    <Grid Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="84"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
 
-                                    <TextBlock Grid.Row="1" Grid.Column="0" Text="RX Port"
+                                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Input"
+                                                   Style="{StaticResource IpLabel}"/>
+                                        <ComboBox x:Name="InputBox" Grid.Row="0" Grid.Column="1"
+                                                  Style="{StaticResource IpMiniCombo}"
+                                                  SelectionChanged="InputBox_SelectionChanged"
+                                                  ToolTip="Record from the SDI card (the default) or from an IP stream">
+                                            <ComboBoxItem Content="SDI card" Tag="sdi"/>
+                                            <ComboBoxItem Content="IP stream" Tag="ip"/>
+                                        </ComboBox>
+
+                                        <TextBlock x:Name="BoardLabel" Grid.Row="1" Grid.Column="0" Text="Board"
+                                                   Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
+                                        <ComboBox x:Name="BoardBox" Grid.Row="1" Grid.Column="1" Margin="0,3,0,0"
+                                                  Style="{StaticResource IpMiniCombo}" Tag="no boards found"
+                                                  SelectionChanged="BoardBox_SelectionChanged"
+                                                  ToolTip="DELTACAST board the receiver is on"/>
+
+                                        <TextBlock x:Name="IpUrlLabel" Grid.Row="2" Grid.Column="0" Text="Stream URL"
+                                                   Style="{StaticResource IpLabel}" Margin="0,3,8,0" Visibility="Collapsed"/>
+                                        <TextBox x:Name="IpUrlBox" Grid.Row="2" Grid.Column="1" Margin="0,3,0,0"
+                                                 Style="{StaticResource IpMiniTextBox}" Visibility="Collapsed"
+                                                 LostFocus="IpUrlBox_LostFocus"
+                                                 ToolTip="rtsp://server:8554/live (from MediaMTX), srt://..., rtmp://..., https://....m3u8, or twitch:channel"/>
+                                    </Grid>
+
+                                    <TextBlock x:Name="PortLabel" Grid.Row="1" Grid.Column="0" Text="RX Port"
                                                Style="{StaticResource IpLabel}" Margin="0,3,8,0"/>
-                                    <Grid Grid.Row="1" Grid.Column="1" Margin="0,3,0,0">
+                                    <Grid x:Name="PortRow" Grid.Row="1" Grid.Column="1" Margin="0,3,0,0">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="4"/>

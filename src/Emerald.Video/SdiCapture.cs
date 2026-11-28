@@ -22,7 +22,6 @@ namespace Emerald.Video;
 public sealed class SdiCapture : IDisposable
 {
     private const int SampleRate = 48000;
-    private const uint IoTimeoutMs = 2000;
 
     /// <summary>About a third of a second of slack before frames start being dropped.</summary>
     private const int VideoQueueDepth = 8;
@@ -206,16 +205,15 @@ public sealed class SdiCapture : IDisposable
     private void Run(CaptureRequest request, CancellationToken ct)
     {
         string folder = request.Folder;
-        uint boardIndex = request.BoardIndex;
-        int rxChannel = request.RxChannel;
 
-        IntPtr board = IntPtr.Zero, stream = IntPtr.Zero;
+        // The card's receiver, or an IP stream standing in for it. Everything after a frame is in
+        // hand is the same for both.
+        ICaptureInput? input = null;
         // The encoder writing the files, and the next day's once it is being started - kept
         // out here so however the recording ends, both are closed.
         Encoder? encoder = null;
         Task<Encoder?>? upcoming = null;
         SdiAudioReader? audio = null;
-        RxLease? lease = null;
 
         // Reported to Finished once the encoder has closed its files.
         long framesTaken = 0;
@@ -236,57 +234,16 @@ public sealed class SdiCapture : IDisposable
                         Path.Combine(request.Paths.For(output), naming.Folder));
             }
 
-            // Claim the receiver before touching it. A live preview on the same input holds
-            // a yielding lease and is closed by this call; anything else is a real conflict.
-            try
+            input = request.Ip is { } ip
+                ? new IpInput(ip, request.FfmpegPath, request.FrameRate, SessionId, Say)
+                : new SdiInput(request.BoardIndex, request.RxChannel, request.FrameRate);
+
+            if (input.Open(ct, out string? openProblem) is not { } format)
             {
-                lease = RxLease.Acquire(boardIndex, rxChannel, "recording");
-            }
-            catch (RxBusyException busy)
-            {
-                Fail($"Capture: {busy.Message}");
+                Fail($"Capture: {openProblem}");
                 return;
             }
 
-            uint rc = VideoMasterHD.VHD_OpenBoardHandle(boardIndex, ref board, IntPtr.Zero, 0);
-            if (rc != 0) { Fail($"Capture: cannot open board {boardIndex} (error {rc})."); return; }
-
-            int setupLock = 0;
-
-            // JOINED so the slots carry ANC, which is where embedded audio lives.
-            rc = VideoMasterHD.VHD_OpenStreamHandle(board, VideoMasterHD.RxStreamType(rxChannel),
-                    VideoMasterHD.VHD_SDI_STPROC_JOINED, ref setupLock, ref stream, IntPtr.Zero);
-
-            if (rc != 0)
-            {
-                Fail(rc == 18
-                    ? $"Capture: RX{rxChannel} is already open in another application - close dCARE and try again."
-                    : $"Capture: cannot open RX{rxChannel} (error {rc}).");
-                return;
-            }
-
-            // The receiver may not have locked yet at the moment capture starts, so give it
-            // a little time rather than giving up on a single look.
-            uint std = 0;
-            uint detectRc = 0;
-            bool locked = false;
-
-            for (int attempt = 0; attempt < 20 && !ct.IsCancellationRequested; attempt++)
-            {
-                detectRc = VideoMasterHD.VHD_GetStreamPropertyEx(
-                    stream, VideoMasterHD.VHD_SDI_SP_VIDEO_STANDARD, 1, ref std);
-
-                if (detectRc == 0) { locked = true; break; }
-                Thread.Sleep(100);
-            }
-
-            if (!locked)
-            {
-                Fail($"Capture: no signal on RX{rxChannel} after 2s (detect error {detectRc}) - nothing to record.");
-                return;
-            }
-
-            CaptureFormat format = CaptureFormat.FromStandard(std, request.FrameRate);
             recordedFormat = format;
 
             // Before the encoder is built, because a codec that cannot take this raster fails
@@ -307,25 +264,18 @@ public sealed class SdiCapture : IDisposable
             try { FormatDetected?.Invoke(format); }
             catch (Exception ex) { Fail($"Capture: {ex.Message}"); return; }
 
-            VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_SDI_SP_VIDEO_STANDARD, std);
-            VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_CORE_SP_BUFFER_PACKING,
-                                                VideoMasterHD.VHD_BUFPACK_VIDEO_YUV422_8);
-            VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_CORE_SP_TRANSFER_SCHEME,
-                                                VideoMasterHD.VHD_TRANSFER_SLAVED);
-            VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_CORE_SP_BUFFERQUEUE_DEPTH, 4);
-            VideoMasterHD.VHD_SetStreamProperty(stream, VideoMasterHD.VHD_CORE_SP_IO_TIMEOUT, IoTimeoutMs);
+            input.Configure();
 
             // Before the stream starts, while nothing is waiting to be taken off the receiver.
             request = ChooseProxyEncoder(request, format);
 
             (int proxyWidth, int proxyHeight) = RecordingProfile.HalfRaster(format);
 
-            Report($"Capture: RX{rxChannel} locked to {format.Name}, recording {request.Profile.SegmentSeconds}s proxy " +
+            Report($"Capture: {input.Name} locked to {format.Name}, recording {request.Profile.SegmentSeconds}s proxy " +
                    $"and {RecordingProfile.MasterSegmentSeconds / 60} min master segments to {folder} - {proxyWidth}x{proxyHeight} {request.Profile.GpuEncoder?.Label ?? RecordingProfile.LowRes.VideoLabel} proxy " +
                    $"and {RecordingProfile.HighRes.VideoLabel} master");
 
-            rc = VideoMasterHD.VHD_StartStream(stream);
-            if (rc != 0) { Fail($"Capture: StartStream failed (error {rc})."); return; }
+            if (input.Start() is { } startProblem) { Fail($"Capture: {startProblem}"); return; }
 
             audio = new SdiAudioReader(SdiAudioReader.MaxChannels, format.FrameRate);
 
@@ -333,7 +283,7 @@ public sealed class SdiCapture : IDisposable
             // starts, because the number of channels on the audio pipe is fixed for the life
             // of the process. So the first slots are read for their audio alone, before a
             // frame is recorded. A feed on channels 1-2 records exactly as it always did.
-            int pairs = request.AudioPairs ?? DetectPairs(stream, audio, ct);
+            int pairs = request.AudioPairs ?? input.DetectPairs(audio, ct);
             pairs = Math.Clamp(pairs, 1, SdiAudioReader.MaxPairs);
 
             Volatile.Write(ref _pairsRecording, pairs);
@@ -406,7 +356,7 @@ public sealed class SdiCapture : IDisposable
             var started = Stopwatch.StartNew();
             var encoderWatch = new EncoderWatch(format.FrameRate);
 
-            Report($"Capture: stream started on RX{rxChannel}, waiting for slots...");
+            Report($"Capture: stream started on {input.Name}, waiting for slots...");
 
             // Frames off the receiver are the clock a frame limit is counted on. A wall-clock
             // stop would end the file a frame or two either side of where the operator asked,
@@ -462,15 +412,14 @@ public sealed class SdiCapture : IDisposable
                     }
                 }
 
-                IntPtr slot = IntPtr.Zero;
-                if (VideoMasterHD.VHD_LockSlotHandle(stream, ref slot) != 0)
+                if (!input.Lock())
                 {
                     lockFailures++;
 
                     if (!warnedNoSlots && frames == 0 && started.Elapsed > TimeSpan.FromSeconds(3))
                     {
                         warnedNoSlots = true;
-                        Fail($"Capture: no slots arriving from RX{rxChannel} after {lockFailures} lock timeouts.");
+                        Fail($"Capture: no slots arriving from {input.Name} after {lockFailures} lock timeouts.");
                     }
 
                     continue;
@@ -480,17 +429,13 @@ public sealed class SdiCapture : IDisposable
 
                 try
                 {
-                    IntPtr buffer = IntPtr.Zero;
-                    uint size = 0;
-
                     // The frame and its audio, held until both are in hand: the tap wants
                     // them together, and they are only genuinely the same frame while this
                     // slot is locked.
                     byte[]? tapVideo = null;
                     int tapVideoBytes = 0;
 
-                    if (VideoMasterHD.VHD_GetSlotBuffer(slot, VideoMasterHD.VHD_SDI_BT_VIDEO, ref buffer, ref size) == 0
-                        && buffer != IntPtr.Zero)
+                    if (input.Picture(out IntPtr buffer, out uint size))
                     {
                         int take = Math.Min(format.FrameBytes, (int)size);
 
@@ -547,7 +492,7 @@ public sealed class SdiCapture : IDisposable
 
                     if (pipeReady || tap is not null || listener is not null)
                     {
-                        int samples = audio.Read(slot);
+                        int samples = input.ReadAudio(audio);
                         int bytes = samples > 0 ? audio.Interleave(interleaved, recordChannels) : 0;
                         audioReal = bytes > 0;
 
@@ -607,7 +552,7 @@ public sealed class SdiCapture : IDisposable
                 }
                 finally
                 {
-                    VideoMasterHD.VHD_UnlockSlotHandle(slot);
+                    input.Unlock();
 
                     // Whoever queued the frame holds it now. With nobody left, it is the next frame's.
                     picture?.Release();
@@ -747,13 +692,10 @@ public sealed class SdiCapture : IDisposable
                 }
             }
 
-            if (stream != IntPtr.Zero) { VideoMasterHD.VHD_StopStream(stream); VideoMasterHD.VHD_CloseStreamHandle(stream); }
-            if (board != IntPtr.Zero) VideoMasterHD.VHD_CloseBoardHandle(board);
+            input?.Dispose();
 
             _ffmpeg = null;
             _audioPipe = null;
-
-            lease?.Dispose();
 
             audio?.Dispose();
 
@@ -1151,45 +1093,6 @@ public sealed class SdiCapture : IDisposable
         return ff;
     }
 
-    /// <summary>
-    /// Counts the stereo pairs on the wire, by reading the first slots for their audio alone.
-    ///
-    /// It has to be settled here because the encoder's channel count is fixed once ffmpeg
-    /// starts, and nothing else knows how many languages the feed is carrying. Two seconds of
-    /// looking is generous; a feed that has produced no audio by then is recorded as the
-    /// single pair it has always been, which is also the right answer for silence.
-    ///
-    /// The slots read here are discarded. At 25 fps that is well under a second of picture,
-    /// spent before the recording is considered to have started.
-    /// </summary>
-    private static int DetectPairs(IntPtr stream, SdiAudioReader reader, CancellationToken ct)
-    {
-        var looking = Stopwatch.StartNew();
-        int best = 0;
-
-        while (looking.Elapsed < TimeSpan.FromSeconds(2) && !ct.IsCancellationRequested)
-        {
-            IntPtr slot = IntPtr.Zero;
-            if (VideoMasterHD.VHD_LockSlotHandle(stream, ref slot) != 0) continue;
-
-            try
-            {
-                if (reader.Read(slot) > 0) best = Math.Max(best, reader.PairsPresent());
-            }
-            finally
-            {
-                VideoMasterHD.VHD_UnlockSlotHandle(slot);
-            }
-
-            // Kept looking for the whole window rather than stopping at the first answer. A
-            // pair is counted on having carried a sample that was not zero, and a language
-            // falls silent between words - so the highest count over two seconds is a far
-            // better guess at the track layout than whatever the first slot happened to hold.
-        }
-
-        return Math.Max(1, best);
-    }
-
     // Narration goes two places: to whoever owns this recorder, as it always has, and to the
     // application record. The window still decides what to put on screen; the record keeps it
     // whether a window is open or not, which is the half that was missing.
@@ -1198,6 +1101,9 @@ public sealed class SdiCapture : IDisposable
         ActivityLog.Shared.Info(LogSource.Capture, text, correlation: SessionId);
         Message?.Invoke(text, false);
     }
+
+    /// <summary>For the input to speak through: on screen, and in the record if it is a problem.</summary>
+    private void Say(string text, bool problem) => Message?.Invoke(text, problem);
 
     private void Fail(string text)
     {
@@ -1295,5 +1201,19 @@ public sealed record CaptureFormat(string Name, int Width, int Height, int Frame
         9 => new("1080p60", 1920, 1080, 60, std),
         10 => new("1080p50", 1920, 1080, 50, std),
         _ => new($"standard {std}", 1920, 1080, fallbackRate, std),
+    };
+
+    /// <summary>
+    /// What an IP stream is made into: 1080 progressive at the rate the deck is set to, the same
+    /// standard a receiver would report, so the delay and the transmitter take it as they would a
+    /// card's. Rates with no 1080p standard come in at 25.
+    /// </summary>
+    public static CaptureFormat ForIp(int frameRate) => frameRate switch
+    {
+        24 => FromStandard(8, 24),
+        30 => FromStandard(1, 30),
+        50 => FromStandard(10, 50),
+        60 => FromStandard(9, 60),
+        _ => FromStandard(0, 25),
     };
 }

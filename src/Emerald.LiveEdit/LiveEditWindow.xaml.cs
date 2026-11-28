@@ -436,6 +436,11 @@ public partial class LiveEditWindow : Window
         };
 
         Closing += LiveEditWindow_Closing;
+
+        // This window keeps its own copy of the settings: it follows the IP stream's, so a save from
+        // here never puts back what the playback deck has since changed.
+        WebStream.Shared.Configured += OnWebStreamConfigured;
+        Closed += (_, _) => WebStream.Shared.Configured -= OnWebStreamConfigured;
     }
 
 
@@ -459,12 +464,24 @@ public partial class LiveEditWindow : Window
     /// <summary>True while the store is being refreshed, so two never overlap.</summary>
     private bool _listing;
 
+    /// <summary>
+    /// The store as read, kept for the life of the program rather than of this window: opening Live
+    /// Edit again reads only what has changed since, not every file again. Refreshed under its own
+    /// lock, since a refresh started by a window that has since closed may still be running.
+    /// </summary>
+    private static StoreIndex? _kept;
+
     private StoreIndex Store()
     {
         StorePaths paths = MediaLibrary.PathsFor(_settings);
 
-        if (_store is null || _store.Paths != paths)
-            _store = new StoreIndex(paths, MediaProbe.LocateFfprobe(Ffmpeg.Locate(_settings.FfmpegPath)));
+        lock (typeof(StoreIndex))
+        {
+            if (_kept is null || _kept.Paths != paths)
+                _kept = new StoreIndex(paths, MediaProbe.LocateFfprobe(Ffmpeg.Locate(_settings.FfmpegPath)));
+
+            _store = _kept;
+        }
 
         return _store;
     }
@@ -724,7 +741,12 @@ public partial class LiveEditWindow : Window
     /// could have changed and lays out again only when something did. Anything else - opening, a
     /// new day, Refresh - walks every folder and always lays out.
     /// </summary>
-    private void LoadClips(bool onlyIfChanged = false)
+    /// <param name="restOfStore">
+    /// The read of every folder that follows the newest recording's. Without it, the store still not
+    /// read in full would ask for the newest recording again, and again - a loop that redrew the
+    /// timeline without end and left the window unable to take a click.
+    /// </param>
+    private void LoadClips(bool onlyIfChanged = false, bool restOfStore = false)
     {
         if (_listing)
         {
@@ -737,13 +759,20 @@ public partial class LiveEditWindow : Window
         StoreIndex store = Store();
         string folder = store.Paths.Root ?? store.Paths.Low;
 
-        if (!onlyIfChanged) StoreText.Text = $"reading {folder}...";
+        // A store never read in full: the newest recording first - the one being recorded, which is
+        // what the window was opened for - and every other folder straight after, behind it.
+        bool quick = !onlyIfChanged && !restOfStore && !store.ListedInFull;
+
+        if (!onlyIfChanged) StoreText.Text = quick ? $"reading the newest recording in {folder}..." : $"reading {folder}...";
 
         var listing = System.Diagnostics.Stopwatch.StartNew();
 
         // Off this thread: the first refresh of a store opens every file in it, and any refresh is
         // disk, which on this thread is a stall in playback whenever the recorder is busy.
-        Task.Run(() => store.Refresh(full: !onlyIfChanged))
+        Task.Run(() =>
+            {
+                lock (store) return quick ? store.Refresh(newestOnly: true) : store.Refresh(full: !onlyIfChanged);
+            })
             .ContinueWith(t =>
             {
                 _listing = false;
@@ -789,14 +818,14 @@ public partial class LiveEditWindow : Window
                 _rebinding = false;
 
                 StoreText.Text = clips.Count == 0
-                    ? $"No captures yet. Recordings land in {folder}."
-                    : $"{clips.Count} clip{(clips.Count == 1 ? "" : "s")} in {folder}";
+                    ? quick ? $"reading {folder}..." : $"No captures yet. Recordings land in {folder}."
+                    : $"{clips.Count} clip{(clips.Count == 1 ? "" : "s")} in {folder}" + (quick ? " - reading older recordings..." : "");
 
                 // The first, and any that was slow. Every ten seconds otherwise would be noise.
                 if (!_listedOnce || listing.ElapsedMilliseconds > 1000)
                     ActivityLog.Shared.Info(LogSource.App,
                         $"Live Edit listed {clips.Count} clips and laid out {_placed.Count} in " +
-                        $"{listing.ElapsedMilliseconds} ms.",
+                        $"{listing.ElapsedMilliseconds} ms" + (quick ? " (the newest recording first)." : "."),
                         @event: "liveedit.listed", file: folder);
 
                 _listedOnce = true;
@@ -805,6 +834,9 @@ public partial class LiveEditWindow : Window
                     ActivityLog.Shared.Warn(LogSource.App,
                         $"Live Edit could not read the store: {t.Exception?.GetBaseException().Message}",
                         @event: "liveedit.storefailed", file: folder);
+
+                // And now the rest of the store - once, in full.
+                if (quick && !t.IsFaulted) LoadClips(restOfStore: true);
 
             }, TaskScheduler.FromCurrentSynchronizationContext());
     }
@@ -4786,6 +4818,8 @@ public partial class LiveEditWindow : Window
     }
 
     private int _dropRedrawQueued;
+
+    private void OnWebStreamConfigured() => WebStream.Shared.Current.WriteTo(_settings);
 
     private void LiveEditWindow_Closing(object? sender, CancelEventArgs e)
     {

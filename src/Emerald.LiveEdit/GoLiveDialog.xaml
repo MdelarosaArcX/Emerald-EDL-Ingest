@@ -32,6 +32,9 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
             <TextBlock Grid.Row="0" Text="Board" Foreground="{StaticResource Muted}"
@@ -58,6 +61,26 @@
             <ComboBox x:Name="HeadroomBox" Grid.Row="3" Grid.Column="1" Height="26" Margin="0,10,0,0"
                       SelectionChanged="Room_Changed"
                       ToolTip="How much the delay may grow while live. Every inserted item holds the recording back for its length; the delay buffer is made big enough for this much, up front."/>
+
+            <!-- What goes to air sent to the network as well, for phones and browsers. The same
+                 switch as the playback deck's IP stream panel: changing it here changes it there. -->
+            <TextBlock Grid.Row="4" Text="IP stream" Foreground="{StaticResource Muted}"
+                       FontSize="11.5" Margin="0,14,0,0" VerticalAlignment="Center"/>
+            <CheckBox x:Name="WebStreamBox" Grid.Row="4" Grid.Column="1" Margin="0,14,0,0"
+                      Content="Also send air to phones and browsers" Foreground="{StaticResource Text}"
+                      Click="WebStream_Changed"
+                      ToolTip="The same frames as the SDI card, through MediaMTX. It never slows air."/>
+
+            <TextBlock Grid.Row="5" Text="Send to" Foreground="{StaticResource Muted}"
+                       FontSize="11.5" Margin="0,8,0,0" VerticalAlignment="Center"/>
+            <TextBox x:Name="WebStreamUrlBox" Grid.Row="5" Grid.Column="1" Height="26" Margin="0,8,0,0"
+                     FontSize="11.5" Padding="6,0" VerticalContentAlignment="Center"
+                     TextChanged="WebStreamUrl_Changed"
+                     ToolTip="MediaMTX: rtsp://127.0.0.1:8554/onair when it runs on this computer"/>
+
+            <TextBox x:Name="WebStreamViewers" Grid.Row="6" Grid.Column="1" Margin="0,6,0,0"
+                     IsReadOnly="True" BorderThickness="0" Background="Transparent" TextWrapping="Wrap"
+                     FontSize="10.5" Foreground="{StaticResource Muted}"/>
         </Grid>
 
         <!-- What it will take: the disk the delay buffer needs, and the most the inserts can add. -->

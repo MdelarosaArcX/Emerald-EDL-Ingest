@@ -377,6 +377,8 @@ public partial class App : Application
     /// </summary>
     public void OpenModule(string? mode)
     {
+        StartWebStream();
+
         if (Windows.OfType<ShellWindow>().FirstOrDefault() is { } shell)
         {
             shell.OpenModule(mode);
@@ -395,6 +397,25 @@ public partial class App : Application
     }
 
     private T? Existing<T>() where T : Window => Windows.OfType<T>().FirstOrDefault();
+
+    /// <summary>The IP stream of air set from these settings: started, stopped or changed.</summary>
+    public static void ApplyWebStream() => WebStream.Shared.Configure(WebStreamSettings.From(Settings));
+
+    private static bool _webStreamStarted;
+
+    /// <summary>
+    /// Once, as the first module opens: the stream as it was saved. From then on it is changed only
+    /// by a window's own controls (the playback deck, Live Edit's Go Live), and these settings follow
+    /// whatever it was changed to, so a later save never puts back what was there before.
+    /// </summary>
+    private static void StartWebStream()
+    {
+        if (_webStreamStarted) return;
+        _webStreamStarted = true;
+
+        WebStream.Shared.Configured += () => WebStream.Shared.Current.WriteTo(Settings);
+        ApplyWebStream();
+    }
 
     private void Show(Window window)
     {

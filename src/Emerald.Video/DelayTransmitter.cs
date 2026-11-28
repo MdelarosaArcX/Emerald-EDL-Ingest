@@ -189,9 +189,7 @@ public sealed class DelayTransmitter : IDisposable
             SdiPorts.Shared.TryHold(PortOwner,
                 _txChannels.Select(c => new SdiPort(_boardIndex, c)).ToArray());
 
-            output = _txChannels.Length == 1
-                ? SdiOutput.Open(_boardIndex, _txChannels[0], _format, SdiOutput.DelayQueueDepth)
-                : SdiOutputFan.Open(_boardIndex, _txChannels, _format, SdiOutput.DelayQueueDepth);
+            output = AirOutputs.Open(_boardIndex, _txChannels, _format, SdiOutput.DelayQueueDepth);
             byte[] black = output.BlackFrame();
 
             while (!ct.IsCancellationRequested)
@@ -292,7 +290,7 @@ public sealed class DelayTransmitter : IDisposable
                 {
                     // Which port, when there are several: "the card stopped accepting frames" is
                     // not actionable when four are open and one has gone.
-                    string which = output is SdiOutputFan { FailedChannel: >= 0 } fan
+                    string which = AirOutputs.Card(output) is SdiOutputFan { FailedChannel: >= 0 } fan
                         ? $"TX{fan.FailedChannel}"
                         : Ports;
 

@@ -184,9 +184,7 @@ public sealed class LiveAirTransmitter : IDisposable
                 return;
             }
 
-            output = _txChannels.Length == 1
-                ? SdiOutput.Open(_boardIndex, _txChannels[0], _format, SdiOutput.DelayQueueDepth)
-                : SdiOutputFan.Open(_boardIndex, _txChannels, _format, SdiOutput.DelayQueueDepth);
+            output = AirOutputs.Open(_boardIndex, _txChannels, _format, SdiOutput.DelayQueueDepth);
 
             byte[] black = output.BlackFrame();
 

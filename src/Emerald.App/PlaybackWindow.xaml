@@ -295,6 +295,35 @@
                             </StackPanel>
                         </Border>
 
+                        <!-- ============ IP stream ============ -->
+                        <!-- What is on air, sent to MediaMTX as well, for phones and browsers on
+                             the network. The same frames as the card; it never slows air. -->
+                        <Border Style="{StaticResource IpCardBorder}" Margin="0,7,0,0">
+                            <StackPanel>
+                                <Grid Margin="0,0,0,6">
+                                    <TextBlock Text="IP stream" Style="{StaticResource IpCardTitle}"/>
+                                    <ToggleButton x:Name="WebStreamToggle" HorizontalAlignment="Right"
+                                                  Width="46" Height="22" Padding="0" FontSize="9.5"
+                                                  Style="{StaticResource IpSmallToggle}" Content="OFF"
+                                                  Click="WebStreamToggle_Click"
+                                                  ToolTip="Send what is on air to the network too, for phones and browsers"/>
+                                </Grid>
+
+                                <TextBlock Text="Send to (MediaMTX)" Style="{StaticResource IpLabel}"/>
+                                <TextBox x:Name="WebStreamUrlBox" Style="{StaticResource IpMiniTextBox}"
+                                         LostFocus="WebStreamUrl_LostFocus"
+                                         ToolTip="rtsp://127.0.0.1:8554/onair when MediaMTX runs on this computer"/>
+
+                                <TextBlock Text="Viewers open" Style="{StaticResource IpLabel}" Margin="0,6,0,0"/>
+                                <TextBox x:Name="WebStreamViewerBox" Style="{StaticResource IpMiniTextBox}"
+                                         IsReadOnly="True" TextWrapping="Wrap" FontSize="9.5"
+                                         ToolTip="The first is WebRTC (under a second behind air); the second is HLS (a few seconds, plays on every phone)"/>
+
+                                <TextBlock x:Name="WebStreamStateText" Text="off" Foreground="{StaticResource IpDim}"
+                                           FontSize="10" Margin="0,5,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </Border>
+
                         <!-- ============ preview ============ -->
                         <Border Style="{StaticResource IpCardBorder}" Margin="0,7,0,0">
                             <StackPanel>

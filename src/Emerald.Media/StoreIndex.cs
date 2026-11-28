@@ -85,6 +85,9 @@ public sealed class StoreIndex
     /// <summary>How many files have been opened since this index was made: what a refresh costs.</summary>
     public int FilesRead { get; private set; }
 
+    /// <summary>Every folder has been read at least once. Until then, older recordings may be missing.</summary>
+    public bool ListedInFull => _lastFull != DateTime.MinValue;
+
     /// <summary>
     /// The masters of one recording folder, in order, as of the last refresh. Safe to ask from
     /// another thread while a refresh is running: it reads the answer the last one left.
@@ -98,10 +101,16 @@ public sealed class StoreIndex
     /// is not a change - it is placed at an assumed length and has nothing new to show.
     /// </summary>
     /// <param name="full">Walk every folder, not only those that could have changed.</param>
-    public bool Refresh(bool full = false, DateTime? now = null)
+    /// <param name="newestOnly">
+    /// Read only the newest recording folder - the one being recorded - and leave the rest for the
+    /// next refresh. For a window opening on a store of a thousand files: the first full read opens
+    /// every one of them, and on a disk the recorder is writing to that has taken over a minute,
+    /// with nothing on the timeline meanwhile. The recording an operator opened it for comes first.
+    /// </param>
+    public bool Refresh(bool full = false, DateTime? now = null, bool newestOnly = false)
     {
         DateTime clock = now ?? DateTime.UtcNow;
-        full |= clock - _lastFull >= FullEvery;
+        full = !newestOnly && (full || clock - _lastFull >= FullEvery);
 
         string low = _paths.Low;
         string high = _paths.High;
@@ -132,9 +141,10 @@ public sealed class StoreIndex
                 changed = true;
             }
 
+            bool isNewest = string.Equals(name, newest, StringComparison.OrdinalIgnoreCase);
+
             // A finished recording cannot change except by deletion, which the full pass catches.
-            if (full || folder.HasOpen || folder.Fresh ||
-                string.Equals(name, newest, StringComparison.OrdinalIgnoreCase))
+            if (newestOnly ? isNewest : full || folder.HasOpen || folder.Fresh || isNewest)
                 walk.Add(folder);
         }
 

@@ -13,8 +13,96 @@ Line references are to commit `dd8e4a7`. Unless stated, nothing here was measure
 | Out | `low\` | H.264 and AAC in MP4 |
 | Out | `high\` | DNxHD 145 and AAC in MOV |
 | Out | Speakers | 48 kHz stereo, monitoring only |
+| In (option) | IP stream, through ffmpeg | RTSP, SRT, RTMP, HLS, or a Twitch channel through streamlink. Made into 1080p UYVY at the deck's rate, stereo 48 kHz as CH 1-2. |
+| Out (option) | IP stream of air, to MediaMTX | H.264 (on the video card where there is one), AAC and Opus from CH 1-2 |
 
-**There is no network streaming.** No RTMP, SRT, HLS, NDI or similar code exists. "Streaming" in this project means SDI stream handles on the card. The only network output is the [read-only monitoring page](07_API_AND_COMMUNICATION.md), which carries status text and no media.
+## IP streams, in and out
+
+Both are options. **The SDI card stays the default input and the only air output** unless they are switched on. One extra program serves the network side: MediaMTX (free), configured by [tools/mediamtx/mediamtx.yml](../tools/mediamtx/mediamtx.yml).
+
+```mermaid
+flowchart LR
+    OBS[OBS / phone] -->|SRT or RTMP| MTX[MediaMTX]
+    TW[Twitch channel] -->|streamlink link| IPI
+    MTX -->|rtsp://.../live| IPI[IpInput: ffmpeg reader]
+    IPI --> REG[FrameRegulator] --> CLK[FrameClock, one frame per frame time]
+    CLK --> CAP[SdiCapture: recorder, delay line, preview, meters]
+    CAP --> AIR[Delay / Live Edit / Playback]
+    AIR -->|PushFrame| TAP[WebStreamTap]
+    TAP --> CARD[SDI card]
+    TAP -->|copy, never waits| WS[WebStream: own clock, ffmpeg] -->|rtsp://.../onair| MTX
+    MTX -->|WebRTC :8889, HLS :8880| VIEW[Phones and browsers]
+```
+
+### In: the capture deck's Input
+
+- **Input: SDI card / IP stream** on the capture deck. Chosen before recording, locked while recording. Old settings files have no `captureInput` and record from the card.
+- `SdiCapture.Run` asks an `ICaptureInput` for each frame. `SdiInput` holds exactly the card calls it always made. `IpInput` stands in for it. Everything after a frame is in hand (encoder, delay line, preview, meters, midnight) is the same code for both.
+- `IpInput` runs an ffmpeg child (`IpReaderCommand`): the picture is fitted inside 1920x1080 with black either side, deinterlaced only where interlaced, and made exactly the deck's rate (`fps=...:start_time=0`). Sound is resampled to 48 kHz stereo and padded from 0, so frame n and sound chunk n are the same moment. It probes the stream for 1 s, not ffmpeg's 5.
+- `FrameRegulator` turns what the network delivers into one frame per tick:
+  - It fills a store of a third of a second before taking anything.
+  - A frame is ready only when its sound has arrived too. ffmpeg writes the sound a few frames behind the picture.
+  - One frame short shows the last picture again. Short for 3 ticks fills the store again.
+  - Gone for a second shows black (`ipinput.lost`, then `ipinput.back`). A rush over two thirds of a second lets the oldest frames go.
+- `FrameClock` paces the frames with no card: deadlines counted from the start, a high-resolution waitable timer, the last millisecond spun.
+- A stream that stops is reconnected by itself, 1 s after ffmpeg stops (`ipinput.reconnect`). A stream with no sound is read again without it, and silence is recorded.
+- The format reported is a real 1080p standard (`CaptureFormat.ForIp`), so the delay line and the transmitter take it as they would a receiver's.
+- Addresses are written to the log without their stream keys, passwords or passphrases (`IpSource.Mask`).
+- A Twitch channel (`twitch:name` or a twitch.tv link) is turned into a playlist by `streamlink --stream-url`, found on PATH or at `streamlinkPath`. It is 5-15 s behind live and can carry Twitch's ads.
+- Before recording, the deck shows a live preview of the stream (`IpPreview`): a quarter-size picture at 12 frames a second, and its sound on the meters and the speaker monitor. It retries every 2 s while the stream is away. It stops the moment Record is pressed, and the recorder's own picture is shown from then. It comes back when recording stops.
+
+Measured with ffmpeg sending SRT in place of OBS:
+- 750 of 750 frames, one every 40.0 ms (worst 41.8 ms).
+- Picture and sound in step in both files.
+- A 3 s outage cost about 6 s of black and silence, then went on by itself.
+- A portrait 60 fps stream with no sound recorded upright with black sides, with silence.
+
+### Out: the playback deck's IP stream
+
+- **IP stream ON/OFF** on the playback deck, with the address it is sent to and the pages viewers open. Off by default (`webStreamEnabled`).
+- The same switch and address are in **Live Edit's Go Live** pop-up ("Also send air to phones and browsers"). Changing either changes both.
+  - `WebStream.Current` holds the settings in use.
+  - Every window that keeps its own copy of the settings (Live Edit does) takes them from `WebStream.Configured`, so a later save from that window does not undo a change made elsewhere.
+- Every air output is opened by `AirOutputs.Open`: the straight delay (`DelayTransmitter`), Live Edit's air (`LiveAirTransmitter`) and the playback deck (`PlayoutService`). It wraps the card's output in `WebStreamTap`.
+  - The tap sends each frame to the card first, then offers the same frame to `WebStream`, which copies it and returns.
+  - A full store lets a web frame go. Air is never slowed.
+  - Only one output feeds the stream at a time.
+- `WebStream` runs one encoder for the whole run of air, on its own `FrameClock`. Through a change of output, it shows the last picture for half a second, then black. Viewers keep one unbroken stream.
+- `WebStreamCommand`:
+  - H.264 on NVIDIA or Intel where there is one, otherwise libx264 `veryfast zerolatency`.
+  - A keyframe every second, no B-frames.
+  - AAC (for HLS) and Opus (for WebRTC) from CH 1-2.
+  - RTSP to MediaMTX by default; SRT or RTMP by the address's scheme.
+  - If MediaMTX or the encoder stops, it starts again every 3 s (`webstream.down`).
+- `airWithoutCard`: no SDI board. `SoftClockOutput` paces air by the computer's clock, and air is the IP stream alone. Not tried on a machine without a card.
+- Viewers see the same frames and the same edits as air, arriving later: WebRTC under a second, low-latency HLS 1-3 s. Nothing over IP arrives at the same moment as SDI.
+
+Measured, sent as UDP MPEG-TS, no card:
+- Received H.264 High, AAC and Opus.
+- The picture levels match what was sent, second by second.
+- The tone measures -15.3 dB, exactly what was sent.
+- Air's pace stayed at 40.0 ms (worst 42.5 ms) with the stream on.
+
+**The whole chain, through MediaMTX v1.21.4 with [tools/mediamtx/mediamtx.yml](../tools/mediamtx/mediamtx.yml), on one PC:**
+- "OBS" (ffmpeg) sent SRT to MediaMTX.
+- Emerald recorded it from `rtsp://127.0.0.1:8554/live`: 750 of 750 frames.
+- A 5 s delay line fed the real `DelayTransmitter`, with no card (`SoftClockOutput`).
+- Air went out as the IP stream to `rtsp://127.0.0.1:8554/onair`, and was watched three ways.
+
+The picture stepped its grey level every second, so each viewer's first sight of a step could be timed against the moment Emerald recorded it.
+
+| | Behind the sender / behind air |
+|---|---|
+| OBS to Emerald's recording | about 1.0 s behind the sender |
+| Edge, WebRTC page (`:8889/onair`) | median 0.8 s behind air (0.5 to 1.4 s) |
+| Edge, HLS page (`:8880/onair`, low-latency HLS) | median 2.1 s (0.9 to 3.1 s) |
+| ffmpeg reading HLS | median 1.5 s |
+
+- MediaMTX received 3 tracks: H264, AAC and Opus.
+- WebRTC takes H264 and Opus. "skipping track 2 (MPEG-4 Audio)" in its log is expected.
+- HLS carries all three tracks. Edge played it.
+
+**Not yet tried:** real phones (iPhone Safari with the HLS page, Android), OBS and Larix themselves, other computers on the network, and a real SDI card with the stream on.
 
 ## Recording flowchart
 

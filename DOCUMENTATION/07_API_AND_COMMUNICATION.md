@@ -14,9 +14,14 @@ Line references are to commit `dd8e4a7`. Example values are illustrative. The fi
 | ffmpeg decoded video and audio, waveform PCM | stdout pipe | ffmpeg to Emerald | N/A |
 | ffprobe | stdout pipe, JSON | ffprobe to Emerald | N/A |
 | ffmpeg diagnostics | stderr pipe | ffmpeg to Emerald | N/A |
+| IP stream in (option) | ffmpeg reads RTSP, SRT, RTMP or HLS; raw picture on stdout, sound on named pipe `emerald_ip_<session>_<n>` | Network to Emerald | Whatever the address carries |
+| IP stream of air (option) | ffmpeg sends RTSP (default `rtsp://127.0.0.1:8554/onair`), SRT or RTMP; picture on stdin, sound on named pipe `emerald_web_...` | Emerald to MediaMTX | None by default |
+| MediaMTX (separate program) | RTSP 8554, SRT 8890, RTMP 1935 in; WebRTC 8889 and HLS 8880 out to browsers | Phones/OBS in, viewers out | None by default. Local network only. |
 | Everything else | In-process method calls and C# events | | N/A |
 
-**WebSockets:** Not found in the codebase. **Server-sent events:** Not found. **UDP:** Not found. **Authentication anywhere:** Not found.
+**WebSockets:** Not found in the codebase. **Server-sent events:** Not found. **UDP:** Only when an IP stream address is `udp://` or `srt://`, inside ffmpeg. **Authentication anywhere:** Not found.
+
+The IP stream ports belong to MediaMTX, not to Emerald. HLS is moved to 8880 in [tools/mediamtx/mediamtx.yml](../tools/mediamtx/mediamtx.yml) because the timecode API defaults to 8888 on the same computer. See [IP streams, in and out](05_MEDIA_PROCESSING.md#ip-streams-in-and-out).
 
 `readme.md` says Emerald has "no server, no network transport". That is out of date.
 

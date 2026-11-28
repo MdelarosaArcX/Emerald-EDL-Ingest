@@ -74,10 +74,10 @@ public sealed class DelayOverflowTests : IDisposable
     }
 
     [Fact]
-    public void This_ffmpeg_gives_back_every_frame_in_order()
+    public async Task This_ffmpeg_gives_back_every_frame_in_order()
     {
         if (Ffmpeg.Locate() is not { } ffmpeg) return;
-        Assert.Null(DelayOverflow.Probe(ffmpeg, Hd).Result);
+        Assert.Null(await DelayOverflow.Probe(ffmpeg, Hd));
     }
 
     [Fact]

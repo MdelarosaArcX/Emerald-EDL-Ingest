@@ -72,6 +72,9 @@ public partial class ShellWindow : Window
 
     private readonly AppSettings _settings = App.Settings;
     private readonly RxPreview _preview = new();
+
+    /// <summary>The picture of an IP stream before it is recorded.</summary>
+    private readonly IpPreview _ipPreview = new();
     private readonly SdiCapture _capture = new();
 
     /// <summary>
@@ -157,6 +160,11 @@ public partial class ShellWindow : Window
         _preview.FormatChanged += OnPreviewFormat;
         _preview.Audio += _audio.Push;
 
+        _ipPreview.Status += OnPreviewStatus;
+        _ipPreview.FrameReady += OnPreviewFrame;
+        _ipPreview.FormatChanged += OnPreviewFormat;
+        _ipPreview.Audio += _audio.Push;
+
         _capture.Message += OnCaptureMessage;
         _capture.PreviewFrame += OnCapturePreviewFrame;
 
@@ -222,6 +230,10 @@ public partial class ShellWindow : Window
             StorageLimits.FirstOrDefault(o => o.Value == (_settings.HighResLimitGb ?? 0)) ?? StorageLimits[0];
         LowLimitCombo.SelectedItem =
             StorageLimits.FirstOrDefault(o => o.Value == (_settings.LowResLimitGb ?? 0)) ?? StorageLimits[0];
+
+        InputBox.SelectedIndex = _settings.CaptureFromIp ? 1 : 0;
+        IpUrlBox.Text = _settings.IpInputUrl;
+        ApplyInputUi();
 
         LoadProfile();
         UpdateBreadcrumbs();
@@ -343,6 +355,39 @@ public partial class ShellWindow : Window
 
     private void StartPreview()
     {
+        if (_settings.CaptureFromIp)
+        {
+            // The card's receiver is not what will be recorded, so it is not shown: the stream is,
+            // read by a preview of its own until Record is pressed.
+            _preview.Stop();
+            _ipPreview.Stop();
+            if (_recording || _capture.IsRunning) return;
+
+            PreviewImage.Source = null;
+            PreviewPlaceholder.Visibility = Visibility.Visible;
+
+            string url = _settings.IpInputUrl.Trim();
+
+            if (url.Length == 0)
+            {
+                SetStatus("IP stream: type the stream's address.", false);
+            }
+            else if (Ffmpeg.Locate(_settings.FfmpegPath) is not { } ffmpeg)
+            {
+                SetStatus("IP stream: ffmpeg was not found, so the stream cannot be shown or recorded.", true);
+            }
+            else
+            {
+                _ipPreview.Start(new IpSource(url, string.IsNullOrWhiteSpace(_settings.StreamlinkPath) ? null : _settings.StreamlinkPath.Trim()),
+                                 ffmpeg);
+            }
+
+            UpdateSourceDetails();
+            return;
+        }
+
+        _ipPreview.Stop();
+
         if (BoardBox.SelectedItem is not BoardInfo board || PortBox.SelectedItem is not ChannelPort port)
         {
             _preview.Stop();
@@ -419,6 +464,14 @@ public partial class ShellWindow : Window
 
     private void UpdateSourceDetails()
     {
+        if (_settings.CaptureFromIp)
+        {
+            SourceUrlText.Text = $"IP stream  |  {IpSource.Mask(_settings.IpInputUrl)}";
+            SourceTitleText.Text = "IP stream";
+            SourceDescriptionText.Text = _previewNote.Length == 0 ? "-" : _previewNote;
+            return;
+        }
+
         var board = BoardBox.SelectedItem as BoardInfo;
         var port = PortBox.SelectedItem as ChannelPort;
 
@@ -428,6 +481,61 @@ public partial class ShellWindow : Window
 
         SourceTitleText.Text = board?.Model ?? "-";
         SourceDescriptionText.Text = _previewNote.Length == 0 ? "-" : _previewNote;
+    }
+
+    // ------------------------------------------------------------------ input: SDI card or IP stream
+
+    private void InputBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_loading) return;
+
+        string want = (InputBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "sdi";
+        if (string.Equals(want, _settings.CaptureInput, StringComparison.OrdinalIgnoreCase)) return;
+
+        // A recording keeps the input it started on.
+        if (_recording || _capture.IsRunning)
+        {
+            _loading = true;
+            InputBox.SelectedIndex = _settings.CaptureFromIp ? 1 : 0;
+            _loading = false;
+            SetStatus("the input can be changed once this recording has stopped.", true);
+            return;
+        }
+
+        string was = _settings.CaptureFromIp ? "IP stream" : "SDI card";
+        _settings.CaptureInput = want;
+        _settings.Save();
+
+        ActivityLog.Shared.Info(LogSource.Capture,
+            $"INPUT set to {(_settings.CaptureFromIp ? "IP stream " + IpSource.Mask(_settings.IpInputUrl) : "SDI card")} (was {was}).",
+            @event: "capture.input");
+
+        ApplyInputUi();
+        StartPreview();
+    }
+
+    private void IpUrlBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        string url = IpUrlBox.Text.Trim();
+        if (url == _settings.IpInputUrl) return;
+
+        _settings.IpInputUrl = url;
+        _settings.Save();
+
+        ActivityLog.Shared.Info(LogSource.Capture, $"IP STREAM address set to {IpSource.Mask(url)}.",
+                                @event: "capture.ipaddress");
+        StartPreview();
+    }
+
+    /// <summary>The board and receiver for the card; the address for a stream.</summary>
+    private void ApplyInputUi()
+    {
+        bool ip = _settings.CaptureFromIp;
+        Visibility card = ip ? Visibility.Collapsed : Visibility.Visible;
+        Visibility stream = ip ? Visibility.Visible : Visibility.Collapsed;
+
+        BoardLabel.Visibility = BoardBox.Visibility = PortLabel.Visibility = PortRow.Visibility = card;
+        IpUrlLabel.Visibility = IpUrlBox.Visibility = stream;
     }
 
     private void BoardBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1186,11 +1294,28 @@ public partial class ShellWindow : Window
 
     private void StartRecording()
     {
-        if (BoardBox.SelectedItem is not BoardInfo board || PortBox.SelectedItem is not ChannelPort port)
+        bool fromIp = _settings.CaptureFromIp;
+
+        // Typed and not yet left: what is in the box is what is recorded.
+        if (fromIp) IpUrlBox_LostFocus(IpUrlBox, new RoutedEventArgs());
+
+        var board = BoardBox.SelectedItem as BoardInfo;
+        var port = PortBox.SelectedItem as ChannelPort;
+
+        if (fromIp && _settings.IpInputUrl.Trim().Length == 0)
+        {
+            SetStatus("no IP stream address - type it under Input.", true);
+            return;
+        }
+
+        if (!fromIp && (board is null || port is null))
         {
             SetStatus("no receiver selected - pick a board and RX port.", true);
             return;
         }
+
+        // What it is recording from, in what is said about it.
+        string from = fromIp ? $"IP stream {IpSource.Mask(_settings.IpInputUrl)}" : $"board {board!.Index} {port!.Name}";
 
         StorePaths store = Store;
         HighResBox.Text = store.High;
@@ -1234,7 +1359,7 @@ public partial class ShellWindow : Window
 
         RecordingNames naming = RecordingSequence.Next(rolledAt, RecordTitleBox.Text);
 
-        if (!RecordingSetup.TryBuild(_settings, board.Index, port.Index, folder, SelectedRate(),
+        if (!RecordingSetup.TryBuild(_settings, board?.Index ?? 0, port?.Index ?? 0, folder, SelectedRate(),
                                      RecordTitleBox.Text.Trim(), out CaptureRequest? request, out string? problem,
                                      extraAudio: addedAudio, store: store))
         {
@@ -1245,6 +1370,16 @@ public partial class ShellWindow : Window
 
             return;
         }
+
+        // The recorder reads the stream from here on, and shows its own picture.
+        if (fromIp) _ipPreview.Stop();
+
+        if (fromIp)
+            request = request! with
+            {
+                Ip = new IpSource(_settings.IpInputUrl.Trim(),
+                                  string.IsNullOrWhiteSpace(_settings.StreamlinkPath) ? null : _settings.StreamlinkPath.Trim()),
+            };
 
         _recordLimit = ParseSetDuration(SelectedRate());
         _recordStartedUtc = DateTime.UtcNow;
@@ -1283,7 +1418,7 @@ public partial class ShellWindow : Window
         // After Start, because that is where the session is minted, and the whole point of the
         // line is to name the recording everything after it will refer to.
         ActivityLog.Shared.Ok(LogSource.Capture,
-            $"Recording {request!.NamePrefix} from board {board.Index} {port.Name} at " +
+            $"Recording {request!.NamePrefix} from {from} at " +
             $"{SelectedRate()} fps, masters into {store.High}, proxies into {store.Low}." +
             (_captureAudio.Count > 0 ? $" {_captureAudio.Count} added audio track(s)." : ""),
             @event: "capture.started",
@@ -1311,7 +1446,7 @@ public partial class ShellWindow : Window
         PipelineState.Shared.Recording = true;
         PipelineState.Shared.Capture = new StageState(
             "RECORDING",
-            $"{request.NamePrefix} - board {board.Index} {port.Name}",
+            $"{request.NamePrefix} - {from}",
             LogLevel.Ok);
     }
 
@@ -1882,6 +2017,7 @@ public partial class ShellWindow : Window
         // The receiver cannot be moved out from under a running recording, and neither can the
         // segment length: the encoder is told it once, when it starts.
         BoardBox.IsEnabled = PortBox.IsEnabled = SegmentCombo.IsEnabled = !live;
+        InputBox.IsEnabled = IpUrlBox.IsEnabled = !live;
 
         // Nor can the folders: the recorder, the segment watch and the storage limit are all
         // told them once. Moving them mid-recording left the limit policing an empty folder.
@@ -2999,6 +3135,7 @@ public partial class ShellWindow : Window
 
         _capture.Stop();
         _preview.Dispose();
+        _ipPreview.Dispose();
         _audio.Dispose();
 
         // The clock is the application's, not this window's. Only the subscription is ours.

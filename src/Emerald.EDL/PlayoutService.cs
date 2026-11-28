@@ -383,9 +383,8 @@ public sealed class PlayoutService : IDisposable
 
                         // One port or several, through the same surface - the play loop does not
                         // need to know which, and there is one read of the picture either way.
-                        output = req.TxChannels is { Count: > 1 } many
-                            ? SdiOutputFan.Open(req.BoardIndex, many, format)
-                            : SdiOutput.Open(req.BoardIndex, req.TxChannel, format);
+                        output = AirOutputs.Open(req.BoardIndex,
+                            req.TxChannels is { Count: > 1 } many ? many : new[] { req.TxChannel }, format);
                         openFor = (req.BoardIndex, req.TxChannel);
                         lastFrame = null;
                     }

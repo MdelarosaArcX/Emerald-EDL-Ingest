@@ -1,0 +1,48 @@
+# MediaMTX for Emerald: the one extra program for IP streams, in and out.
+#
+#   In:  OBS, a phone (Larix Broadcaster) or another encoder publishes here, and Emerald's capture
+#        deck reads it (Input: IP stream, e.g. rtsp://127.0.0.1:8554/live).
+#   Out: Emerald sends what is on air to rtsp://127.0.0.1:8554/onair, and viewers on the network
+#        open http://<this PC>:8889/onair (WebRTC, under a second) or :8880/onair (HLS).
+#
+# Run: double-click mediamtx.exe in this folder (v1.21.4, github.com/bluenviron/mediamtx, MIT licence);
+# it reads this file from beside it.
+# Anything not set here keeps MediaMTX's own default. Local network only: do not forward these
+# ports to the internet.
+
+logLevel: info
+
+# Publishing and reading by RTSP (Emerald, OBS, ffmpeg).
+rtsp: yes
+rtspAddress: :8554
+
+# OBS and phones: SRT (srt://<this PC>:8890?streamid=publish:live) or RTMP (rtmp://<this PC>/live).
+srt: yes
+srtAddress: :8890
+rtmp: yes
+rtmpAddress: :1935
+
+# Viewers, in a browser.
+# HLS on 8880, not MediaMTX's usual 8888: the timecode API uses 8888 on Emerald's computer.
+hls: yes
+hlsAddress: :8880
+hlsVariant: lowLatency
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+# Kept ready while air is being sent, so a phone opening the page gets a picture at once rather
+# than waiting for the first segments to be made.
+hlsAlwaysRemux: yes
+
+webrtc: yes
+webrtcAddress: :8889
+
+# Not needed: the API, metrics, recording playback, and MoQ (which would also write a key file).
+moq: no
+api: no
+metrics: no
+pprof: no
+playback: no
+
+paths:
+  # live: what OBS or a phone sends in.  onair: what Emerald sends out.
+  all_others:

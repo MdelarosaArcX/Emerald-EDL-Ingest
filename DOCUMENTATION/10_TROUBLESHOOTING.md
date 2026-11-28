@@ -75,6 +75,11 @@ select at, area, source, event, message from log_error order by at_ms desc limit
 | Signal lost mid-recording, no warning | Known issue: not reported once frames have arrived | Watch the deck's frame count. |
 | A good recording is logged "stopped early" | Known issue: every deck recording | Ignore this line |
 | A later recording shows an old encoder error | Known issue: `_encoderErrors` is never cleared | Restart Emerald to clear it |
+| "no picture from the IP stream ... after 20 s" | Nothing is publishing to that address, the address is wrong, or MediaMTX is not running | Check OBS or the phone is live, and the Stream URL matches the path it publishes to (e.g. `/live`) |
+| IP recording shows black for a few seconds, then goes on | The stream dropped (`ipinput.lost`, `ipinput.reconnect`, `ipinput.back`). Reconnection is automatic. | Check the sender's network. A 3 s drop costs about 6 s. |
+| IP recording is silent | The stream carries no sound ("it carries no sound" in the log), or the sender's sound is off | Turn on the sender's audio |
+| Twitch: "needs streamlink" or "found no stream" | streamlink missing, or the channel is not live | Install streamlink or set `streamlinkPath`; check the channel |
+| Can't change Input | A recording is running | Stop it first |
 
 ### ffmpeg errors
 
@@ -154,6 +159,9 @@ select at, area, source, event, message from log_error order by at_ms desc limit
 | INGEST stage is always idle | Known issue: nothing writes it | Look at the Ingest window |
 | Live Edit's air isn't on the strip | Known issue | Look at Live Edit's header |
 | No GPU tile | The machine has no graphics engine counters | Nothing to fix. CPU, RAM and disks still show. |
+| Viewers can't open the IP stream | MediaMTX not running, IP stream OFF, or firewall | Start MediaMTX, switch IP stream ON on the playback deck, allow 8889/8880 on the local network. The deck shows the state under the addresses. |
+| IP stream "reconnecting" | MediaMTX is not reachable at the Send to address | Check MediaMTX is running and the address. Air is not affected. |
+| Phone plays HLS but WebRTC page stays black | WebRTC needs UDP 8189 through the firewall | Allow it, or use the HLS address |
 | An earlier day shows fewer lines than happened | More than the limit: the window holds 20,000 rows, the remote page the newest 5000 of a day | Narrow by area, or read `emerald.db` directly |
 
 ## Hardware checks

@@ -141,6 +141,8 @@ A frame's route has two independent branches: the encoder (to files) and the rin
 
 ## 4. Frontend to backend communication
 
+IP streams in and out are optional and go through ffmpeg child processes and MediaMTX, a separate program. Inside Emerald, an IP input stands in for the card's receiver behind `ICaptureInput`, and the IP stream of air is a wrapper on `ISdiOutput` (`AirOutputs`, `WebStreamTap`). See [IP streams, in and out](05_MEDIA_PROCESSING.md#ip-streams-in-and-out).
+
 There is no network boundary between the UI and the engines. Windows call engine methods directly and subscribe to C# events. Handlers raised on engine threads must marshal to the UI thread with `Dispatcher.BeginInvoke`.
 
 The only real client-server boundary is the optional monitoring web page.

@@ -181,6 +181,20 @@ And the recording drives. Outside Emerald:
 - Exclude the high-res, low-res and database folders from Windows Search indexing and from Defender real-time scanning. Both read files as they are written.
 - Put the low-res folder on a different drive from the high-res one where you can.
 
+### IP streams (optional)
+
+Only needed to record from OBS, a phone or Twitch, or to send air to phones and browsers. The SDI card works without any of this.
+
+1. **MediaMTX.** `tools/mediamtx/mediamtx.exe` (v1.21.4, MIT licence, from github.com/bluenviron/mediamtx) sits next to its config [tools/mediamtx/mediamtx.yml](../tools/mediamtx/mediamtx.yml). Copy the folder to the Emerald computer, or another one on the network, and double-click `mediamtx.exe`: it reads the config beside it.
+2. **Firewall.** Allow, on the local network only: TCP 8554 (RTSP), UDP 8890 (SRT), TCP 1935 (RTMP) for senders; TCP 8889 and UDP 8189 (WebRTC), TCP 8880 (HLS) for viewers. Do not forward them to the internet.
+3. **Senders.**
+   - **OBS:** Settings, Stream, Custom, `rtmp://<MediaMTX PC>/live`; or `srt://<MediaMTX PC>:8890?streamid=publish:live`.
+   - **iPhone:** Larix Broadcaster (free), with the same SRT or RTMP address.
+4. **Capture deck.** Input: IP stream, Stream URL `rtsp://<MediaMTX PC>:8554/live`.
+5. **Twitch (optional).** Install streamlink (streamlink.github.io), or set `streamlinkPath`. Stream URL `twitch:<channel>`. Only with the channel's permission.
+6. **IP stream of air.** Playback deck, IP stream: ON. Send to `rtsp://127.0.0.1:8554/onair` when MediaMTX is on the same computer. Viewers open the two addresses shown, WebRTC first.
+7. **No SDI board for air.** Set `airWithoutCard` to `true` in `settings.json`. Air is then the IP stream alone. Not yet tried.
+
 Edit `settings.json` only with Emerald closed. The running process holds its own copy, does not re-read these values, and overwrites the file when it next saves.
 
 ## Updating
